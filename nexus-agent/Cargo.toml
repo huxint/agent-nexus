@@ -1,0 +1,20 @@
+[package]
+name = "nexus-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nexus-core.workspace = true
+nexus-crypto.workspace = true
+nexus-economy.workspace = true
+nexus-runtime.workspace = true
+nexus-storage.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true

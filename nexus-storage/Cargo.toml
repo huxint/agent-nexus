@@ -1,0 +1,17 @@
+[package]
+name = "nexus-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nexus-core.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
