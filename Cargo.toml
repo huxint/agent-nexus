@@ -1,0 +1,69 @@
+[workspace]
+members = [
+    "nexus-core",
+    "nexus-crypto",
+    "nexus-storage",
+    "nexus-runtime",
+    "nexus-workspace",
+    "nexus-network",
+    "nexus-sync",
+    "nexus-node",
+    "nexus-economy",
+    "nexus-agent",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nexus-ai/nexus"
+
+[workspace.dependencies]
+# -- internal --
+nexus-core = { path = "nexus-core" }
+nexus-crypto = { path = "nexus-crypto" }
+nexus-storage = { path = "nexus-storage" }
+nexus-runtime = { path = "nexus-runtime" }
+nexus-workspace = { path = "nexus-workspace" }
+nexus-network = { path = "nexus-network" }
+nexus-sync = { path = "nexus-sync" }
+nexus-economy = { path = "nexus-economy" }
+nexus-agent = { path = "nexus-agent" }
+
+# -- crypto --
+ed25519-dalek = "2"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# -- serialization --
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+ciborium = "0.2"
+
+# -- storage --
+multihash = "0.19"
+cid = "0.11"
+
+# -- runtime (native, no sandbox) --
+# -- async --
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# -- error handling --
+thiserror = "2"
+anyhow = "1"
+
+# -- logging --
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# -- p2p networking --
+libp2p = { version = "0.54", features = ["quic", "kad", "gossipsub", "request-response", "dns", "tokio", "identify", "macros"] }
+futures = "0.3"
+
+# -- testing --
+tempfile = "3"
