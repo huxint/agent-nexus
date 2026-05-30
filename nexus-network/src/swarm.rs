@@ -35,6 +35,7 @@ pub struct NetworkConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
     pub kademlia_mode: kad::Mode,
     pub bootstrap_interval: Duration,
+    pub enable_mdns: bool,
 }
 
 impl Default for NetworkConfig {
@@ -44,6 +45,7 @@ impl Default for NetworkConfig {
             bootstrap_peers: Vec::new(),
             kademlia_mode: kad::Mode::Server,
             bootstrap_interval: Duration::from_secs(30),
+            enable_mdns: true,
         }
     }
 }
@@ -141,9 +143,14 @@ impl Network {
         let libp2p_keypair = transport::to_libp2p_keypair(node_identity);
         let local_peer_id = libp2p_keypair.public().to_peer_id();
         let gs_kp = libp2p_keypair.clone();
-        let mut behaviour =
-            CompositeBehaviour::new(local_peer_id, libp2p_keypair.public(), gs_kp.clone())
-                .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?;
+        let enable_mdns = config.enable_mdns && !is_loopback_addr(&config.listen_addr);
+        let mut behaviour = CompositeBehaviour::new(
+            local_peer_id,
+            libp2p_keypair.public(),
+            gs_kp.clone(),
+            enable_mdns,
+        )
+        .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?;
         behaviour.kademlia.set_mode(Some(config.kademlia_mode));
 
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair.clone())
@@ -409,6 +416,22 @@ fn handle_swarm_event(
                 discovery_key_label(err.key().as_ref())
             );
         }
+        SwarmEvent::Behaviour(ToSwarm::Mdns(libp2p::mdns::Event::Discovered(peers))) => {
+            for (peer, addr) in peers {
+                if peer == *swarm.local_peer_id() {
+                    continue;
+                }
+                debug!("mDNS discovered {peer} at {addr}");
+                behaviour_add_address(swarm.behaviour_mut(), &peer, addr.clone());
+                let _ = swarm.dial(addr.with(Protocol::P2p(peer)));
+                let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id: peer });
+            }
+        }
+        SwarmEvent::Behaviour(ToSwarm::Mdns(libp2p::mdns::Event::Expired(peers))) => {
+            for (peer, addr) in peers {
+                debug!("mDNS expired {peer} at {addr}");
+            }
+        }
         SwarmEvent::Behaviour(ToSwarm::Identify(identify::Event::Received {
             peer_id,
             info,
@@ -525,6 +548,14 @@ fn peer_and_kad_addr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
         Some(Protocol::P2p(peer)) => Some((peer, addr)),
         _ => None,
     }
+}
+
+fn is_loopback_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_loopback(),
+        Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
 }
 
 fn behaviour_add_address(behaviour: &mut CompositeBehaviour, peer: &PeerId, addr: Multiaddr) {

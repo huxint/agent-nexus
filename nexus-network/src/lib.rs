@@ -6,6 +6,7 @@
 //! Network
 //!   └── Swarm<CompositeBehaviour>
 //!         ├── Kademlia      (peer discovery via DHT)
+//!         ├── mDNS          (zero-config LAN discovery)
 //!         └── Identify      (peer info exchange)
 //! ```
 //!

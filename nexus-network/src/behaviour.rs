@@ -1,16 +1,18 @@
 //! Composite [`NetworkBehaviour`] — Kademlia + Identify + Gossipsub + WorkspaceSync.
 
 use libp2p::{
-    gossipsub, identify, kad,
+    gossipsub, identify, kad, mdns,
     request_response::{self, ProtocolSupport},
     PeerId, StreamProtocol,
 };
+use libp2p_swarm::behaviour::toggle::Toggle;
 use libp2p_swarm::NetworkBehaviour as NetworkBehaviourDerive;
 
 use nexus_sync::client::SyncClient;
 use nexus_sync::codec::SyncCodec;
 use nexus_sync::message::{SyncRequest, SyncResponse};
 use nexus_sync::{ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC, SYNC_PROTOCOL};
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Behaviour
@@ -20,6 +22,7 @@ use nexus_sync::{ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC, SYNC_PROTOCOL};
 #[derive(Debug)]
 pub enum BehaviourEvent {
     Kad(kad::Event),
+    Mdns(mdns::Event),
     Identify(Box<identify::Event>),
     GossipsubMessage {
         source: Option<PeerId>,
@@ -44,6 +47,7 @@ pub enum BehaviourEvent {
 #[behaviour(to_swarm = "ToSwarm")]
 pub struct CompositeBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub gossipsub: gossipsub::Behaviour,
     pub sync: request_response::Behaviour<SyncCodec>,
     pub identify: identify::Behaviour,
@@ -53,6 +57,7 @@ pub struct CompositeBehaviour {
 #[derive(Debug)]
 pub enum ToSwarm {
     Kad(kad::Event),
+    Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
     Sync(request_response::Event<SyncRequest, SyncResponse>),
     Identify(identify::Event),
@@ -61,6 +66,11 @@ pub enum ToSwarm {
 impl From<kad::Event> for ToSwarm {
     fn from(e: kad::Event) -> Self {
         Self::Kad(e)
+    }
+}
+impl From<mdns::Event> for ToSwarm {
+    fn from(e: mdns::Event) -> Self {
+        Self::Mdns(e)
     }
 }
 impl From<gossipsub::Event> for ToSwarm {
@@ -85,9 +95,22 @@ impl CompositeBehaviour {
         local_peer_id: PeerId,
         public_key: libp2p::identity::PublicKey,
         gossipsub_keypair: libp2p::identity::Keypair,
+        enable_mdns: bool,
     ) -> Result<Self, String> {
         let kademlia =
             kad::Behaviour::new(local_peer_id, kad::store::MemoryStore::new(local_peer_id));
+        let mdns = if enable_mdns {
+            match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
+                Ok(behaviour) => Some(behaviour),
+                Err(err) => {
+                    warn!("mDNS discovery disabled: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+        .into();
 
         let gs_config = gossipsub::ConfigBuilder::default()
             .max_transmit_size(1_048_576)
@@ -120,6 +143,7 @@ impl CompositeBehaviour {
 
         Ok(Self {
             kademlia,
+            mdns,
             gossipsub,
             sync,
             identify,

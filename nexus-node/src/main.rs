@@ -5,9 +5,9 @@
 //!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>]
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
-//!   nexus-node clone --base <dir> [--global] [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
+//!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
-//!   nexus-node discover --base <dir> [--global] [--bootstrap <addr>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -47,7 +47,7 @@ use nexus_workspace::{
     Workspace, WorkspaceConfig, WorkspaceError, WorkspaceServer, WorkspaceState,
 };
 
-const WORKSPACE_ANNOUNCEMENT_VERSION: u32 = 1;
+const WORKSPACE_ANNOUNCEMENT_VERSION: u32 = 2;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SOCIAL_EVENTS_PER_RESPONSE: usize = 512;
 const MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE: usize = 256;
@@ -62,6 +62,7 @@ struct WorkspaceAnnouncement {
     author: Did,
     workspace: String,
     name: String,
+    description: String,
     owner: Did,
     root: Option<String>,
     timestamp: u64,
@@ -73,6 +74,7 @@ struct WorkspaceAnnouncement {
 struct DiscoveredWorkspaceView {
     workspace: String,
     name: String,
+    description: String,
     owner: Did,
     root: Option<String>,
     latest_timestamp: u64,
@@ -83,12 +85,23 @@ struct DiscoveredWorkspaceView {
     announcements: Vec<WorkspaceAnnouncement>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DiscoverySort {
+    #[default]
+    Relevance,
+    CloneReady,
+    Name,
+    Owner,
+    Latest,
+}
+
 #[derive(Clone, Debug, Default)]
 struct DiscoveryFilter {
     workspace: Option<String>,
     peer: Option<String>,
     owner: Option<Did>,
     name: Option<String>,
+    sort: DiscoverySort,
     verified_only: bool,
     clone_ready_only: bool,
 }
@@ -130,10 +143,10 @@ fn print_usage(prog: &str) {
     eprintln!("nexus-node — AI workspace node");
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
-    eprintln!("  {prog} clone --base <DIR> [--global] [--peer <PEER_ID>] [--bootstrap <ADDR>] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
+    eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
     eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
     eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>]");
-    eprintln!("  {prog} discover --base <DIR> [--global] [--bootstrap <ADDR>] [--listen <ADDR>] [--timeout-ms <N>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
+    eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -292,7 +305,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 peer = Some(required_arg(args, i, "--peer")?.parse()?);
             }
-            "--global" | "--online" => {
+            "--global" | "--online" | "--lan" => {
                 online = true;
             }
             "--timeout-ms" => {
@@ -341,11 +354,6 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let identity = load_or_create_identity(&base)?;
     let mut network = None;
     if peer.is_none() && online {
-        if bootstrap.is_empty() {
-            return Err(
-                "global clone discovery requires --bootstrap <ADDR> or NEXUS_BOOTSTRAP".into(),
-            );
-        }
         let online_network = Network::new(
             &identity,
             NetworkConfig {
@@ -374,7 +382,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         network = Some(online_network);
     }
     let peer = peer.ok_or("--peer required or discoverable workspace announcement required")?;
-    if bootstrap.is_empty() {
+    if bootstrap.is_empty() && !peer_ready {
         return Err(
             "--bootstrap required or discoverable workspace announcement with addrs required"
                 .into(),
@@ -1018,6 +1026,7 @@ fn workspace_announcement_signing_payload(
         author: &'a Did,
         workspace: &'a str,
         name: &'a str,
+        description: &'a str,
         owner: &'a Did,
         root: &'a Option<String>,
         timestamp: u64,
@@ -1030,6 +1039,7 @@ fn workspace_announcement_signing_payload(
         author: &announcement.author,
         workspace: &announcement.workspace,
         name: &announcement.name,
+        description: &announcement.description,
         owner: &announcement.owner,
         root: &announcement.root,
         timestamp: announcement.timestamp,
@@ -1051,6 +1061,13 @@ fn sign_workspace_announcement(
 fn verify_workspace_announcement(
     announcement: &WorkspaceAnnouncement,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if announcement.version != WORKSPACE_ANNOUNCEMENT_VERSION {
+        return Err(format!(
+            "unsupported workspace announcement version {}",
+            announcement.version
+        )
+        .into());
+    }
     parse_workspace_id(&announcement.workspace)?;
     if let Some(root) = &announcement.root {
         parse_cid(root)?;
@@ -1091,7 +1108,9 @@ fn discovered_workspace_views(
             }
         }
         if let Some(name) = &name_filter {
-            if !announcement.name.to_ascii_lowercase().contains(name) {
+            if !announcement.name.to_ascii_lowercase().contains(name)
+                && !announcement.description.to_ascii_lowercase().contains(name)
+            {
                 continue;
             }
         }
@@ -1144,6 +1163,7 @@ fn discovered_workspace_views(
         views.push(DiscoveredWorkspaceView {
             workspace,
             name: latest.name.clone(),
+            description: latest.description.clone(),
             owner: latest.owner.clone(),
             root: latest.root.clone(),
             latest_timestamp: latest.timestamp,
@@ -1155,12 +1175,75 @@ fn discovered_workspace_views(
         });
     }
 
-    views.sort_by(|a, b| {
-        b.latest_timestamp
-            .cmp(&a.latest_timestamp)
-            .then_with(|| a.workspace.cmp(&b.workspace))
-    });
+    sort_discovered_workspace_views(&mut views, filter.sort);
     views
+}
+
+fn sort_discovered_workspace_views(views: &mut [DiscoveredWorkspaceView], sort: DiscoverySort) {
+    match sort {
+        DiscoverySort::Relevance => views.sort_by(|a, b| {
+            discovery_relevance_score(b)
+                .cmp(&discovery_relevance_score(a))
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+                .then_with(|| b.latest_timestamp.cmp(&a.latest_timestamp))
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        }),
+        DiscoverySort::CloneReady => views.sort_by(|a, b| {
+            b.clone_ready
+                .cmp(&a.clone_ready)
+                .then_with(|| b.verified.cmp(&a.verified))
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+                .then_with(|| b.latest_timestamp.cmp(&a.latest_timestamp))
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        }),
+        DiscoverySort::Name => views.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+                .then_with(|| b.clone_ready.cmp(&a.clone_ready))
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        }),
+        DiscoverySort::Owner => views.sort_by(|a, b| {
+            a.owner
+                .to_string()
+                .cmp(&b.owner.to_string())
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        }),
+        DiscoverySort::Latest => views.sort_by(|a, b| {
+            b.latest_timestamp
+                .cmp(&a.latest_timestamp)
+                .then_with(|| a.workspace.cmp(&b.workspace))
+        }),
+    }
+}
+
+fn discovery_relevance_score(view: &DiscoveredWorkspaceView) -> u64 {
+    let mut score = 0;
+    if view.clone_ready {
+        score += 4_000;
+    }
+    if view.verified {
+        score += 2_000;
+    }
+    if view.root.is_some() {
+        score += 500;
+    }
+    score += (view.peers.len().min(20) as u64) * 25;
+    score += (view.addrs.len().min(20) as u64) * 10;
+    score
 }
 
 fn discover_clone_source(
@@ -1543,7 +1626,7 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             "--json" => {
                 json = true;
             }
-            "--global" | "--online" => {
+            "--global" | "--online" | "--lan" => {
                 online = true;
             }
             "--listen" => {
@@ -1559,6 +1642,10 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 i += 1;
                 let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
                 timeout = Duration::from_millis(millis);
+            }
+            "--sort" => {
+                i += 1;
+                filter.sort = parse_discovery_sort(required_arg(args, i, "--sort")?)?;
             }
             "--verified" => {
                 filter.verified_only = true;
@@ -1592,9 +1679,6 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         bootstrap = default_bootstrap_peers()?;
     }
     if online {
-        if bootstrap.is_empty() {
-            return Err("global discovery requires --bootstrap <ADDR> or NEXUS_BOOTSTRAP".into());
-        }
         let identity = load_or_create_identity(&base)?;
         let network = Network::new(
             &identity,
@@ -1641,6 +1725,9 @@ fn print_discovered_workspaces_text(base: &Path, workspaces: &[DiscoveredWorkspa
             workspace.verified,
             workspace.clone_ready
         );
+        if !workspace.description.is_empty() {
+            println!("  description: {}", workspace.description);
+        }
         println!("  owner: {}", workspace.owner);
         println!("  root: {}", workspace.root.as_deref().unwrap_or("-"));
         for peer in &workspace.peers {
@@ -4802,6 +4889,20 @@ fn parse_usize_arg(value: &str, flag: &str) -> Result<usize, Box<dyn std::error:
         .map_err(|err| format!("invalid {flag}: {err}").into())
 }
 
+fn parse_discovery_sort(value: &str) -> Result<DiscoverySort, Box<dyn std::error::Error>> {
+    match value {
+        "relevance" | "relevant" => Ok(DiscoverySort::Relevance),
+        "clone-ready" | "clone_ready" | "ready" => Ok(DiscoverySort::CloneReady),
+        "name" => Ok(DiscoverySort::Name),
+        "owner" => Ok(DiscoverySort::Owner),
+        "latest" | "time" | "recent" => Ok(DiscoverySort::Latest),
+        other => Err(format!(
+            "invalid --sort: {other}; use relevance, clone-ready, name, owner, or latest"
+        )
+        .into()),
+    }
+}
+
 fn parse_bootstrap_list(value: &str) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
     let mut addrs = Vec::new();
     for item in value
@@ -5153,6 +5254,7 @@ fn workspace_announcement(
         author: identity.did().clone(),
         workspace: workspace.id().to_string(),
         name: workspace.name().to_string(),
+        description: workspace.description().to_string(),
         owner: workspace.owner().clone(),
         root: workspace.root_cid().map(|cid| hex::encode(cid.as_bytes())),
         timestamp: now,
@@ -5824,6 +5926,7 @@ mod tests {
             author: identity.did().clone(),
             workspace: workspace.to_string(),
             name: "shared-lab".into(),
+            description: "shared workspace".into(),
             owner: identity.did().clone(),
             root: None,
             timestamp: 10,
@@ -5857,6 +5960,7 @@ mod tests {
                 author: owner.did().clone(),
                 workspace: workspace.clone(),
                 name: "shared-lab".into(),
+                description: "shared research workspace".into(),
                 owner: owner.did().clone(),
                 root: None,
                 timestamp: 10,
@@ -5869,6 +5973,7 @@ mod tests {
                 author: owner.did().clone(),
                 workspace: workspace.clone(),
                 name: "shared-lab-new".into(),
+                description: "new shared research workspace".into(),
                 owner: owner.did().clone(),
                 root: Some(hex::encode(Cid::hash_of(b"new root").as_bytes())),
                 timestamp: 12,
@@ -5881,6 +5986,7 @@ mod tests {
                 author: other.did().clone(),
                 workspace: other_workspace,
                 name: "other-lab".into(),
+                description: "other workspace".into(),
                 owner: other.did().clone(),
                 root: None,
                 timestamp: 11,
@@ -5927,6 +6033,7 @@ mod tests {
             author: identity.did().clone(),
             workspace: workspace.to_string(),
             name: "discoverable-lab".into(),
+            description: "discoverable workspace".into(),
             owner: identity.did().clone(),
             root: Some(hex::encode(Cid::hash_of(b"discover root").as_bytes())),
             timestamp: 20,
@@ -5969,6 +6076,25 @@ mod tests {
             },
         );
         assert!(verified.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_lan_scan_does_not_require_bootstrap() {
+        let temp = TempDir::new().unwrap();
+        cmd_discover(&[
+            "nexus-node".into(),
+            "discover".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--lan".into(),
+            "--listen".into(),
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "--timeout-ms".into(),
+            "20".into(),
+            "--json".into(),
+        ])
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -6031,7 +6157,20 @@ mod tests {
             35,
         )
         .unwrap();
-        let announcements = vec![announcement];
+        let newer_unverified = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: "12D3KooWUnverifiedPeer".into(),
+            addrs: Vec::new(),
+            author: identity.did().clone(),
+            workspace: WorkspaceId::from_bytes([95; 32]).to_string(),
+            name: "zzz-newer-unverified".into(),
+            description: "newer but not clone ready".into(),
+            owner: identity.did().clone(),
+            root: None,
+            timestamp: 99,
+            signature: None,
+        };
+        let announcements = vec![announcement, newer_unverified];
 
         let views = discovered_workspace_views(
             &announcements,
@@ -6045,6 +6184,19 @@ mod tests {
         assert!(views[0].clone_ready);
         assert_eq!(views[0].name, "verified-lab");
         assert_eq!(views[0].addrs, vec!["/ip4/127.0.0.1/udp/5555/quic-v1"]);
+
+        let relevance_sorted =
+            discovered_workspace_views(&announcements, &DiscoveryFilter::default());
+        assert_eq!(relevance_sorted[0].name, "verified-lab");
+
+        let latest_sorted = discovered_workspace_views(
+            &announcements,
+            &DiscoveryFilter {
+                sort: DiscoverySort::Latest,
+                ..Default::default()
+            },
+        );
+        assert_eq!(latest_sorted[0].name, "zzz-newer-unverified");
     }
 
     #[tokio::test]

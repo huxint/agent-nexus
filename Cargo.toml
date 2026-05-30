@@ -62,7 +62,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # -- p2p networking --
-libp2p = { version = "0.54", features = ["quic", "kad", "gossipsub", "request-response", "dns", "tokio", "identify", "macros"] }
+libp2p = { version = "0.54", features = ["quic", "kad", "gossipsub", "request-response", "dns", "tokio", "identify", "macros", "mdns"] }
 futures = "0.3"
 
 # -- testing --
