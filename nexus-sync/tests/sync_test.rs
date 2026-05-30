@@ -46,6 +46,21 @@ fn sync_message_roundtrip() {
         } if known_event_ids == vec!["event-a".to_string()]
     ));
 
+    // WorkspaceAnnouncementsRequest
+    let req = SyncRequest::WorkspaceAnnouncementsRequest {
+        workspace_id: Some(ws_id),
+        limit: 10,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    let decoded: SyncRequest = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        decoded,
+        SyncRequest::WorkspaceAnnouncementsRequest {
+            workspace_id: Some(got_ws),
+            limit: 10,
+        } if got_ws == ws_id
+    ));
+
     // StateResponse
     let resp = SyncResponse::StateResponse {
         workspace_id: ws_id,
@@ -66,6 +81,18 @@ fn sync_message_roundtrip() {
     assert!(matches!(
         decoded,
         SyncResponse::SocialEventsResponse { events_json } if events_json.len() == 1
+    ));
+
+    // WorkspaceAnnouncementsResponse
+    let resp = SyncResponse::WorkspaceAnnouncementsResponse {
+        announcements_json: vec![br#"{"workspace":"abc"}"#.to_vec()],
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let decoded: SyncResponse = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        decoded,
+        SyncResponse::WorkspaceAnnouncementsResponse { announcements_json }
+            if announcements_json.len() == 1
     ));
 }
 

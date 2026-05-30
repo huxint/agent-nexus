@@ -12,6 +12,7 @@ path = "src/main.rs"
 nexus-agent.workspace = true
 nexus-core.workspace = true
 nexus-crypto.workspace = true
+nexus-economy.workspace = true
 nexus-storage.workspace = true
 nexus-runtime.workspace = true
 nexus-workspace.workspace = true

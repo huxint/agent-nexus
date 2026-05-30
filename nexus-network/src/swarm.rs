@@ -8,6 +8,7 @@ use futures::StreamExt;
 use libp2p::{
     gossipsub, identify,
     kad::{self, QueryResult},
+    multiaddr::Protocol,
     request_response::{self, InboundRequestId, OutboundRequestId, ResponseChannel},
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder, Transport,
@@ -51,6 +52,10 @@ impl Default for NetworkConfig {
 pub enum NetworkEvent {
     PeerDiscovered {
         peer_id: PeerId,
+    },
+    ProvidersFound {
+        key: Vec<u8>,
+        providers: Vec<PeerId>,
     },
     RoutingUpdated {
         peer_id: PeerId,
@@ -102,6 +107,9 @@ impl Clone for Network {
 
 enum NetworkCommand {
     Dial(Multiaddr),
+    DialPeer(PeerId),
+    StartProviding(Vec<u8>),
+    FindProviders(Vec<u8>),
     Publish {
         topic: GossipTopic,
         data: Vec<u8>,
@@ -156,6 +164,9 @@ impl Network {
             .listen_on(config.listen_addr.clone())
             .map_err(|e| nexus_core::NexusError::Network(format!("listen: {e}")))?;
         for addr in &config.bootstrap_peers {
+            if let Some((peer, kad_addr)) = peer_and_kad_addr(addr) {
+                behaviour_add_address(swarm.behaviour_mut(), &peer, kad_addr);
+            }
             swarm
                 .dial(addr.clone())
                 .map_err(|e| nexus_core::NexusError::Network(format!("dial: {e}")))?;
@@ -178,6 +189,18 @@ impl Network {
                 tokio::select! {
                     Some(cmd) = cmd_rx.recv() => match cmd {
                         NetworkCommand::Dial(a) => { let _ = swarm.dial(a); }
+                        NetworkCommand::DialPeer(peer) => { let _ = swarm.dial(peer); }
+                        NetworkCommand::StartProviding(key) => {
+                            match swarm.behaviour_mut().kademlia.start_providing(kad::RecordKey::new(&key)) {
+                                Ok(_) => debug!("started provider announcement for {}", discovery_key_label(&key)),
+                                Err(err) => warn!("failed to start provider announcement for {}: {err}", discovery_key_label(&key)),
+                            }
+                        }
+                        NetworkCommand::FindProviders(key) => {
+                            let label = discovery_key_label(&key);
+                            swarm.behaviour_mut().kademlia.get_providers(kad::RecordKey::new(&key));
+                            debug!("started provider lookup for {label}");
+                        }
                         NetworkCommand::Publish { topic, data, reply } => {
                             let result = match swarm
                                 .behaviour_mut()
@@ -214,7 +237,7 @@ impl Network {
                         pending_outbound.insert(rid, reply_tx);
                     }
                     Some(event) = swarm.next() => {
-                        handle_swarm_event(event, &event_tx_clone, &listen_addrs_clone, &mut pending_outbound, &mut pending_inbound);
+                        handle_swarm_event(event, &event_tx_clone, &listen_addrs_clone, &mut pending_outbound, &mut pending_inbound, &mut swarm);
                     }
                     _ = tick.tick() => {
                         if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -238,6 +261,19 @@ impl Network {
 
     pub fn dial(&self, a: Multiaddr) {
         let _ = self.cmd_tx.send(NetworkCommand::Dial(a));
+    }
+    pub fn dial_peer(&self, peer: PeerId) {
+        let _ = self.cmd_tx.send(NetworkCommand::DialPeer(peer));
+    }
+    pub fn start_providing(&self, key: Vec<u8>) -> NexusResult<()> {
+        self.cmd_tx
+            .send(NetworkCommand::StartProviding(key))
+            .map_err(|_| NexusError::Network("network task stopped".into()))
+    }
+    pub fn find_providers(&self, key: Vec<u8>) -> NexusResult<()> {
+        self.cmd_tx
+            .send(NetworkCommand::FindProviders(key))
+            .map_err(|_| NexusError::Network("network task stopped".into()))
     }
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
@@ -286,6 +322,14 @@ impl Network {
     }
 }
 
+pub fn global_discovery_key() -> Vec<u8> {
+    b"/nexus/global/1".to_vec()
+}
+
+pub fn workspace_discovery_key(workspace_id: &nexus_core::WorkspaceId) -> Vec<u8> {
+    format!("/nexus/workspace/1/{workspace_id}").into_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // Event handler
 // ---------------------------------------------------------------------------
@@ -296,6 +340,7 @@ fn handle_swarm_event(
     listen_addrs: &Arc<Mutex<Vec<Multiaddr>>>,
     pending_out: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<SyncResponse, String>>>,
     pending_in: &mut HashMap<InboundRequestId, ResponseChannel<SyncResponse>>,
+    swarm: &mut libp2p::Swarm<CompositeBehaviour>,
 ) {
     match event {
         SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::RoutingUpdated {
@@ -318,7 +363,60 @@ fn handle_swarm_event(
                 });
             }
         }
-        SwarmEvent::Behaviour(ToSwarm::Identify(identify::Event::Received { peer_id, .. })) => {
+        SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::OutboundQueryProgressed {
+            result:
+                QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { key, providers })),
+            ..
+        })) => {
+            let mut providers = providers.into_iter().collect::<Vec<_>>();
+            providers.sort();
+            providers.dedup();
+            for peer in &providers {
+                if peer != swarm.local_peer_id() {
+                    let _ = swarm.dial(*peer);
+                }
+                let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id: *peer });
+            }
+            let _ = event_tx.send(NetworkEvent::ProvidersFound {
+                key: key.to_vec(),
+                providers,
+            });
+        }
+        SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::OutboundQueryProgressed {
+            result: QueryResult::GetProviders(Err(err)),
+            ..
+        })) => {
+            debug!(
+                "provider lookup failed for {}: {err}",
+                discovery_key_label(err.key().as_ref())
+            );
+        }
+        SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::OutboundQueryProgressed {
+            result: QueryResult::StartProviding(Ok(ok)),
+            ..
+        })) => {
+            debug!(
+                "provider announcement published for {}",
+                discovery_key_label(ok.key.as_ref())
+            );
+        }
+        SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::OutboundQueryProgressed {
+            result: QueryResult::StartProviding(Err(err)),
+            ..
+        })) => {
+            debug!(
+                "provider announcement failed for {}: {err}",
+                discovery_key_label(err.key().as_ref())
+            );
+        }
+        SwarmEvent::Behaviour(ToSwarm::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
+            for addr in info.listen_addrs {
+                behaviour_add_address(swarm.behaviour_mut(), &peer_id, addr);
+            }
             let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id });
         }
         SwarmEvent::Behaviour(ToSwarm::Gossipsub(gossipsub::Event::Message {
@@ -401,6 +499,14 @@ fn handle_swarm_event(
             }
             let _ = event_tx.send(NetworkEvent::Listening(address));
         }
+        SwarmEvent::ExternalAddrConfirmed { address } => {
+            info!("External address confirmed: {address}");
+            if let Ok(mut addrs) = listen_addrs.lock() {
+                if !addrs.contains(&address) {
+                    addrs.push(address);
+                }
+            }
+        }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             debug!("Connected to {peer_id}");
             let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
@@ -411,4 +517,20 @@ fn handle_swarm_event(
         }
         _ => {}
     }
+}
+
+fn peer_and_kad_addr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    let mut addr = addr.clone();
+    match addr.pop() {
+        Some(Protocol::P2p(peer)) => Some((peer, addr)),
+        _ => None,
+    }
+}
+
+fn behaviour_add_address(behaviour: &mut CompositeBehaviour, peer: &PeerId, addr: Multiaddr) {
+    let _ = behaviour.kademlia.add_address(peer, addr);
+}
+
+fn discovery_key_label(key: &[u8]) -> String {
+    String::from_utf8_lossy(key).into_owned()
 }
