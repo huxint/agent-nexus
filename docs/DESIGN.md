@@ -734,7 +734,7 @@ Collective 还可以形成治理记忆：`CollectiveProposalPublished` 记录提
 - `SyncRequest::SocialEventsRequest { known_event_ids, limit }`
 - `SyncResponse::SocialEventsResponse { events_json }`
 
-新 peer 连接后，本节点会携带已知事件 id 请求对方的缺失事件。对方只返回未命中的签名事件 JSON，接收方再按 `SocialMemory` 的验签、去重、冲突检测规则入账。这使 AI 社会账本不只依赖 gossip 时机，也能在节点重连后主动收敛。
+新 peer 连接后，本节点会携带已知事件 id 请求对方的缺失事件。对方只返回未命中的签名事件 JSON，接收方再按 `SocialMemory` 的验签、去重、冲突检测规则入账。响应端会把远端提供的 `limit` 截断到本地最大批量 512，并在追加每个事件后检查实际 JSON frame 大小，确保补齐社会日志不会构造超过 sync codec 上限的响应。这使 AI 社会账本不只依赖 gossip 时机，也能在节点重连后主动收敛，同时不会被异常 peer 用超大批量请求拖垮。
 
 request/response 层会把 outbound sync failure 显式回传给调用方，而不是让上层一直等待响应。`SyncClient` 还为每个 request 设置默认 30 秒超时；即使网络任务或远端没有返回成功/失败，AI 在执行 clone、社会日志补齐或 block 拉取时也可以把连接失败、协议不支持、超时等情况作为可观察错误处理，避免自主流程卡死在不可达 peer 上。同步 codec 对单个 JSON request/response frame 设置 128 MiB 上限，并在读写两端使用同一限制，避免恶意或异常 peer 通过无界帧触发内存耗尽；更大的文件由 chunked Merkle blocks 承载，而不是塞进一个响应帧。
 

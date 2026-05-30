@@ -35,6 +35,7 @@ use nexus_crypto::NodeIdentity;
 use nexus_network::{Network, NetworkConfig, NetworkEvent};
 use nexus_runtime::{ExecError, ExecOptions, ProcessOutput, ResourceUsage};
 use nexus_storage::{BlockStore, Cid, DiskBlockStore};
+use nexus_sync::codec::MAX_SYNC_MESSAGE_BYTES;
 use nexus_sync::message::{SyncRequest, SyncResponse};
 use nexus_sync::SyncClient;
 use nexus_workspace::{
@@ -43,6 +44,7 @@ use nexus_workspace::{
 
 const WORKSPACE_ANNOUNCEMENT_VERSION: u32 = 1;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_SOCIAL_EVENTS_PER_RESPONSE: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceAnnouncement {
@@ -4903,11 +4905,31 @@ fn social_events_response(
     known_event_ids: &[String],
     limit: usize,
 ) -> SyncResponse {
+    social_events_response_with_caps(
+        social_memory,
+        known_event_ids,
+        limit,
+        MAX_SOCIAL_EVENTS_PER_RESPONSE,
+        MAX_SYNC_MESSAGE_BYTES,
+    )
+}
+
+fn social_events_response_with_caps(
+    social_memory: &SocialMemory,
+    known_event_ids: &[String],
+    limit: usize,
+    max_events: usize,
+    max_frame_bytes: usize,
+) -> SyncResponse {
     let known: std::collections::HashSet<&str> =
         known_event_ids.iter().map(String::as_str).collect();
+    let effective_limit = limit.min(max_events);
     let mut events_json = Vec::new();
 
     for event in social_memory.events() {
+        if events_json.len() >= effective_limit {
+            break;
+        }
         if known.contains(event.id.as_str()) {
             continue;
         }
@@ -4919,12 +4941,36 @@ fn social_events_response(
                 };
             }
         }
-        if events_json.len() >= limit {
-            break;
+        match social_events_response_frame_len(&events_json) {
+            Ok(frame_len) if frame_len <= max_frame_bytes => {}
+            Ok(_) => {
+                let oversized_event_id = event.id.clone();
+                events_json.pop();
+                if events_json.is_empty() {
+                    return SyncResponse::Error {
+                        message: format!(
+                            "social event {oversized_event_id} exceeds sync frame limit"
+                        ),
+                    };
+                }
+                break;
+            }
+            Err(err) => {
+                return SyncResponse::Error {
+                    message: format!("serialize social events response: {err}"),
+                };
+            }
         }
     }
 
     SyncResponse::SocialEventsResponse { events_json }
+}
+
+fn social_events_response_frame_len(events_json: &[Vec<u8>]) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(&SyncResponse::SocialEventsResponse {
+        events_json: events_json.to_vec(),
+    })
+    .map(|bytes| bytes.len())
 }
 
 async fn request_social_events_from_peer(
@@ -6699,6 +6745,64 @@ mod tests {
         let decoded = SocialEvent::from_json(&events_json[0]).unwrap();
         decoded.verify_signature().unwrap();
         assert_eq!(decoded.id, event_b.id);
+    }
+
+    #[test]
+    fn social_events_response_clamps_remote_limit() {
+        let identity = NodeIdentity::generate();
+        let mut memory = SocialMemory::new();
+        for i in 0..3 {
+            let event = signed_workspace_event(&identity, (i % 251) as u8, i as u64 + 1);
+            assert!(memory.ingest_event(event).unwrap());
+        }
+
+        let response =
+            social_events_response_with_caps(&memory, &[], usize::MAX, 2, MAX_SYNC_MESSAGE_BYTES);
+        let events_json = match response {
+            SyncResponse::SocialEventsResponse { events_json } => events_json,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        assert_eq!(events_json.len(), 2);
+    }
+
+    #[test]
+    fn social_events_response_stops_before_frame_limit() {
+        let identity = NodeIdentity::generate();
+        let event_a = signed_workspace_event(&identity, 45, 1);
+        let event_b = signed_workspace_event(&identity, 46, 2);
+        let first_event_json = event_a.to_json().unwrap();
+        let max_frame_bytes =
+            social_events_response_frame_len(std::slice::from_ref(&first_event_json)).unwrap();
+        let mut memory = SocialMemory::new();
+        for event in [event_a, event_b] {
+            assert!(memory.ingest_event(event).unwrap());
+        }
+
+        let response = social_events_response_with_caps(&memory, &[], 10, 10, max_frame_bytes);
+        let events_json = match response {
+            SyncResponse::SocialEventsResponse { events_json } => events_json,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        assert_eq!(events_json.len(), 1);
+    }
+
+    #[test]
+    fn social_events_response_errors_when_single_event_exceeds_frame_limit() {
+        let identity = NodeIdentity::generate();
+        let event = signed_workspace_event(&identity, 47, 1);
+        let event_id = event.id.clone();
+        let mut memory = SocialMemory::new();
+        assert!(memory.ingest_event(event).unwrap());
+
+        let response = social_events_response_with_caps(&memory, &[], 10, 10, 0);
+
+        assert!(matches!(
+            response,
+            SyncResponse::Error { message }
+                if message.contains(&event_id) && message.contains("exceeds sync frame limit")
+        ));
     }
 
     #[test]
