@@ -25,8 +25,9 @@ use nexus_agent::{
     CollectiveVote, CollectiveVoteChoice, ExecutionReceipt, GovernanceSignal, IntentActionKind,
     IntentActionPlan, IntentKind, IntentRecommendation, IntentResponse, IntentResponseKind,
     Interaction, InteractionOutcome, ProviderRecommendation, RelationKind, ReputationScore,
-    SocialEdge, SocialEvent, SocialEventKind, SocialMemory, TaskClaimJudgment, TaskDispute,
-    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    SettlementRecord, SocialEdge, SocialEvent, SocialEventKind, SocialMemory, TaskClaimJudgment,
+    TaskDispute, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
+    WorkspaceSnapshot,
 };
 use nexus_agent::{Task, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -168,11 +169,11 @@ async fn cmd_create(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--name" => {
                 i += 1;
-                name = Some(args[i].clone());
+                name = Some(required_arg(args, i, "--name")?.to_string());
             }
             "--base" => {
                 i += 1;
-                base = PathBuf::from(&args[i]);
+                base = PathBuf::from(required_arg(args, i, "--base")?);
             }
             o => {
                 eprintln!("unknown: {o}");
@@ -664,15 +665,15 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--base" => {
                 i += 1;
-                base = PathBuf::from(&args[i]);
+                base = PathBuf::from(required_arg(args, i, "--base")?);
             }
             "--listen" => {
                 i += 1;
-                listen = args[i].clone();
+                listen = required_arg(args, i, "--listen")?.to_string();
             }
             "--bootstrap" => {
                 i += 1;
-                bootstrap.push(args[i].clone().parse()?);
+                bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
             }
             o => {
                 eprintln!("unknown: {o}");
@@ -1457,7 +1458,7 @@ fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--base" => {
                 i += 1;
-                base = PathBuf::from(&args[i]);
+                base = PathBuf::from(required_arg(args, i, "--base")?);
             }
             "--json" => {
                 json = true;
@@ -2042,6 +2043,11 @@ fn society_json_for_base(
                         })
                     })
                     .collect::<Vec<_>>(),
+                "settlements": society
+                    .task_settlements(&task.id)
+                    .into_iter()
+                    .map(settlement_json)
+                    .collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -2089,6 +2095,12 @@ fn society_json_for_base(
         .filter(|reputation| reputation_matches_filters(society, *reputation, &options))
         .map(reputation_json)
         .collect::<Vec<_>>();
+    let settlements = society
+        .settlements()
+        .into_iter()
+        .filter(|settlement| settlement_matches_filters(settlement, &options))
+        .map(settlement_json)
+        .collect::<Vec<_>>();
     let discovered_workspaces =
         if options.task_filter.is_some() && options.workspace_filter.is_none() {
             Vec::new()
@@ -2119,6 +2131,7 @@ fn society_json_for_base(
         "intent_responses": intent_responses,
         "reputations": reputations,
         "capability_grants": capability_grants,
+        "settlements": settlements,
         "tasks": tasks,
     })
 }
@@ -2346,6 +2359,20 @@ fn interaction_matches_filters(interaction: &&Interaction, options: &SocietyJson
         && options.task_filter.as_ref().is_none_or(|task_id| {
             interaction.evidence.as_deref() == Some(task_id) || interaction.topic.contains(task_id)
         })
+}
+
+fn settlement_matches_filters(
+    settlement: &&SettlementRecord,
+    options: &SocietyJsonOptions,
+) -> bool {
+    options
+        .agent_filter
+        .as_ref()
+        .is_none_or(|agent| settlement.payer == *agent || settlement.payee == *agent)
+        && options
+            .task_filter
+            .as_ref()
+            .is_none_or(|task_id| settlement.task_id.as_deref() == Some(task_id.as_str()))
 }
 
 fn intent_matches_filters(intent: &&AgentIntent, options: &SocietyJsonOptions) -> bool {
@@ -2848,6 +2875,19 @@ fn task_result_json(result: &TaskResult) -> serde_json::Value {
         "actual_cost": result.actual_cost,
         "error": result.error,
         "receipt": result.receipt.as_deref().map(execution_receipt_json),
+    })
+}
+
+fn settlement_json(settlement: &SettlementRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": settlement.id,
+        "task_id": settlement.task_id,
+        "claim_id": settlement.claim_id,
+        "payer": settlement.payer.to_string(),
+        "payee": settlement.payee.to_string(),
+        "amount": settlement.amount,
+        "proof": settlement.proof,
+        "settled_at": settlement.settled_at,
     })
 }
 
@@ -5266,6 +5306,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
     fn signed_workspace_event(identity: &NodeIdentity, byte: u8, timestamp: u64) -> SocialEvent {
         SocialEvent::new(
             identity.did().clone(),
@@ -5319,6 +5363,23 @@ mod tests {
         let expected = normalize_workspace_path(&temp.path().join("local-computer")).unwrap();
         let paths = local_workspace_paths(temp.path()).unwrap();
         assert_eq!(paths, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn cli_commands_reject_missing_option_values_without_panic() {
+        let create_err = cmd_create(&args(&["nexus-node", "create", "--name"]))
+            .await
+            .expect_err("missing create value should be an error");
+        assert!(create_err.to_string().contains("--name requires a value"));
+
+        let serve_err = cmd_serve(&args(&["nexus-node", "serve", "--listen"]))
+            .await
+            .expect_err("missing serve value should be an error");
+        assert!(serve_err.to_string().contains("--listen requires a value"));
+
+        let society_err = cmd_society(&args(&["nexus-node", "society", "--base"]))
+            .expect_err("missing society value should be an error");
+        assert!(society_err.to_string().contains("--base requires a value"));
     }
 
     #[test]

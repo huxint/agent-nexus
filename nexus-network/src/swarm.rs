@@ -179,13 +179,26 @@ impl Network {
                     Some(cmd) = cmd_rx.recv() => match cmd {
                         NetworkCommand::Dial(a) => { let _ = swarm.dial(a); }
                         NetworkCommand::Publish { topic, data, reply } => {
-                            let result = swarm
+                            let result = match swarm
                                 .behaviour_mut()
                                 .gossipsub
                                 .publish(gossipsub::IdentTopic::new(topic.name()), data)
-                                .map(|_| ())
-                                .map_err(|e| NexusError::Network(format!("publish {}: {e:?}", topic.name())));
-                            if let Err(e) = &result { warn!("{e}"); }
+                            {
+                                Ok(_) => Ok(()),
+                                Err(err) => {
+                                    let result = NexusError::Network(format!(
+                                        "publish {}: {err:?}",
+                                        topic.name()
+                                    ));
+                                    match err {
+                                        gossipsub::PublishError::InsufficientPeers => {
+                                            debug!("{result}");
+                                        }
+                                        _ => warn!("{result}"),
+                                    }
+                                    Err(result)
+                                }
+                            };
                             let _ = reply.send(result);
                         }
                         NetworkCommand::SyncRespond { request_id, response } => {
@@ -204,7 +217,9 @@ impl Network {
                         handle_swarm_event(event, &event_tx_clone, &listen_addrs_clone, &mut pending_outbound, &mut pending_inbound);
                     }
                     _ = tick.tick() => {
-                        if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() { warn!("kad: {e:?}"); }
+                        if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                            debug!("kad bootstrap skipped: {e:?}");
+                        }
                     }
                     else => break,
                 }
@@ -356,7 +371,7 @@ fn handle_swarm_event(
             error,
             ..
         })) => {
-            warn!("sync outbound failure to {peer}: {error}");
+            debug!("sync outbound failure to {peer}: {error}");
             if let Some(tx) = pending_out.remove(&request_id) {
                 let _ = tx.send(Err(error.to_string()));
             }

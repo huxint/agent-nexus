@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nexus_core::{Capability, Did, WorkspaceId};
-use nexus_economy::ReputationScore;
+use nexus_economy::{ReputationScore, SettlementProof};
 use nexus_runtime::ResourceUsage;
 use nexus_storage::Cid;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,10 @@ fn task_dispute_key(dispute: &TaskDispute) -> String {
         dispute.target,
         dispute.claim_id.as_deref().unwrap_or_default()
     )
+}
+
+fn settlement_key(settlement: &SettlementRecord) -> String {
+    settlement.id.clone()
 }
 
 fn capability_grant_key(grant: &CapabilityGrant) -> String {
@@ -317,6 +321,25 @@ pub struct TaskDispute {
     pub reason: String,
     pub evidence: Option<String>,
     pub timestamp: u64,
+}
+
+/// A signed claim that a task, claim, or relationship was economically settled.
+///
+/// Recording a settlement does not itself manufacture reputation. It gives the
+/// society layer a verifiable economic fact that other adoption rules can
+/// require before applying credit, rank, or governance consequences.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementRecord {
+    pub id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub claim_id: Option<String>,
+    pub payer: Did,
+    pub payee: Did,
+    pub amount: u64,
+    pub proof: SettlementProof,
+    pub settled_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -651,6 +674,8 @@ pub struct Society {
     #[serde(default)]
     task_disputes: HashMap<String, TaskDispute>,
     #[serde(default)]
+    settlements: HashMap<String, SettlementRecord>,
+    #[serde(default)]
     applied_task_results: HashSet<String>,
 }
 
@@ -673,6 +698,34 @@ impl Society {
 
     pub fn interactions(&self) -> &[Interaction] {
         &self.interactions
+    }
+
+    pub fn settlements(&self) -> Vec<&SettlementRecord> {
+        let mut settlements: Vec<&SettlementRecord> = self.settlements.values().collect();
+        settlements.sort_by(|a, b| {
+            a.settled_at
+                .cmp(&b.settled_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        settlements
+    }
+
+    pub fn settlement(&self, id: &str) -> Option<&SettlementRecord> {
+        self.settlements.get(id)
+    }
+
+    pub fn task_settlements(&self, task_id: &str) -> Vec<&SettlementRecord> {
+        let mut settlements: Vec<&SettlementRecord> = self
+            .settlements
+            .values()
+            .filter(|settlement| settlement.task_id.as_deref() == Some(task_id))
+            .collect();
+        settlements.sort_by(|a, b| {
+            a.settled_at
+                .cmp(&b.settled_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        settlements
     }
 
     pub fn agent_interactions(&self, agent: &Did) -> Vec<&Interaction> {
@@ -1601,6 +1654,9 @@ impl Society {
             SocialEventKind::TaskDisputed { dispute } => {
                 self.record_task_dispute(dispute.clone());
             }
+            SocialEventKind::SettlementRecorded { settlement } => {
+                self.record_settlement(settlement.clone());
+            }
         }
     }
 
@@ -1858,6 +1914,17 @@ impl Society {
                 .or_else(|| claim_id.map(|claim_id| format!("claim:{claim_id}")))
                 .or(Some(task_id)),
         });
+    }
+
+    fn record_settlement(&mut self, settlement: SettlementRecord) {
+        if settlement.proof.validate().is_err() {
+            return;
+        }
+        self.register_agent(settlement.payer.clone());
+        self.register_agent(settlement.payee.clone());
+        self.settlements
+            .entry(settlement_key(&settlement))
+            .or_insert(settlement);
     }
 
     fn apply_known_task_result(&mut self, task_id: &str) {
@@ -2624,7 +2691,9 @@ mod tests {
     use nexus_core::PermissionSet;
     use nexus_crypto::capability::sign_capability;
     use nexus_crypto::NodeIdentity;
+    use nexus_economy::{LightningSettlement, SettlementProof};
     use nexus_runtime::{ProcessOutput, ResourceUsage};
+    use sha2::{Digest, Sha256};
 
     fn did(s: &str) -> Did {
         Did::new(format!("did:key:{s}"))
@@ -2652,6 +2721,41 @@ mod tests {
         assert_eq!(reputation.successes, 1);
         assert!(reputation.composite() > 0.5);
         assert_eq!(society.interaction_count(), 1);
+    }
+
+    #[test]
+    fn settlement_events_record_verifiable_economic_facts_without_reputation() {
+        let payer = did("payer");
+        let payee = did("payee");
+        let preimage = [13u8; 32];
+        let settlement = SettlementRecord {
+            id: "settlement-1".into(),
+            task_id: Some("task-1".into()),
+            claim_id: Some("claim-1".into()),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount: 42,
+            proof: SettlementProof::Lightning(LightningSettlement {
+                amount_msat: 42_000,
+                payment_hash_hex: hex::encode(Sha256::digest(preimage)),
+                preimage_hex: hex::encode(preimage),
+            }),
+            settled_at: 10,
+        };
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            payer.clone(),
+            11,
+            SocialEventKind::SettlementRecorded { settlement },
+        ));
+
+        assert!(society.settlement("settlement-1").is_some());
+        assert_eq!(society.task_settlements("task-1").len(), 1);
+        assert!(society.reputations().is_empty());
+        assert!(society.interactions().is_empty());
+        assert!(society.has_agent(&payer));
+        assert!(society.has_agent(&payee));
     }
 
     #[test]
