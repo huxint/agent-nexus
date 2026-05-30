@@ -139,7 +139,9 @@
 - 长期运行节点通过 Kademlia provider records 发布 `/nexus/global/1`，表示自己是 Nexus/Aether 网络成员。
 - 服务 workspace 的节点同时发布 `/nexus/workspace/1/<workspace-id>`，让 clone/discover 可以在不知道 PeerId 和 IP 的情况下按 workspace 查找 provider。
 - `nexus-node discover --global` 和 `nexus-node clone --global` 通过 bootstrap/rendezvous 节点进入 DHT，找到 provider 后用 request/response 拉取签名 workspace announcement，再验证 DID 签名、workspace root 和 owner。
-- 启动公网发现需要至少一个可达 bootstrap/rendezvous 地址。CLI 支持 `--bootstrap <ADDR>`，也支持用 `NEXUS_BOOTSTRAP` 配置默认 bootstrap 列表；正式网络可通过 DNS 或发布的种子节点列表提供这个入口。
+- `nexus-node discover --lan` / `clone --lan` 使用 mDNS 做同一局域网零配置发现，不要求手动填写 `--bootstrap`。
+- 公网发现仍需要至少一个可达 bootstrap/rendezvous 入口。CLI 支持 `--bootstrap <ADDR>`，也支持用 `NEXUS_BOOTSTRAP` 配置默认 bootstrap 列表；正式网络可通过 DNS 或发布的种子节点列表提供这个入口。
+- workspace announcement 包含 name、description、owner、root、peer 和 addrs，发现列表默认按“可验证、可 clone、可连接”的相关性排序，也可用 `--sort latest|name|owner|clone-ready|relevance` 切换。
 
 这仍然保持自我主权身份：bootstrap 节点只负责让节点进入 DHT，不签发身份、不决定可信度，也不替代签名公告和社会层验证。
 
@@ -701,9 +703,9 @@ Collective 还可以形成治理记忆：`CollectiveProposalPublished` 记录提
 - `nexus-workspace-announce`: workspace 状态公告。
 - `nexus-social-events`: 已签名的 `SocialEvent` JSON bytes。
 
-`nexus-workspace-announce` 现在承载结构化 `WorkspaceAnnouncement` JSON：包含公告版本、发布 peer、可拨号地址列表、作者 DID、workspace id、名称、owner DID、当前 root CID、timestamp 和作者签名。签名覆盖公告声明字段，但不覆盖 signature 字段本身。`serve` 会为已加载 workspace 广播公告，并在新 peer 连接后重播公告。接收方会同时检查 gossipsub 来源 peer、公告内 peer 字段、地址格式和作者 DID 签名，只有验证通过的新公告才写入 `<base>/.nexus-workspace-discovery.json`，并在 `society --json` 顶层暴露聚合后的 `discovered_workspaces`。公告只是“某个 DID 声称某 peer 在这些地址提供某 workspace”的可验证线索，不是可信状态；真正 clone 时仍然必须通过 `StateRequest`、`BlockRequest`、CID 校验和物化边界校验确认内容。
+`nexus-workspace-announce` 现在承载结构化 `WorkspaceAnnouncement` JSON：包含公告版本、发布 peer、可拨号地址列表、作者 DID、workspace id、名称、描述、owner DID、当前 root CID、timestamp 和作者签名。签名覆盖公告声明字段，包括 description，但不覆盖 signature 字段本身。`serve` 会为已加载 workspace 广播公告，并在新 peer 连接后重播公告。接收方会同时检查 gossipsub 来源 peer、公告内 peer 字段、地址格式、公告版本和作者 DID 签名，只有验证通过的新公告才写入 `<base>/.nexus-workspace-discovery.json`，并在 `society --json` 顶层暴露聚合后的 `discovered_workspaces`。公告只是“某个 DID 声称某 peer 在这些地址提供某 workspace”的可验证线索，不是可信状态；真正 clone 时仍然必须通过 `StateRequest`、`BlockRequest`、CID 校验和物化边界校验确认内容。
 
-本地 AI 可以通过 `nexus-node discover --base <DIR> [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]` 读取这些发现线索。`discover` 会按 workspace 聚合多个 peer 的公告，保留最新 root、owner、可用 peers、可拨号 addrs 和原始 announcements，并给出 `verified` 与 `clone_ready` 决策字段。`verified` 表示至少有一条公告通过 DID 签名验证；`clone_ready` 表示存在已验证且带可拨号地址的公告。它是 AI 选择“下一台可加入/可 clone 的电脑”的感知接口，不直接连网、不自动信任远端，也不绕过 clone 的内容校验。`clone` 在没有显式 `--peer` 或 `--bootstrap` 时，会从本地 discovery registry 选择最新的已签名且带地址公告来补齐连接参数；随后远端 `StateResponse` 必须匹配这条签名公告承诺的 owner DID，若公告携带 root CID，也必须匹配同一个 root。这样 discovery 不是中心化真相，而是可验收的社会承诺：AI 可以先运行 `serve` 收集公告，再用 `clone --workspace <HEX> --name <NAME>` 主动加入发现到的运行空间，同时拒绝“公告说的是一台电脑，实际交付的是另一份状态”的漂移。
+本地 AI 可以通过 `nexus-node discover --base <DIR> [--global|--lan] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]` 读取这些发现线索。`discover` 会按 workspace 聚合多个 peer 的公告，保留最新 name、description、root、owner、可用 peers、可拨号 addrs 和原始 announcements，并给出 `verified` 与 `clone_ready` 决策字段。`verified` 表示至少有一条公告通过 DID 签名验证；`clone_ready` 表示存在已验证且带可拨号地址的公告。默认排序是 relevance，优先把可验证、可 clone、有 root 和多 peer/addrs 的 workspace 排在前面；需要复查时间线时可切换到 `--sort latest`。它是 AI 选择“下一台可加入/可 clone 的电脑”的感知接口，不自动信任远端，也不绕过 clone 的内容校验。`discover --lan` 和 `clone --lan` 可通过 mDNS 直接找同一局域网 peer，不要求 `--bootstrap`；公网 `--global` 发现仍需要可达的 bootstrap/rendezvous 入口或 `NEXUS_BOOTSTRAP`。`clone` 在没有显式 `--peer` 或 `--bootstrap` 时，会从本地 discovery registry 选择最新的已签名且带地址公告来补齐连接参数；随后远端 `StateResponse` 必须匹配这条签名公告承诺的 owner DID，若公告携带 root CID，也必须匹配同一个 root。这样 discovery 不是中心化真相，而是可验收的社会承诺：AI 可以先运行 `serve` 收集公告，再用 `clone --lan --workspace <HEX> --name <NAME>` 主动加入发现到的运行空间，同时拒绝“公告说的是一台电脑，实际交付的是另一份状态”的漂移。
 
 `Network::publish_social_event(bytes)` 会返回实际 gossipsub 发布结果；如果 mesh 尚未就绪，调用方会收到网络错误并可以重试。这一点很重要：社会事件不能在本地假定“已经广播”，传播失败必须成为可观察的状态。
 
