@@ -171,7 +171,7 @@ impl TrustGraph {
     ) -> Vec<(Did, Did)> {
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
-        let mut parent: HashMap<Did, (Did, u64)> = HashMap::new();
+        let mut parent: HashMap<Did, Did> = HashMap::new();
 
         queue.push_back(source.clone());
         visited.insert(source.clone());
@@ -182,10 +182,9 @@ impl TrustGraph {
                 let mut path = Vec::new();
                 let mut node = sink.clone();
                 while node != *source {
-                    let (prev, _cap) = parent
-                        .get(&node)
-                        .cloned()
-                        .unwrap_or_else(|| panic!("no parent for {node}"));
+                    let Some(prev) = parent.get(&node).cloned() else {
+                        return Vec::new();
+                    };
                     path.push((prev.clone(), node.clone()));
                     node = prev;
                 }
@@ -193,25 +192,32 @@ impl TrustGraph {
                 return path;
             }
 
-            // Explore neighbors
-            if let Some(neighbors) = self.adj.get(&current) {
-                for neighbor in neighbors {
-                    if visited.contains(neighbor) {
-                        continue;
-                    }
-                    let key = (current.clone(), neighbor.clone());
-                    if let Some(&cap) = residual.get(&key) {
-                        if cap > 0 {
-                            visited.insert(neighbor.clone());
-                            parent.insert(neighbor.clone(), (current.clone(), cap));
-                            queue.push_back(neighbor.clone());
-                        }
+            for neighbor in self.residual_neighbors(residual, &current) {
+                if visited.contains(&neighbor) {
+                    continue;
+                }
+                let key = (current.clone(), neighbor.clone());
+                if let Some(&cap) = residual.get(&key) {
+                    if cap > 0 {
+                        visited.insert(neighbor.clone());
+                        parent.insert(neighbor.clone(), current.clone());
+                        queue.push_back(neighbor);
                     }
                 }
             }
         }
 
         Vec::new() // No path found
+    }
+
+    fn residual_neighbors(&self, residual: &HashMap<(Did, Did), u64>, current: &Did) -> Vec<Did> {
+        let mut neighbors = self.adj.get(current).cloned().unwrap_or_default();
+        for ((from, to), cap) in residual {
+            if from == current && *cap > 0 && !neighbors.contains(to) {
+                neighbors.push(to.clone());
+            }
+        }
+        neighbors
     }
 }
 
@@ -313,6 +319,30 @@ mod tests {
         let paths = graph.find_paths(&a, &d, 50, 5);
         let total: u64 = paths.iter().map(|p| p.capacity).sum();
         assert!(total >= 30); // Should find at least one path
+    }
+
+    #[test]
+    fn residual_reverse_edges_allow_rerouting_flow() {
+        let mut graph = TrustGraph::new();
+        let source = did("S");
+        let left = did("L");
+        let right = did("R");
+        let middle = did("M");
+        let alternate = did("A");
+        let sink = did("T");
+
+        graph.add_edge(source.clone(), left.clone(), 1);
+        graph.add_edge(source.clone(), right.clone(), 1);
+        graph.add_edge(left.clone(), middle.clone(), 1);
+        graph.add_edge(right.clone(), middle.clone(), 1);
+        graph.add_edge(middle.clone(), sink.clone(), 1);
+        graph.add_edge(left.clone(), alternate.clone(), 1);
+        graph.add_edge(alternate.clone(), sink.clone(), 1);
+
+        let paths = graph.find_paths(&source, &sink, 2, 5);
+        let total: u64 = paths.iter().map(|path| path.capacity).sum();
+
+        assert_eq!(total, 2);
     }
 
     #[test]

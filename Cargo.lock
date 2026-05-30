@@ -1770,9 +1770,11 @@ dependencies = [
 name = "nexus-economy"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nexus-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
 ]

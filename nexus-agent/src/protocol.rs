@@ -9,12 +9,14 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use nexus_core::{Did, WorkspaceId};
 use nexus_crypto::capability::{verify_capability, SigningError};
 use nexus_crypto::{parse_did, DidError, NodeIdentity};
+use nexus_economy::SettlementError;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::AgentManifest;
 use crate::society::{
     AgentIntent, CapabilityGrant, CollectiveDecision, CollectiveProposal, CollectiveVote,
-    IntentResponse, Interaction, RelationKind, TaskDispute, WorkspaceRun, WorkspaceSnapshot,
+    IntentResponse, Interaction, RelationKind, SettlementRecord, TaskDispute, WorkspaceRun,
+    WorkspaceSnapshot,
 };
 use crate::task::{
     ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec,
@@ -53,6 +55,9 @@ pub enum SocialProtocolError {
 
     #[error("invalid capability grant: {0}")]
     InvalidCapabilityGrant(#[from] SigningError),
+
+    #[error("invalid settlement proof: {0}")]
+    InvalidSettlementProof(#[from] SettlementError),
 
     #[error("task result receipt does not match result")]
     TaskResultReceiptMismatch,
@@ -136,6 +141,8 @@ pub enum SocialEventKind {
     TaskCompleted { result: TaskResult },
     /// Dispute a task result or execution claim.
     TaskDisputed { dispute: TaskDispute },
+    /// Record a verified economic settlement claim.
+    SettlementRecorded { settlement: SettlementRecord },
 }
 
 impl SocialEvent {
@@ -257,6 +264,11 @@ impl SocialEvent {
             SocialEventKind::TaskDisputed { dispute } => {
                 self.ensure_subject("task dispute", &dispute.disputer)
             }
+            SocialEventKind::SettlementRecorded { settlement } => {
+                self.ensure_subject("settlement", &settlement.payer)?;
+                settlement.proof.validate()?;
+                Ok(())
+            }
             SocialEventKind::CollectiveDeclared { members, .. } => {
                 for member in members {
                     self.ensure_subject("collective membership", member)?;
@@ -310,10 +322,13 @@ mod tests {
     use nexus_core::PermissionSet;
     use nexus_crypto::capability::sign_capability;
     use nexus_crypto::NodeIdentity;
+    use nexus_economy::{LightningSettlement, SettlementProof};
     use nexus_runtime::{ProcessOutput, ResourceUsage};
+    use sha2::{Digest, Sha256};
 
     use crate::society::{
-        AgentIntent, IntentKind, IntentResponse, IntentResponseKind, InteractionOutcome, Society,
+        AgentIntent, IntentKind, IntentResponse, IntentResponseKind, InteractionOutcome,
+        SettlementRecord, Society,
     };
     use crate::task::{ExecutionReceipt, TaskResult, TaskSpec};
 
@@ -918,6 +933,72 @@ mod tests {
         assert!(matches!(
             event.validate().unwrap_err(),
             SocialProtocolError::InvalidExecutionReceipt(_)
+        ));
+    }
+
+    #[test]
+    fn validation_accepts_settlement_record_with_valid_proof() {
+        let payer = NodeIdentity::generate();
+        let payee = NodeIdentity::generate();
+        let preimage = [11u8; 32];
+        let settlement = SettlementRecord {
+            id: "settlement-1".into(),
+            task_id: Some("task-1".into()),
+            claim_id: Some("claim-1".into()),
+            payer: payer.did().clone(),
+            payee: payee.did().clone(),
+            amount: 100,
+            proof: SettlementProof::Lightning(LightningSettlement {
+                amount_msat: 100_000,
+                payment_hash_hex: hex::encode(Sha256::digest(preimage)),
+                preimage_hex: hex::encode(preimage),
+            }),
+            settled_at: 50,
+        };
+
+        let event = SocialEvent::new(
+            payer.did().clone(),
+            51,
+            SocialEventKind::SettlementRecorded { settlement },
+        )
+        .sign(&payer)
+        .unwrap();
+
+        event.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_settlement_record_for_another_payer() {
+        let payer = NodeIdentity::generate();
+        let payee = NodeIdentity::generate();
+        let observer = NodeIdentity::generate();
+        let preimage = [12u8; 32];
+        let settlement = SettlementRecord {
+            id: "settlement-1".into(),
+            task_id: None,
+            claim_id: None,
+            payer: payer.did().clone(),
+            payee: payee.did().clone(),
+            amount: 100,
+            proof: SettlementProof::Lightning(LightningSettlement {
+                amount_msat: 100_000,
+                payment_hash_hex: hex::encode(Sha256::digest(preimage)),
+                preimage_hex: hex::encode(preimage),
+            }),
+            settled_at: 50,
+        };
+
+        let event = SocialEvent::new(
+            observer.did().clone(),
+            51,
+            SocialEventKind::SettlementRecorded { settlement },
+        )
+        .sign(&observer)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch { .. }
         ));
     }
 }

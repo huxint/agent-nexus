@@ -11,10 +11,15 @@ pub mod credit;
 pub mod ledger;
 pub mod pricing;
 pub mod reputation;
+pub mod settlement;
 pub mod trust;
 
 pub use credit::BilateralCredit;
 pub use ledger::CreditLedger;
 pub use pricing::{CostEstimate, ResourcePricing};
 pub use reputation::ReputationScore;
+pub use settlement::{
+    AnchoredCheckpoint, AuthorityAnchor, AuthorityKind, ExternalPaymentSettlement,
+    LightningSettlement, MutualCreditSettlement, SettlementError, SettlementProof, StateCheckpoint,
+};
 pub use trust::{find_payment_paths, PaymentPath, TrustGraph};
