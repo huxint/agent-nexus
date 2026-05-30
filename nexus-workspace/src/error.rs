@@ -23,7 +23,7 @@ pub enum WorkspaceError {
     Storage(#[from] StoreError),
 
     #[error("execution error: {0}")]
-    Exec(#[from] ExecError),
+    Exec(Box<ExecError>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -33,6 +33,12 @@ pub enum WorkspaceError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<ExecError> for WorkspaceError {
+    fn from(error: ExecError) -> Self {
+        Self::Exec(Box::new(error))
+    }
 }
 
 impl From<WorkspaceError> for NexusError {

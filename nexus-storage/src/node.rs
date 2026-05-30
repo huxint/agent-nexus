@@ -10,6 +10,11 @@
 //! {"type": "blob", "data": <bytes>}
 //! ```
 //!
+//! ### Chunked blob
+//! ```cbor
+//! {"type": "chunked_blob", "chunks": [<cid>, ...], "size": <u64>}
+//! ```
+//!
 //! ### Tree
 //! ```cbor
 //! {"type": "tree", "entries": [
@@ -45,8 +50,9 @@ pub struct TreeEntry {
 
 /// A Merkle-DAG node.
 ///
-/// Blob nodes contain raw data; tree nodes contain directory entries.
-/// Both are content-addressed: `CID = SHA-256(CBOR(node))`.
+/// Blob nodes contain raw data; chunked blobs describe a file split across
+/// raw blob chunks; tree nodes contain directory entries. All nodes are
+/// content-addressed: `CID = SHA-256(CBOR(node))`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum MerkleNode {
@@ -55,6 +61,13 @@ pub enum MerkleNode {
         /// Raw payload.
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+    },
+    #[serde(rename = "chunked_blob")]
+    ChunkedBlob {
+        /// Ordered chunk CIDs. Each chunk must resolve to a raw blob node.
+        chunks: Vec<Cid>,
+        /// Total file size in bytes.
+        size: u64,
     },
     #[serde(rename = "tree")]
     Tree {
@@ -67,6 +80,11 @@ impl MerkleNode {
     /// Create a new blob node.
     pub fn blob(data: Vec<u8>) -> Self {
         Self::Blob { data }
+    }
+
+    /// Create a new chunked blob node.
+    pub fn chunked_blob(chunks: Vec<Cid>, size: u64) -> Self {
+        Self::ChunkedBlob { chunks, size }
     }
 
     /// Create a new tree node (empty or with entries).
@@ -97,7 +115,7 @@ impl MerkleNode {
     /// Returns the kind of this node.
     pub fn kind(&self) -> NodeKind {
         match self {
-            Self::Blob { .. } => NodeKind::Blob,
+            Self::Blob { .. } | Self::ChunkedBlob { .. } => NodeKind::Blob,
             Self::Tree { .. } => NodeKind::Tree,
         }
     }
@@ -106,6 +124,14 @@ impl MerkleNode {
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Self::Blob { data } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// If this is a chunked blob, return its ordered chunk CIDs and total size.
+    pub fn as_chunked_blob(&self) -> Option<(&[Cid], u64)> {
+        match self {
+            Self::ChunkedBlob { chunks, size } => Some((chunks, *size)),
             _ => None,
         }
     }
@@ -196,6 +222,20 @@ mod tests {
         let cbor = blob.to_cbor().unwrap();
         let decoded = MerkleNode::from_cbor(&cbor).unwrap();
         assert_eq!(blob, decoded);
+    }
+
+    #[test]
+    fn chunked_blob_roundtrip_and_kind() {
+        let chunk_a = Cid::hash_of(b"chunk-a");
+        let chunk_b = Cid::hash_of(b"chunk-b");
+        let node = MerkleNode::chunked_blob(vec![chunk_a, chunk_b], 14);
+
+        assert_eq!(node.kind(), NodeKind::Blob);
+        assert_eq!(node.as_chunked_blob(), Some((&[chunk_a, chunk_b][..], 14)));
+
+        let cbor = node.to_cbor().unwrap();
+        let decoded = MerkleNode::from_cbor(&cbor).unwrap();
+        assert_eq!(node, decoded);
     }
 
     #[test]

@@ -142,6 +142,76 @@ async fn get_block_rejects_content_cid_mismatch() {
     assert!(err.to_string().contains("block content CID mismatch"));
 }
 
+/// Chunked file nodes must cause sync recursion to fetch the chunk blocks too.
+#[tokio::test]
+async fn clone_workspace_fetches_chunked_blob_children() {
+    use base64::Engine;
+
+    let remote_store: Arc<dyn BlockStore> = Arc::new(InMemoryBlockStore::new());
+    let chunk_a = remote_store
+        .put(MerkleNode::blob(b"large-".to_vec()))
+        .await
+        .unwrap();
+    let chunk_b = remote_store
+        .put(MerkleNode::blob(b"file".to_vec()))
+        .await
+        .unwrap();
+    let file_node = MerkleNode::chunked_blob(vec![chunk_a, chunk_b], "large-file".len() as u64);
+    let file_cid = remote_store.put(file_node).await.unwrap();
+    let root_node = MerkleNode::tree(vec![TreeEntry {
+        name: "large.bin".into(),
+        cid: file_cid,
+        kind: NodeKind::Blob,
+    }]);
+    let root_cid = remote_store.put(root_node).await.unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = SyncClient::new(tx);
+    let peer = libp2p::PeerId::random();
+    let workspace_id = WorkspaceId::from_bytes([9; 32]);
+    let remote_store_for_task = Arc::clone(&remote_store);
+
+    tokio::spawn(async move {
+        while let Some((_peer, request, reply)) = rx.recv().await {
+            let response = match request {
+                SyncRequest::StateRequest { workspace_id } => SyncResponse::StateResponse {
+                    workspace_id,
+                    root_cid_hex: hex::encode(root_cid.as_bytes()),
+                    name: "chunked".into(),
+                    owner_did: "did:key:z6MkChunked".into(),
+                },
+                SyncRequest::BlockRequest {
+                    workspace_id,
+                    cid_hex,
+                } => {
+                    let cid_bytes = hex::decode(&cid_hex).unwrap();
+                    let cid = Cid::from_bytes(cid_bytes.try_into().unwrap());
+                    let node = remote_store_for_task.get(&cid).await.unwrap();
+                    SyncResponse::BlockResponse {
+                        workspace_id,
+                        cid_hex,
+                        cbor_base64: base64::engine::general_purpose::STANDARD
+                            .encode(node.to_cbor().unwrap()),
+                    }
+                }
+                other => panic!("unexpected request: {other:?}"),
+            };
+            reply.send(Ok(response)).ok();
+        }
+    });
+
+    let local_store: Arc<dyn BlockStore> = Arc::new(InMemoryBlockStore::new());
+    let synced_root = client
+        .clone_workspace(peer, workspace_id, &local_store)
+        .await
+        .unwrap();
+
+    assert_eq!(synced_root, root_cid);
+    assert!(local_store.has(&file_cid).await.unwrap());
+    assert!(local_store.has(&chunk_a).await.unwrap());
+    assert!(local_store.has(&chunk_b).await.unwrap());
+}
+
 /// Verify workspace ID is stable when derived from root CID.
 #[test]
 fn workspace_id_from_root_cid() {

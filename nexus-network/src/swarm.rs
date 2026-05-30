@@ -133,6 +133,10 @@ impl Network {
         let libp2p_keypair = transport::to_libp2p_keypair(node_identity);
         let local_peer_id = libp2p_keypair.public().to_peer_id();
         let gs_kp = libp2p_keypair.clone();
+        let mut behaviour =
+            CompositeBehaviour::new(local_peer_id, libp2p_keypair.public(), gs_kp.clone())
+                .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?;
+        behaviour.kademlia.set_mode(Some(config.kademlia_mode));
 
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair.clone())
             .with_tokio()
@@ -142,14 +146,9 @@ impl Network {
                     .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
                     .boxed()
             })
-            .expect("transport")
-            .with_behaviour(|_key| {
-                let mut b =
-                    CompositeBehaviour::new(local_peer_id, libp2p_keypair.public(), gs_kp.clone());
-                b.kademlia.set_mode(Some(config.kademlia_mode));
-                b
-            })
-            .expect("behaviour")
+            .map_err(|err| NexusError::Network(format!("transport: {err}")))?
+            .with_behaviour(|_key| behaviour)
+            .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 

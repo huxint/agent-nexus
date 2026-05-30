@@ -1,6 +1,7 @@
 //! Sync client — fetches workspace state and blocks from a remote peer.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use libp2p::PeerId;
 use nexus_core::WorkspaceId;
@@ -20,6 +21,9 @@ pub type SyncRequestSender = mpsc::UnboundedSender<SyncRequestEnvelope>;
 pub enum SyncError {
     #[error("request failed: {0}")]
     RequestFailed(String),
+
+    #[error("request timed out after {0:?}")]
+    RequestTimedOut(Duration),
 
     #[error("workspace not found on remote")]
     WorkspaceNotFound,
@@ -41,12 +45,23 @@ pub enum SyncError {
 pub struct SyncClient {
     /// Channel to send sync requests to the network event loop.
     request_tx: SyncRequestSender,
+    request_timeout: Duration,
 }
 
 impl SyncClient {
+    pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Create a new sync client backed by the given request channel.
     pub fn new(request_tx: SyncRequestSender) -> Self {
-        Self { request_tx }
+        Self::with_timeout(request_tx, Self::DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Create a sync client with an explicit per-request timeout.
+    pub fn with_timeout(request_tx: SyncRequestSender, request_timeout: Duration) -> Self {
+        Self {
+            request_tx,
+            request_timeout,
+        }
     }
 
     /// Send a sync request to a peer and await the response.
@@ -56,7 +71,11 @@ impl SyncClient {
             .send((peer, req, reply_tx))
             .map_err(|_| SyncError::RequestFailed("event loop closed".into()))?;
 
-        match reply_rx.await {
+        let reply = tokio::time::timeout(self.request_timeout, reply_rx)
+            .await
+            .map_err(|_| SyncError::RequestTimedOut(self.request_timeout))?;
+
+        match reply {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(SyncError::Remote(e)),
             Err(_) => Err(SyncError::RequestFailed("reply channel closed".into())),
@@ -188,11 +207,16 @@ impl SyncClient {
 
         let node = self.get_block(peer, workspace_id, cid).await?;
 
-        // If it's a tree, fetch all children
-        if let Some(entries) = node.as_tree() {
-            for entry in entries {
-                Box::pin(self.fetch_recursive(peer, workspace_id, &entry.cid, store)).await?;
-            }
+        let child_cids = if let Some(entries) = node.as_tree() {
+            entries.iter().map(|entry| entry.cid).collect::<Vec<_>>()
+        } else if let Some((chunks, _)) = node.as_chunked_blob() {
+            chunks.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        for child in child_cids {
+            Box::pin(self.fetch_recursive(peer, workspace_id, &child, store)).await?;
         }
 
         // Store the block
@@ -202,5 +226,35 @@ impl SyncClient {
             .map_err(|e| SyncError::Storage(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_times_out_when_network_task_never_replies() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = SyncClient::with_timeout(tx, Duration::from_millis(20));
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let workspace_id = WorkspaceId::from_bytes([42; 32]);
+
+        let _hold_reply = tokio::spawn(async move {
+            let (_peer, _request, _reply) = rx.recv().await.expect("sync request");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let err = client
+            .request(peer, SyncRequest::StateRequest { workspace_id })
+            .await
+            .expect_err("request should time out");
+
+        assert!(matches!(
+            err,
+            SyncError::RequestTimedOut(timeout) if timeout == Duration::from_millis(20)
+        ));
     }
 }

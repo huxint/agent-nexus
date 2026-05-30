@@ -1,5 +1,6 @@
 //! Workspace — the core abstraction that ties storage, execution, and identity together.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::filesystem;
+
+const FILE_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Guest
@@ -431,19 +434,21 @@ impl Workspace {
             }
 
             let path = entry.path();
-            let metadata = entry.metadata()?;
+            let file_type = entry.file_type()?;
 
-            if metadata.is_dir() {
+            if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+                continue;
+            }
+
+            if file_type.is_dir() {
                 let child_cid = Box::pin(Self::index_directory(store, &path)).await?;
                 entries.push(TreeEntry {
                     name,
                     cid: child_cid,
                     kind: NodeKind::Tree,
                 });
-            } else {
-                let data = std::fs::read(&path)?;
-                let blob = MerkleNode::blob(data);
-                let child_cid = store.put(blob).await?;
+            } else if file_type.is_file() {
+                let child_cid = Self::index_file(store, &path).await?;
                 entries.push(TreeEntry {
                     name,
                     cid: child_cid,
@@ -455,6 +460,40 @@ impl Workspace {
         let tree = MerkleNode::tree(entries);
         let cid = store.put(tree).await?;
         Ok(cid)
+    }
+
+    async fn index_file(store: &dyn BlockStore, path: &Path) -> WorkspaceResult<Cid> {
+        if std::fs::metadata(path)?.len() <= FILE_CHUNK_SIZE_BYTES as u64 {
+            let data = std::fs::read(path)?;
+            return Ok(store.put(MerkleNode::blob(data)).await?);
+        }
+
+        let mut file = std::fs::File::open(path)?;
+        let mut chunks = Vec::new();
+        let mut total_size = 0_u64;
+
+        loop {
+            let mut data = vec![0_u8; FILE_CHUNK_SIZE_BYTES];
+            let read = file.read(&mut data)?;
+            if read == 0 {
+                break;
+            }
+            data.truncate(read);
+            total_size += read as u64;
+            chunks.push(store.put(MerkleNode::blob(data)).await?);
+        }
+
+        if chunks.is_empty() {
+            return Ok(store.put(MerkleNode::blob(Vec::new())).await?);
+        }
+
+        if chunks.len() == 1 {
+            return Ok(chunks[0]);
+        }
+
+        Ok(store
+            .put(MerkleNode::chunked_blob(chunks, total_size))
+            .await?)
     }
 
     async fn restore_tree(
@@ -474,14 +513,12 @@ impl Workspace {
             match entry.kind {
                 NodeKind::Blob => {
                     let node = Self::verified_node(source_store, &entry.cid).await?;
-                    let data = node.as_blob().ok_or_else(|| {
-                        WorkspaceError::Other(format!("tree entry '{}' is not a blob", entry.name))
-                    })?;
                     target_store.put(node.clone()).await?;
                     if let Some(parent) = path.parent() {
                         filesystem::ensure_dir(parent)?;
                     }
-                    std::fs::write(path, data)?;
+                    Self::restore_blob_node(source_store, target_store, &node, &entry.name, &path)
+                        .await?;
                 }
                 NodeKind::Tree => {
                     filesystem::ensure_dir(&path)?;
@@ -497,6 +534,49 @@ impl Workspace {
         }
 
         Ok(())
+    }
+
+    async fn restore_blob_node(
+        source_store: &dyn BlockStore,
+        target_store: &dyn BlockStore,
+        node: &MerkleNode,
+        entry_name: &str,
+        path: &Path,
+    ) -> WorkspaceResult<()> {
+        if let Some(data) = node.as_blob() {
+            std::fs::write(path, data)?;
+            return Ok(());
+        }
+
+        if let Some((chunks, expected_size)) = node.as_chunked_blob() {
+            let mut file = std::fs::File::create(path)?;
+            let mut restored_size = 0_u64;
+            for chunk in chunks {
+                let chunk_node = Self::verified_node(source_store, chunk).await?;
+                let data = chunk_node.as_blob().ok_or_else(|| {
+                    WorkspaceError::Other(format!(
+                        "chunk {} for '{}' is not a blob",
+                        hex::encode(chunk.as_bytes()),
+                        entry_name
+                    ))
+                })?;
+                target_store.put(chunk_node.clone()).await?;
+                file.write_all(data)?;
+                restored_size += data.len() as u64;
+            }
+            if restored_size != expected_size {
+                return Err(WorkspaceError::Other(format!(
+                    "chunked blob '{}' size mismatch: expected {}, got {}",
+                    entry_name, expected_size, restored_size
+                )));
+            }
+            return Ok(());
+        }
+
+        Err(WorkspaceError::Other(format!(
+            "tree entry '{}' is not a blob",
+            entry_name
+        )))
     }
 
     async fn verified_node(store: &dyn BlockStore, cid: &Cid) -> WorkspaceResult<MerkleNode> {
@@ -678,6 +758,10 @@ mod tests {
             for entry in entries {
                 Box::pin(copy_tree(source, target, &entry.cid)).await?;
             }
+        } else if let Some((chunks, _)) = node.as_chunked_blob() {
+            for chunk in chunks {
+                Box::pin(copy_tree(source, target, chunk)).await?;
+            }
         }
         target.put(node).await?;
         Ok(())
@@ -824,6 +908,35 @@ mod tests {
         assert_eq!(ws.root_cid().unwrap(), cid2);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_and_listing_skip_symlinks() {
+        let (mut ws, base) = setup_workspace().await;
+        let outside = base.path().join("outside-secret.txt");
+        std::fs::write(&outside, b"outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.root_dir().join("linked-secret")).unwrap();
+        ws.write_file("real.txt", b"real").unwrap();
+
+        let files = ws.list_files().unwrap();
+        assert!(files
+            .iter()
+            .any(|entry| entry.path == Path::new("real.txt")));
+        assert!(!files
+            .iter()
+            .any(|entry| entry.path == Path::new("linked-secret")));
+
+        let root = ws.snapshot().await.unwrap();
+        let root_node = ws.store.get(&root).await.unwrap();
+        let entries = root_node.as_tree().unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "real.txt"));
+        assert!(!entries.iter().any(|entry| entry.name == "linked-secret"));
+        assert!(!ws
+            .store
+            .has(&MerkleNode::blob(b"outside secret".to_vec()).cid())
+            .await
+            .unwrap());
+    }
+
     #[tokio::test]
     async fn materialize_from_store_restores_workspace_files() {
         let owner = NodeIdentity::generate();
@@ -871,6 +984,60 @@ mod tests {
         let loaded = Workspace::load(&owner, &clone_path).await.unwrap();
         assert_eq!(loaded.id(), source.id());
         assert_eq!(loaded.owner(), remote_owner.did());
+    }
+
+    #[tokio::test]
+    async fn large_files_snapshot_as_chunks_and_restore() {
+        let owner = NodeIdentity::generate();
+        let base = TempDir::new().unwrap();
+        let mut source = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "source".into(),
+                description: "source workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let data = (0..(FILE_CHUNK_SIZE_BYTES + 17))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        source.write_file("large.bin", &data).unwrap();
+        let root = source.snapshot().await.unwrap();
+
+        let root_node = source.store.get(&root).await.unwrap();
+        let entry = root_node
+            .lookup("large.bin")
+            .expect("large file tree entry");
+        let file_node = source.store.get(&entry.cid).await.unwrap();
+        let (chunks, size) = file_node
+            .as_chunked_blob()
+            .expect("large file should be chunked");
+        assert_eq!(size, data.len() as u64);
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            let chunk_node = source.store.get(chunk).await.unwrap();
+            assert!(chunk_node.as_blob().unwrap().len() <= FILE_CHUNK_SIZE_BYTES);
+        }
+
+        let clone_path = base.path().join("chunked-clone");
+        let cloned = Workspace::materialize_from_store(
+            owner.did(),
+            &clone_path,
+            WorkspaceConfig {
+                name: "clone".into(),
+                description: "restored workspace".into(),
+            },
+            source.id(),
+            root,
+            source.store.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cloned.read_file("large.bin").unwrap(), data);
     }
 
     #[tokio::test]

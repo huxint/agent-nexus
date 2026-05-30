@@ -77,10 +77,14 @@ fn workspace_snapshot_key(snapshot: &WorkspaceSnapshot) -> String {
 }
 
 fn workspace_run_key(run: &WorkspaceRun) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        run.workspace, run.actor, run.command, run.started_at, run.finished_at
-    )
+    let bytes = serde_json::to_vec(run).unwrap_or_else(|_| {
+        format!(
+            "{}|{}|{}|{}|{}",
+            run.workspace, run.actor, run.command, run.started_at, run.finished_at
+        )
+        .into_bytes()
+    });
+    hex::encode(Cid::hash_of(&bytes).as_bytes())
 }
 
 fn intent_key(intent: &AgentIntent) -> String {
@@ -422,6 +426,46 @@ pub struct WorkspaceSnapshot {
     pub timestamp: u64,
 }
 
+/// Non-secret execution context for a free workspace run.
+///
+/// The context records enough to replay or audit how a command was invoked,
+/// while intentionally omitting environment variable values.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRunContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<WorkspaceRunStdin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl WorkspaceRunContext {
+    pub fn is_empty(&self) -> bool {
+        self.working_dir.is_none()
+            && self.env_keys.is_empty()
+            && self.stdin.is_none()
+            && self.timeout_ms.is_none()
+    }
+}
+
+/// Content-addressed stdin evidence for a workspace run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRunStdin {
+    pub bytes: u64,
+    pub cid: Cid,
+}
+
+/// Error metadata for a workspace run attempt that did not produce process
+/// output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRunFailure {
+    pub kind: String,
+    pub message: String,
+}
+
 /// A signed claim that an agent executed a command in a free workspace.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceRun {
@@ -434,6 +478,10 @@ pub struct WorkspaceRun {
     pub stderr: Cid,
     pub output_root: Option<Cid>,
     pub resources: ResourceUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<WorkspaceRunContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WorkspaceRunFailure>,
     pub started_at: u64,
     pub finished_at: u64,
     pub note: Option<String>,
@@ -1516,7 +1564,7 @@ impl Society {
                 self.record_workspace_snapshot(snapshot.clone());
             }
             SocialEventKind::WorkspaceRunRecorded { run } => {
-                self.record_workspace_run(run.clone());
+                self.record_workspace_run(run.as_ref().clone());
             }
             SocialEventKind::IntentPublished { intent } => {
                 self.record_intent(intent.clone());
@@ -2747,7 +2795,7 @@ mod tests {
             actor.did().clone(),
             2,
             SocialEventKind::WorkspaceRunRecorded {
-                run: WorkspaceRun {
+                run: Box::new(WorkspaceRun {
                     workspace,
                     actor: actor.did().clone(),
                     command: "python".into(),
@@ -2760,10 +2808,20 @@ mod tests {
                         process_count: 1,
                         ..Default::default()
                     },
+                    context: Some(WorkspaceRunContext {
+                        working_dir: Some("analysis".into()),
+                        env_keys: vec!["PYTHONPATH".into()],
+                        stdin: Some(WorkspaceRunStdin {
+                            bytes: 2,
+                            cid: nexus_storage::Cid::hash_of(b"{}"),
+                        }),
+                        timeout_ms: Some(30_000),
+                    }),
+                    failure: None,
                     started_at: 1,
                     finished_at: 2,
                     note: Some("autonomous analysis".into()),
-                },
+                }),
             },
         ));
 
@@ -2772,6 +2830,11 @@ mod tests {
         assert_eq!(runs[0].actor, actor.did().clone());
         assert_eq!(runs[0].stdout, stdout);
         assert_eq!(runs[0].output_root, Some(root));
+        let context = runs[0].context.as_ref().unwrap();
+        assert_eq!(context.working_dir.as_deref(), Some("analysis"));
+        assert_eq!(context.env_keys, vec!["PYTHONPATH"]);
+        assert_eq!(context.stdin.as_ref().unwrap().bytes, 2);
+        assert_eq!(context.timeout_ms, Some(30_000));
         let snapshots = society.workspace_snapshots(&workspace);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].actor, actor.did().clone());
@@ -2787,6 +2850,45 @@ mod tests {
     }
 
     #[test]
+    fn workspace_run_events_keep_same_second_distinct_outputs() {
+        let actor = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([77; 32]);
+        let mut society = Society::new();
+
+        for stdout in [
+            nexus_storage::Cid::hash_of(b"first"),
+            nexus_storage::Cid::hash_of(b"second"),
+        ] {
+            society.apply_event(&SocialEvent::new(
+                actor.did().clone(),
+                2,
+                SocialEventKind::WorkspaceRunRecorded {
+                    run: Box::new(WorkspaceRun {
+                        workspace,
+                        actor: actor.did().clone(),
+                        command: "python".into(),
+                        args: vec!["analysis.py".into()],
+                        exit_code: 0,
+                        stdout,
+                        stderr: nexus_storage::Cid::hash_of(b""),
+                        output_root: None,
+                        resources: ResourceUsage::default(),
+                        context: None,
+                        failure: None,
+                        started_at: 1,
+                        finished_at: 2,
+                        note: None,
+                    }),
+                },
+            ));
+        }
+
+        let runs = society.workspace_runs(&workspace);
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].stdout, runs[1].stdout);
+    }
+
+    #[test]
     fn explicit_workspace_snapshot_replaces_derived_snapshot_metadata() {
         let actor = NodeIdentity::generate();
         let workspace = WorkspaceId::from_bytes([76; 32]);
@@ -2797,7 +2899,7 @@ mod tests {
             actor.did().clone(),
             2,
             SocialEventKind::WorkspaceRunRecorded {
-                run: WorkspaceRun {
+                run: Box::new(WorkspaceRun {
                     workspace,
                     actor: actor.did().clone(),
                     command: "sh".into(),
@@ -2807,10 +2909,12 @@ mod tests {
                     stderr: nexus_storage::Cid::hash_of(b""),
                     output_root: Some(root),
                     resources: ResourceUsage::default(),
+                    context: None,
+                    failure: None,
                     started_at: 1,
                     finished_at: 2,
                     note: None,
-                },
+                }),
             },
         ));
         society.apply_event(&SocialEvent::new(

@@ -5,9 +5,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
-use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use crate::resources::ResourceUsage;
 
@@ -26,8 +28,13 @@ pub enum ExecError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("timeout after {0:?}")]
-    Timeout(std::time::Duration),
+    #[error("timeout after {duration:?}")]
+    Timeout {
+        duration: std::time::Duration,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        resources: ResourceUsage,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -110,7 +117,7 @@ impl Executor {
 
     /// Run a command and capture all output.
     ///
-    /// Uses `tokio::process::Command` with `wait_with_output()` internally.
+    /// Uses `tokio::process::Command` and drains output pipes concurrently.
     /// For complex commands (pipes, redirects), pass `["sh", "-c", "<cmd>"]`.
     pub async fn exec(
         &self,
@@ -148,7 +155,21 @@ impl Executor {
 
         let wall_start = Instant::now();
 
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => ExecError::CommandNotFound(program.to_string()),
+            _ => ExecError::Io(err),
+        })?;
+
+        let stdout_reader = if options.capture_stdout {
+            child.stdout.take().map(spawn_output_reader)
+        } else {
+            None
+        };
+        let stderr_reader = if options.capture_stderr {
+            child.stderr.take().map(spawn_output_reader)
+        } else {
+            None
+        };
 
         // Feed stdin
         if let Some(ref stdin_data) = options.stdin {
@@ -157,18 +178,32 @@ impl Executor {
             }
         }
 
-        let output = if let Some(timeout) = options.timeout {
-            tokio::time::timeout(timeout, child.wait_with_output())
-                .await
-                .map_err(|_| ExecError::Timeout(timeout))?
-                .map_err(ExecError::Io)?
+        let status = if let Some(timeout) = options.timeout {
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(status) => status.map_err(ExecError::Io)?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let wall_time = wall_start.elapsed();
+                    let resources = ResourceUsage {
+                        wall_time,
+                        process_count: 1,
+                        ..Default::default()
+                    };
+                    return Err(ExecError::Timeout {
+                        duration: timeout,
+                        stdout: collect_partial_output(stdout_reader).await?,
+                        stderr: collect_partial_output(stderr_reader).await?,
+                        resources,
+                    });
+                }
+            }
         } else {
-            child.wait_with_output().await?
+            child.wait().await?
         };
 
         let wall_time = wall_start.elapsed();
 
-        let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = status.code().unwrap_or(-1);
 
         // Approximate resource usage from /proc if available (Linux-only)
         // For now, we just track wall time.
@@ -180,8 +215,8 @@ impl Executor {
 
         Ok(ProcessOutput {
             exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: collect_output(stdout_reader).await?,
+            stderr: collect_output(stderr_reader).await?,
             resources,
         })
     }
@@ -193,6 +228,79 @@ impl Executor {
             None => self.workspace_dir.clone(),
         }
     }
+}
+
+const OUTPUT_READ_CHUNK_SIZE: usize = 8 * 1024;
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(25);
+
+struct OutputReader {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> OutputReader
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let task_buffer = Arc::clone(&buffer);
+    let task = tokio::spawn(async move {
+        let mut chunk = [0u8; OUTPUT_READ_CHUNK_SIZE];
+        loop {
+            let bytes_read = reader.read(&mut chunk).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            task_buffer
+                .lock()
+                .await
+                .extend_from_slice(&chunk[..bytes_read]);
+        }
+        Ok(())
+    });
+    OutputReader { buffer, task }
+}
+
+async fn collect_output(reader: Option<OutputReader>) -> Result<Vec<u8>, ExecError> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+
+    let OutputReader { buffer, task } = reader;
+    task.await
+        .map_err(|err| ExecError::Other(format!("output reader failed: {err}")))?
+        .map_err(ExecError::Io)?;
+    let output = buffer.lock().await.clone();
+    Ok(output)
+}
+
+async fn collect_partial_output(reader: Option<OutputReader>) -> Result<Vec<u8>, ExecError> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+
+    let OutputReader { buffer, mut task } = reader;
+
+    tokio::select! {
+        result = &mut task => {
+            result
+                .map_err(|err| ExecError::Other(format!("output reader failed: {err}")))?
+                .map_err(ExecError::Io)?;
+        }
+        _ = tokio::time::sleep(OUTPUT_DRAIN_GRACE) => {
+            task.abort();
+            match task.await {
+                Ok(result) => result.map_err(ExecError::Io)?,
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => {
+                    return Err(ExecError::Other(format!("output reader failed: {err}")));
+                }
+            }
+        }
+    }
+
+    let output = buffer.lock().await.clone();
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +362,76 @@ mod tests {
 
         let err = executor
             .exec("__nonexistent_command_xyzzy__", &[], &opts)
-            .await;
+            .await
+            .expect_err("missing commands should be classified");
 
-        assert!(err.is_err());
+        assert!(
+            matches!(err, ExecError::CommandNotFound(command) if command == "__nonexistent_command_xyzzy__")
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_partial_output_and_resources() {
+        let executor = Executor::new("/tmp");
+        let opts = ExecOptions {
+            timeout: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        };
+
+        let err = executor
+            .exec(
+                "sh",
+                &["-c", "printf partial-out; printf partial-err >&2; sleep 1"],
+                &opts,
+            )
+            .await
+            .expect_err("timeout should return captured evidence");
+
+        match err {
+            ExecError::Timeout {
+                stdout,
+                stderr,
+                resources,
+                ..
+            } => {
+                assert_eq!(stdout, b"partial-out");
+                assert_eq!(stderr, b"partial-err");
+                assert_eq!(resources.process_count, 1);
+                assert!(resources.wall_time.as_millis() >= 50);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_is_not_delayed_by_descendant_inherited_stdout() {
+        let executor = Executor::new("/tmp");
+        let opts = ExecOptions {
+            timeout: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let start = Instant::now();
+
+        let err = executor
+            .exec(
+                "sh",
+                &[
+                    "-c",
+                    "printf ready; (sleep 1) & while true; do sleep 1; done",
+                ],
+                &opts,
+            )
+            .await
+            .expect_err("timeout should not wait for descendant pipe EOF");
+
+        assert!(
+            start.elapsed() < Duration::from_millis(750),
+            "timeout returned too slowly"
+        );
+        assert!(matches!(
+            err,
+            ExecError::Timeout { stdout, .. } if stdout == b"ready"
+        ));
     }
 
     #[tokio::test]
