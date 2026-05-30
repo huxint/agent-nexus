@@ -116,6 +116,32 @@ impl SyncClient {
         }
     }
 
+    /// Fetch signed workspace announcements from a peer.
+    pub async fn get_workspace_announcements(
+        &self,
+        peer: PeerId,
+        workspace_id: Option<WorkspaceId>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, SyncError> {
+        let resp = self
+            .request(
+                peer,
+                SyncRequest::WorkspaceAnnouncementsRequest {
+                    workspace_id,
+                    limit,
+                },
+            )
+            .await?;
+
+        match resp {
+            SyncResponse::WorkspaceAnnouncementsResponse { announcements_json } => {
+                Ok(announcements_json)
+            }
+            SyncResponse::Error { message } => Err(SyncError::Remote(message)),
+            other => Err(SyncError::Remote(format!("unexpected response: {other:?}"))),
+        }
+    }
+
     /// Fetch a single Merkle block from a remote peer.
     pub async fn get_block(
         &self,

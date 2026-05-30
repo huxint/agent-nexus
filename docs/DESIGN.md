@@ -132,6 +132,17 @@
 | **AutoNAT + DCUtR** | NAT 类型探测 + 中继打洞 | `libp2p-autonat` / `libp2p-dcutr` |
 | **Relay** | 为 NAT 后节点提供中继 | `libp2p-relay` |
 
+### 4.1.1 全球发现
+
+本地 mDNS 只能解决同一局域网发现，Aether 的默认方向是公网 DHT 发现：
+
+- 长期运行节点通过 Kademlia provider records 发布 `/nexus/global/1`，表示自己是 Nexus/Aether 网络成员。
+- 服务 workspace 的节点同时发布 `/nexus/workspace/1/<workspace-id>`，让 clone/discover 可以在不知道 PeerId 和 IP 的情况下按 workspace 查找 provider。
+- `nexus-node discover --global` 和 `nexus-node clone --global` 通过 bootstrap/rendezvous 节点进入 DHT，找到 provider 后用 request/response 拉取签名 workspace announcement，再验证 DID 签名、workspace root 和 owner。
+- 启动公网发现需要至少一个可达 bootstrap/rendezvous 地址。CLI 支持 `--bootstrap <ADDR>`，也支持用 `NEXUS_BOOTSTRAP` 配置默认 bootstrap 列表；正式网络可通过 DNS 或发布的种子节点列表提供这个入口。
+
+这仍然保持自我主权身份：bootstrap 节点只负责让节点进入 DHT，不签发身份、不决定可信度，也不替代签名公告和社会层验证。
+
 ### 4.2 核心抽象
 
 ```rust

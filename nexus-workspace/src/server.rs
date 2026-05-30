@@ -170,6 +170,9 @@ impl WorkspaceServer {
             SyncRequest::SocialEventsRequest { .. } => SyncResponse::Error {
                 message: "social events are handled by nexus-node".into(),
             },
+            SyncRequest::WorkspaceAnnouncementsRequest { .. } => SyncResponse::Error {
+                message: "workspace announcements are handled by nexus-node".into(),
+            },
         }
     }
 }

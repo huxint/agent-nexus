@@ -3,6 +3,7 @@
 //! Tests two-node communication: both nodes start, discover each other,
 //! and exchange events.
 
+use libp2p::multiaddr::Protocol;
 use nexus_crypto::NodeIdentity;
 use nexus_network::{Network, NetworkConfig, NetworkEvent};
 use nexus_sync::message::{SyncRequest, SyncResponse};
@@ -90,6 +91,10 @@ async fn wait_for_social_sync_request(
     .expect("social sync request timeout")
 }
 
+fn with_peer(addr: libp2p::Multiaddr, peer: libp2p::PeerId) -> libp2p::Multiaddr {
+    addr.with(Protocol::P2p(peer))
+}
+
 /// Start two nodes and verify they can discover each other via Kademlia.
 #[tokio::test]
 async fn two_nodes_discover_each_other() {
@@ -154,6 +159,80 @@ async fn two_nodes_discover_each_other() {
         a_discovered_b || b_discovered_a,
         "nodes should discover each other"
     );
+}
+
+/// Provider records let a node find a workspace-serving peer through the DHT
+/// after both nodes have only connected to a bootstrap seed.
+#[tokio::test]
+async fn dht_provider_records_discover_workspace_peers_via_bootstrap() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let id_seed = NodeIdentity::generate();
+    let mut seed = Network::new(
+        &id_seed,
+        NetworkConfig {
+            listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed start");
+    let seed_addr = with_peer(wait_for_listen(&mut seed).await, seed.local_peer_id());
+
+    let id_provider = NodeIdentity::generate();
+    let mut provider = Network::new(
+        &id_provider,
+        NetworkConfig {
+            listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            bootstrap_peers: vec![seed_addr.clone()],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("provider start");
+    wait_for_peer_connection(&mut provider, seed.local_peer_id()).await;
+
+    let workspace = nexus_core::WorkspaceId::from_bytes([88; 32]);
+    let key = nexus_network::workspace_discovery_key(&workspace);
+    provider
+        .start_providing(key.clone())
+        .expect("start providing workspace key");
+
+    let id_seeker = NodeIdentity::generate();
+    let mut seeker = Network::new(
+        &id_seeker,
+        NetworkConfig {
+            listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            bootstrap_peers: vec![seed_addr],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seeker start");
+    wait_for_peer_connection(&mut seeker, seed.local_peer_id()).await;
+
+    let provider_peer = provider.local_peer_id();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    seeker.find_providers(key.clone()).expect("find providers");
+                }
+                event = seeker.next_event() => {
+                    match event {
+                        Some(NetworkEvent::ProvidersFound { key: found_key, providers })
+                            if found_key == key && providers.contains(&provider_peer) => break,
+                        Some(NetworkEvent::PeerDiscovered { peer_id }) if peer_id == provider_peer => break,
+                        Some(_) => {}
+                        None => panic!("seeker event stream ended"),
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider discovery timeout");
 }
 
 /// Signed social events are first-class gossip payloads.

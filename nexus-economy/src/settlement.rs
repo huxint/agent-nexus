@@ -83,6 +83,7 @@ pub struct AnchoredCheckpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "proof")]
 pub enum SettlementProof {
+    Sovereign,
     MutualCredit(MutualCreditSettlement),
     ExternalPayment(ExternalPaymentSettlement),
     Lightning(LightningSettlement),
@@ -162,6 +163,7 @@ impl AuthorityAnchor {
 impl SettlementProof {
     pub fn validate(&self) -> Result<(), SettlementError> {
         match self {
+            Self::Sovereign => Ok(()),
             Self::MutualCredit(proof) => proof.validate(),
             Self::ExternalPayment(proof) => proof.validate(),
             Self::Lightning(proof) => proof.validate(),
@@ -354,6 +356,11 @@ mod tests {
                 threshold: 2,
             }
         );
+    }
+
+    #[test]
+    fn sovereign_settlement_is_valid_by_signed_event_authority() {
+        SettlementProof::Sovereign.validate().unwrap();
     }
 
     #[test]

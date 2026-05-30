@@ -25,6 +25,14 @@ pub enum SyncRequest {
         /// Maximum number of events to return.
         limit: usize,
     },
+
+    /// Ask for signed workspace announcements known by the remote node.
+    WorkspaceAnnouncementsRequest {
+        /// Optional workspace filter.
+        workspace_id: Option<WorkspaceId>,
+        /// Maximum number of announcements to return.
+        limit: usize,
+    },
 }
 
 /// Response to a sync request.
@@ -59,6 +67,9 @@ pub enum SyncResponse {
 
     /// Signed social events encoded as JSON bytes, one event per vector item.
     SocialEventsResponse { events_json: Vec<Vec<u8>> },
+
+    /// Signed workspace announcements encoded as JSON bytes.
+    WorkspaceAnnouncementsResponse { announcements_json: Vec<Vec<u8>> },
 
     /// The workspace is not available on this node.
     WorkspaceNotFound { workspace_id: WorkspaceId },

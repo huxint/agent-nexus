@@ -16,5 +16,7 @@ pub mod behaviour;
 pub mod swarm;
 pub mod transport;
 
-pub use swarm::{Network, NetworkConfig, NetworkEvent};
+pub use swarm::{
+    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkEvent,
+};
 pub use transport::{to_libp2p_keypair, to_peer_id};

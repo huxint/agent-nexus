@@ -5,9 +5,9 @@
 //!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>]
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
-//!   nexus-node clone --base <dir> [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
+//!   nexus-node clone --base <dir> [--global] [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
-//!   nexus-node discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node discover --base <dir> [--global] [--bootstrap <addr>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -34,7 +34,10 @@ use nexus_core::{Did, PermissionSet, WorkspaceId};
 use nexus_crypto::capability::sign_capability;
 use nexus_crypto::verify_did_signature;
 use nexus_crypto::NodeIdentity;
-use nexus_network::{Network, NetworkConfig, NetworkEvent};
+use nexus_economy::SettlementProof;
+use nexus_network::{
+    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkEvent,
+};
 use nexus_runtime::{ExecError, ExecOptions, ProcessOutput, ResourceUsage};
 use nexus_storage::{BlockStore, Cid, DiskBlockStore};
 use nexus_sync::codec::MAX_SYNC_MESSAGE_BYTES;
@@ -47,6 +50,8 @@ use nexus_workspace::{
 const WORKSPACE_ANNOUNCEMENT_VERSION: u32 = 1;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SOCIAL_EVENTS_PER_RESPONSE: usize = 512;
+const MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE: usize = 256;
+const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceAnnouncement {
@@ -111,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "clone" => cmd_clone(&args).await?,
         "exec" => cmd_exec(&args).await?,
         "serve" => cmd_serve(&args).await?,
-        "discover" => cmd_discover(&args)?,
+        "discover" => cmd_discover(&args).await?,
         "society" => cmd_society(&args)?,
         "act" => cmd_act(&args)?,
         "event" => cmd_event(&args)?,
@@ -125,10 +130,10 @@ fn print_usage(prog: &str) {
     eprintln!("nexus-node — AI workspace node");
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
-    eprintln!("  {prog} clone --base <DIR> [--peer <PEER_ID>] [--bootstrap <ADDR>] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--description <TEXT>]");
+    eprintln!("  {prog} clone --base <DIR> [--global] [--peer <PEER_ID>] [--bootstrap <ADDR>] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
     eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
-    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>]");
-    eprintln!("  {prog} discover --base <DIR> [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
+    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>]");
+    eprintln!("  {prog} discover --base <DIR> [--global] [--bootstrap <ADDR>] [--listen <ADDR>] [--timeout-ms <N>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -154,6 +159,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event task-cancel --base <DIR> --task <ID> --reason <TEXT>");
     eprintln!("  {prog} event task-complete --base <DIR> --task <ID> (--success|--failure) [--exit-code <N>] [--stdout <TEXT>] [--stderr <TEXT>] [--actual-cost <N>] [--error <TEXT>] [--receipt --command <CMD> [--arg <ARG>...] [--workspace <HEX>] [--output-root <CID_HEX>] [--started-at <TS>] [--finished-at <TS>]]");
     eprintln!("  {prog} event task-dispute --base <DIR> --task <ID> --target <DID> --reason <TEXT> [--claim <CLAIM_ID>] [--evidence <TEXT>]");
+    eprintln!("  {prog} event settlement --base <DIR> --payee <DID> --amount <N> [--task <ID>] [--claim <CLAIM_ID>] [--id <ID>] [--proof sovereign]");
     eprintln!("  {prog} demo");
 }
 
@@ -264,6 +270,8 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut workspace_id = None;
     let mut name = None;
     let mut description = None;
+    let mut online = false;
+    let mut discovery_timeout = DEFAULT_DISCOVERY_TIMEOUT;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -278,10 +286,19 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--bootstrap" => {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
+                online = true;
             }
             "--peer" => {
                 i += 1;
                 peer = Some(required_arg(args, i, "--peer")?.parse()?);
+            }
+            "--global" | "--online" => {
+                online = true;
+            }
+            "--timeout-ms" => {
+                i += 1;
+                let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
+                discovery_timeout = Duration::from_millis(millis);
             }
             "--workspace" => {
                 i += 1;
@@ -302,7 +319,14 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let workspace_id = workspace_id.ok_or("--workspace required")?;
     let name = name.ok_or("--name required")?;
+    if bootstrap.is_empty() {
+        bootstrap = default_bootstrap_peers()?;
+        if !bootstrap.is_empty() && peer.is_none() {
+            online = true;
+        }
+    }
     let mut discovered_source = None;
+    let mut peer_ready = false;
     if peer.is_none() || bootstrap.is_empty() {
         if let Some(discovered) = discover_clone_source(&base, &workspace_id, peer.as_ref())? {
             if peer.is_none() {
@@ -314,6 +338,41 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             discovered_source = Some(discovered);
         }
     }
+    let identity = load_or_create_identity(&base)?;
+    let mut network = None;
+    if peer.is_none() && online {
+        if bootstrap.is_empty() {
+            return Err(
+                "global clone discovery requires --bootstrap <ADDR> or NEXUS_BOOTSTRAP".into(),
+            );
+        }
+        let online_network = Network::new(
+            &identity,
+            NetworkConfig {
+                listen_addr: listen.parse()?,
+                bootstrap_peers: bootstrap.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        refresh_online_discovery(
+            &base,
+            &online_network,
+            Some(workspace_id),
+            None,
+            discovery_timeout,
+        )
+        .await?;
+        if let Some(discovered) = discover_clone_source(&base, &workspace_id, None)? {
+            peer = Some(discovered.peer);
+            if bootstrap.is_empty() {
+                bootstrap = discovered.addrs.clone();
+            }
+            discovered_source = Some(discovered);
+            peer_ready = true;
+        }
+        network = Some(online_network);
+    }
     let peer = peer.ok_or("--peer required or discoverable workspace announcement required")?;
     if bootstrap.is_empty() {
         return Err(
@@ -321,18 +380,24 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let identity = load_or_create_identity(&base)?;
-    let network = Network::new(
-        &identity,
-        NetworkConfig {
-            listen_addr: listen.parse()?,
-            bootstrap_peers: bootstrap,
-            ..Default::default()
-        },
-    )
-    .await?;
+    let network = match network {
+        Some(network) => network,
+        None => {
+            Network::new(
+                &identity,
+                NetworkConfig {
+                    listen_addr: listen.parse()?,
+                    bootstrap_peers: bootstrap,
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+    };
 
-    wait_for_peer(&network, peer, Duration::from_secs(15)).await?;
+    if !peer_ready {
+        wait_for_peer(&network, peer, Duration::from_secs(15)).await?;
+    }
     let memory_path = base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
     let synced_social_events =
@@ -682,6 +747,9 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+    if bootstrap.is_empty() {
+        bootstrap = default_bootstrap_peers()?;
+    }
 
     let id_path = identity_path(&base);
     let id = load_or_create_identity(&base)?;
@@ -719,6 +787,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    announce_dht_presence(&network, &workspace_ids);
 
     announce_node_presence(
         &id,
@@ -1369,8 +1438,99 @@ fn unix_now() -> u64 {
 // discover
 // ---------------------------------------------------------------------------
 
-fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn refresh_online_discovery(
+    base: &Path,
+    network: &Network,
+    workspace_filter: Option<WorkspaceId>,
+    peer_filter: Option<libp2p::PeerId>,
+    timeout: Duration,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut events = network.clone();
+    let mut contacted = std::collections::HashSet::new();
+    let mut inserted = 0;
+    let stop_after_first_match = workspace_filter.is_some() || peer_filter.is_some();
+    let discovery_key = workspace_filter
+        .as_ref()
+        .map(workspace_discovery_key)
+        .unwrap_or_else(global_discovery_key);
+    let mut query_tick = tokio::time::interval(Duration::from_secs(1));
+    network.find_providers(discovery_key.clone())?;
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            _ = query_tick.tick() => {
+                network.find_providers(discovery_key.clone())?;
+            }
+            event = events.next_event() => {
+                match event {
+                    Some(NetworkEvent::ProvidersFound { providers, .. }) => {
+                        for peer in providers {
+                            if Some(peer) == peer_filter || peer_filter.is_none() {
+                                network.dial_peer(peer);
+                            }
+                        }
+                    }
+                    Some(NetworkEvent::PeerDiscovered { peer_id })
+                    | Some(NetworkEvent::RoutingUpdated { peer_id, .. }) => {
+                        if Some(peer_id) == peer_filter || peer_filter.is_none() {
+                            network.dial_peer(peer_id);
+                        }
+                    }
+                    Some(NetworkEvent::PeerConnected(peer)) => {
+                        if peer == network.local_peer_id() {
+                            continue;
+                        }
+                        if peer_filter.map(|filter| filter != peer).unwrap_or(false) {
+                            continue;
+                        }
+                        if contacted.insert(peer) {
+                            inserted += request_workspace_announcements_from_peer(
+                                network,
+                                peer,
+                                workspace_filter,
+                                base,
+                            )
+                            .await;
+                            if inserted > 0 && stop_after_first_match {
+                                break;
+                            }
+                        }
+                    }
+                    Some(NetworkEvent::WorkspaceAnnounce { source, data }) => {
+                        match record_workspace_announcement_bytes(base, source, &data) {
+                            Ok(true) => {
+                                inserted += 1;
+                                if stop_after_first_match {
+                                    break;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(
+                                "rejected online workspace announcement from {:?}: {err}",
+                                source
+                            ),
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Ok(inserted)
+}
+
+async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
+    let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
+    let mut bootstrap = Vec::new();
+    let mut online = false;
+    let mut timeout = DEFAULT_DISCOVERY_TIMEOUT;
     let mut json = false;
     let mut filter = DiscoveryFilter::default();
     let mut i = 2;
@@ -1382,6 +1542,23 @@ fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--json" => {
                 json = true;
+            }
+            "--global" | "--online" => {
+                online = true;
+            }
+            "--listen" => {
+                i += 1;
+                listen = required_arg(args, i, "--listen")?.to_string();
+            }
+            "--bootstrap" => {
+                i += 1;
+                bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
+                online = true;
+            }
+            "--timeout-ms" => {
+                i += 1;
+                let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
+                timeout = Duration::from_millis(millis);
             }
             "--verified" => {
                 filter.verified_only = true;
@@ -1409,6 +1586,36 @@ fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown discover option: {other}").into()),
         }
         i += 1;
+    }
+
+    if online && bootstrap.is_empty() {
+        bootstrap = default_bootstrap_peers()?;
+    }
+    if online {
+        if bootstrap.is_empty() {
+            return Err("global discovery requires --bootstrap <ADDR> or NEXUS_BOOTSTRAP".into());
+        }
+        let identity = load_or_create_identity(&base)?;
+        let network = Network::new(
+            &identity,
+            NetworkConfig {
+                listen_addr: listen.parse()?,
+                bootstrap_peers: bootstrap,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let workspace_filter = filter
+            .workspace
+            .as_deref()
+            .map(parse_workspace_id)
+            .transpose()?;
+        let peer_filter = filter
+            .peer
+            .as_deref()
+            .map(str::parse::<libp2p::PeerId>)
+            .transpose()?;
+        refresh_online_discovery(&base, &network, workspace_filter, peer_filter, timeout).await?;
     }
 
     let announcements = load_workspace_discovery(&base)?;
@@ -2955,7 +3162,7 @@ fn execution_receipt_json(receipt: &ExecutionReceipt) -> serde_json::Value {
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, or task-dispute"
+            "event subcommand required: manifest, intent, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -2986,6 +3193,7 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "task-cancel" | "task-cancelled" | "cancel" => cmd_event_task_cancel(args),
         "task-complete" => cmd_event_task_complete(args),
         "task-dispute" | "dispute" => cmd_event_task_dispute(args),
+        "settlement" | "settle" => cmd_event_settlement(args),
         other => Err(format!("unknown event subcommand: {other}").into()),
     }
 }
@@ -4474,6 +4682,85 @@ fn cmd_event_task_dispute(args: &[String]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn cmd_event_settlement(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut id = None;
+    let mut task_id = None;
+    let mut claim_id = None;
+    let mut payee = None;
+    let mut amount = None;
+    let mut proof = SettlementProof::Sovereign;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--id" => {
+                i += 1;
+                id = Some(required_arg(args, i, "--id")?.to_string());
+            }
+            "--task" | "--task-id" => {
+                i += 1;
+                task_id = Some(required_arg(args, i, "--task")?.to_string());
+            }
+            "--claim" | "--claim-id" => {
+                i += 1;
+                claim_id = Some(required_arg(args, i, "--claim")?.to_string());
+            }
+            "--payee" => {
+                i += 1;
+                payee = Some(Did::new(required_arg(args, i, "--payee")?.to_string()));
+            }
+            "--amount" => {
+                i += 1;
+                amount = Some(parse_u64_arg(
+                    required_arg(args, i, "--amount")?,
+                    "--amount",
+                )?);
+            }
+            "--proof" => {
+                i += 1;
+                let value = required_arg(args, i, "--proof")?;
+                proof = match value {
+                    "sovereign" | "society" | "signed-event" => SettlementProof::Sovereign,
+                    other => {
+                        return Err(format!(
+                            "unsupported settlement proof for CLI: {other}; use sovereign"
+                        )
+                        .into())
+                    }
+                };
+            }
+            other => return Err(format!("unknown settlement option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::SettlementRecorded {
+                settlement: SettlementRecord {
+                    id: id.unwrap_or_else(random_social_id),
+                    task_id,
+                    claim_id,
+                    payer: identity.did().clone(),
+                    payee: payee.ok_or("--payee required")?,
+                    amount: amount.ok_or("--amount required")?,
+                    proof,
+                    settled_at: now,
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
 fn signed_local_event<F>(
     base: &Path,
     build_kind: F,
@@ -4513,6 +4800,25 @@ fn parse_usize_arg(value: &str, flag: &str) -> Result<usize, Box<dyn std::error:
     value
         .parse::<usize>()
         .map_err(|err| format!("invalid {flag}: {err}").into())
+}
+
+fn parse_bootstrap_list(value: &str) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let mut addrs = Vec::new();
+    for item in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter(|item| !item.is_empty())
+    {
+        addrs.push(item.parse()?);
+    }
+    Ok(addrs)
+}
+
+fn default_bootstrap_peers() -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    match std::env::var("NEXUS_BOOTSTRAP") {
+        Ok(value) => parse_bootstrap_list(&value),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(err) => Err(format!("read NEXUS_BOOTSTRAP: {err}").into()),
+    }
 }
 
 fn parse_i32_arg(value: &str, flag: &str) -> Result<i32, Box<dyn std::error::Error>> {
@@ -4776,6 +5082,17 @@ async fn publish_social_event_with_retry(network: &Network, event: &SocialEvent)
 
     if let Some(err) = last_error {
         tracing::debug!("social event {} not broadcast yet: {err}", event.id);
+    }
+}
+
+fn announce_dht_presence(network: &Network, workspace_ids: &[WorkspaceId]) {
+    if let Err(err) = network.start_providing(global_discovery_key()) {
+        tracing::warn!("failed to announce global DHT presence: {err}");
+    }
+    for workspace_id in workspace_ids {
+        if let Err(err) = network.start_providing(workspace_discovery_key(workspace_id)) {
+            tracing::warn!("failed to announce workspace {workspace_id} in DHT: {err}");
+        }
     }
 }
 
@@ -5044,6 +5361,64 @@ fn social_events_response_frame_len(events_json: &[Vec<u8>]) -> Result<usize, se
     .map(|bytes| bytes.len())
 }
 
+async fn workspace_announcements_response(
+    identity: &NodeIdentity,
+    network: &Network,
+    server: &mut WorkspaceServer,
+    workspace_filter: Option<WorkspaceId>,
+    limit: usize,
+    now: u64,
+) -> SyncResponse {
+    let effective_limit = limit.min(MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE);
+    let peer = network.local_peer_id();
+    let addrs = network.listen_addrs();
+    let workspace_ids = server
+        .workspaces()
+        .map(|workspace| workspace.id())
+        .filter(|workspace_id| {
+            workspace_filter
+                .map(|filter| filter == *workspace_id)
+                .unwrap_or(true)
+        })
+        .take(effective_limit)
+        .collect::<Vec<_>>();
+
+    let mut announcements_json = Vec::new();
+    for workspace_id in workspace_ids {
+        match server.refresh_workspace(&workspace_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(err) => {
+                return SyncResponse::Error {
+                    message: format!("refresh workspace {workspace_id}: {err}"),
+                }
+            }
+        }
+        let Some(workspace) = server.get(&workspace_id) else {
+            continue;
+        };
+        let announcement =
+            match workspace_announcement(identity, peer, addrs.clone(), workspace, now) {
+                Ok(announcement) => announcement,
+                Err(err) => {
+                    return SyncResponse::Error {
+                        message: format!("sign workspace announcement {workspace_id}: {err}"),
+                    }
+                }
+            };
+        match serde_json::to_vec(&announcement) {
+            Ok(data) => announcements_json.push(data),
+            Err(err) => {
+                return SyncResponse::Error {
+                    message: format!("serialize workspace announcement {workspace_id}: {err}"),
+                }
+            }
+        }
+    }
+
+    SyncResponse::WorkspaceAnnouncementsResponse { announcements_json }
+}
+
 async fn request_social_events_from_peer(
     network: &Network,
     peer: libp2p::PeerId,
@@ -5085,6 +5460,68 @@ async fn request_social_events_from_peer(
     inserted
 }
 
+fn record_workspace_announcement_bytes(
+    base: &Path,
+    source: Option<libp2p::PeerId>,
+    data: &[u8],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let announcement = serde_json::from_slice::<WorkspaceAnnouncement>(data)?;
+    if announcement.version != WORKSPACE_ANNOUNCEMENT_VERSION {
+        return Err(format!(
+            "unsupported workspace announcement version {}",
+            announcement.version
+        )
+        .into());
+    }
+    if let Some(source) = source {
+        if announcement.peer != source.to_string() {
+            return Err(format!(
+                "announcement peer {} does not match source {}",
+                announcement.peer, source
+            )
+            .into());
+        }
+    }
+    verify_workspace_announcement(&announcement)?;
+    record_workspace_announcement(base, announcement)
+}
+
+async fn request_workspace_announcements_from_peer(
+    network: &Network,
+    peer: libp2p::PeerId,
+    workspace_filter: Option<WorkspaceId>,
+    base: &Path,
+) -> usize {
+    let client = SyncClient::with_timeout(network.sync_request_channel(), Duration::from_secs(5));
+    let mut inserted = 0;
+
+    match client
+        .get_workspace_announcements(
+            peer,
+            workspace_filter,
+            MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE,
+        )
+        .await
+    {
+        Ok(announcements_json) => {
+            for data in announcements_json {
+                match record_workspace_announcement_bytes(base, Some(peer), &data) {
+                    Ok(true) => inserted += 1,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("rejected workspace announcement from {}: {err}", peer);
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::debug!("workspace announcement request to {} failed: {err}", peer);
+        }
+    }
+
+    inserted
+}
+
 async fn handle_node_event(
     event: NetworkEvent,
     network: &Network,
@@ -5098,38 +5535,9 @@ async fn handle_node_event(
         NetworkEvent::WorkspaceAnnounce {
             source: Some(source),
             data,
-        } => match serde_json::from_slice::<WorkspaceAnnouncement>(data) {
-            Ok(announcement)
-                if announcement.version == WORKSPACE_ANNOUNCEMENT_VERSION
-                    && announcement.peer == source.to_string() =>
-            {
-                match verify_workspace_announcement(&announcement) {
-                    Ok(()) => match record_workspace_announcement(base, announcement.clone()) {
-                        Ok(true) => tracing::info!(
-                            "recorded workspace announcement {} from {}",
-                            announcement.workspace,
-                            source
-                        ),
-                        Ok(false) => {}
-                        Err(err) => tracing::warn!(
-                            "failed to persist workspace announcement from {}: {err}",
-                            source
-                        ),
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            "rejected unsigned or invalid workspace announcement from {}: {err}",
-                            source
-                        );
-                    }
-                }
-            }
-            Ok(announcement) => tracing::debug!(
-                "ignored workspace announcement from {:?}: version={} peer={}",
-                source,
-                announcement.version,
-                announcement.peer
-            ),
+        } => match record_workspace_announcement_bytes(base, Some(*source), data) {
+            Ok(true) => tracing::info!("recorded workspace announcement from {}", source),
+            Ok(false) => {}
             Err(err) => tracing::warn!("rejected workspace announcement from {:?}: {err}", source),
         },
         NetworkEvent::SocialEvent { source, data } => {
@@ -5179,6 +5587,27 @@ async fn handle_node_event(
             ..
         } => {
             let response = social_events_response(social_memory, known_event_ids, *limit);
+            network.respond_to_sync(*request_id, response);
+            return;
+        }
+        NetworkEvent::SyncRequest {
+            request_id,
+            request:
+                SyncRequest::WorkspaceAnnouncementsRequest {
+                    workspace_id,
+                    limit,
+                },
+            ..
+        } => {
+            let response = workspace_announcements_response(
+                identity,
+                network,
+                server,
+                *workspace_id,
+                *limit,
+                unix_now(),
+            )
+            .await;
             network.respond_to_sync(*request_id, response);
             return;
         }
@@ -5301,6 +5730,7 @@ async fn cmd_demo() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::multiaddr::Protocol;
     use nexus_agent::{RelationKind, SocialEvent, SocialEventKind};
     use nexus_core::WorkspaceId;
     use tempfile::TempDir;
@@ -5485,8 +5915,8 @@ mod tests {
         assert_eq!(views[0].announcements[0].peer, "peer-b");
     }
 
-    #[test]
-    fn discover_command_outputs_grouped_workspace_json() {
+    #[tokio::test]
+    async fn discover_command_outputs_grouped_workspace_json() {
         let temp = TempDir::new().unwrap();
         let identity = NodeIdentity::generate();
         let workspace = WorkspaceId::from_bytes([94; 32]);
@@ -5513,6 +5943,7 @@ mod tests {
             "--workspace".into(),
             workspace.to_string(),
         ])
+        .await
         .unwrap();
 
         let views = discovered_workspace_views(
@@ -5659,6 +6090,10 @@ mod tests {
         .expect("test network should listen")
     }
 
+    fn test_addr_with_peer(addr: libp2p::Multiaddr, peer: libp2p::PeerId) -> libp2p::Multiaddr {
+        addr.with(Protocol::P2p(peer))
+    }
+
     async fn publish_test_announce(network: &Network, data: Vec<u8>) {
         let mut last_error = None;
         for _ in 0..40 {
@@ -5708,6 +6143,28 @@ mod tests {
                         let social_memory = social_memory.lock().await;
                         social_events_response(&social_memory, known_event_ids, *limit)
                     };
+                    server_events.respond_to_sync(*request_id, response);
+                    continue;
+                }
+                if let NetworkEvent::SyncRequest {
+                    request_id,
+                    request:
+                        SyncRequest::WorkspaceAnnouncementsRequest {
+                            workspace_id,
+                            limit,
+                        },
+                    ..
+                } = &event
+                {
+                    let response = workspace_announcements_response(
+                        &identity,
+                        &network,
+                        &mut server,
+                        *workspace_id,
+                        *limit,
+                        unix_now(),
+                    )
+                    .await;
                     server_events.respond_to_sync(*request_id, response);
                     continue;
                 }
@@ -5851,6 +6308,200 @@ mod tests {
         assert_eq!(
             view["discovered_workspaces"][0]["announcements"][0]["workspace"],
             workspace_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn global_discovery_fetches_workspace_announcements_via_dht_provider() {
+        let seed_id = NodeIdentity::generate();
+        let mut seed = Network::new(
+            &seed_id,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seed_addr =
+            test_addr_with_peer(wait_for_test_listen(&mut seed).await, seed.local_peer_id());
+
+        let owner_base = TempDir::new().unwrap();
+        let owner = Arc::new(load_or_create_identity(owner_base.path()).unwrap());
+        let mut workspace = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "global-discovery-source".into(),
+                description: "discoverable through DHT provider records".into(),
+            },
+        )
+        .await
+        .unwrap();
+        workspace.write_file("hello.txt", b"hello global").unwrap();
+        workspace.snapshot().await.unwrap();
+        let workspace_id = workspace.id();
+
+        let mut owner_net = Network::new(
+            &owner,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                bootstrap_peers: vec![seed_addr.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_test_listen(&mut owner_net).await;
+        wait_for_peer(&owner_net, seed.local_peer_id(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        announce_dht_presence(&owner_net, &[workspace_id]);
+
+        let mut owner_server = WorkspaceServer::new(Arc::new(owner_net.clone()));
+        owner_server.register(workspace);
+        let owner_task = spawn_test_workspace_social_server(
+            owner.clone(),
+            &owner_net,
+            owner_server,
+            SocialMemory::new(),
+        );
+
+        let discover_base = TempDir::new().unwrap();
+        let discover_id = load_or_create_identity(discover_base.path()).unwrap();
+        let mut discover_net = Network::new(
+            &discover_id,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                bootstrap_peers: vec![seed_addr],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_test_listen(&mut discover_net).await;
+        wait_for_peer(&discover_net, seed.local_peer_id(), Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let inserted = refresh_online_discovery(
+            discover_base.path(),
+            &discover_net,
+            Some(workspace_id),
+            None,
+            Duration::from_secs(12),
+        )
+        .await
+        .unwrap();
+
+        owner_task.abort();
+
+        assert!(
+            inserted > 0,
+            "online discovery should record an announcement"
+        );
+        let views = discovered_workspace_views(
+            &load_workspace_discovery(discover_base.path()).unwrap(),
+            &DiscoveryFilter {
+                workspace: Some(workspace_id.to_string()),
+                clone_ready_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "global-discovery-source");
+        assert_eq!(views[0].peers, vec![owner_net.local_peer_id().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clone_command_can_discover_workspace_peer_through_dht() {
+        let seed_id = NodeIdentity::generate();
+        let mut seed = Network::new(
+            &seed_id,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seed_addr =
+            test_addr_with_peer(wait_for_test_listen(&mut seed).await, seed.local_peer_id());
+
+        let owner_base = TempDir::new().unwrap();
+        let owner = Arc::new(load_or_create_identity(owner_base.path()).unwrap());
+        let mut source = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "dht-clone-source".into(),
+                description: "clone source discovered through DHT".into(),
+            },
+        )
+        .await
+        .unwrap();
+        source
+            .write_file("global.txt", b"cloned without peer id")
+            .unwrap();
+        source.snapshot().await.unwrap();
+        let workspace_id = source.id();
+
+        let mut owner_net = Network::new(
+            &owner,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                bootstrap_peers: vec![seed_addr.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_test_listen(&mut owner_net).await;
+        wait_for_peer(&owner_net, seed.local_peer_id(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        announce_dht_presence(&owner_net, &[workspace_id]);
+
+        let mut owner_server = WorkspaceServer::new(Arc::new(owner_net.clone()));
+        owner_server.register(source);
+        let owner_task = spawn_test_workspace_social_server(
+            owner.clone(),
+            &owner_net,
+            owner_server,
+            SocialMemory::new(),
+        );
+
+        let clone_base = TempDir::new().unwrap();
+        cmd_clone(&[
+            "nexus-node".into(),
+            "clone".into(),
+            "--base".into(),
+            clone_base.path().to_string_lossy().to_string(),
+            "--listen".into(),
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "--global".into(),
+            "--bootstrap".into(),
+            seed_addr.to_string(),
+            "--timeout-ms".into(),
+            "6000".into(),
+            "--workspace".into(),
+            workspace_id.to_string(),
+            "--name".into(),
+            "dht-cloned".into(),
+        ])
+        .await
+        .unwrap();
+
+        owner_task.abort();
+
+        let clone_identity = load_or_create_identity(clone_base.path()).unwrap();
+        let cloned = Workspace::load(&clone_identity, &clone_base.path().join("dht-cloned"))
+            .await
+            .unwrap();
+        assert_eq!(cloned.id(), workspace_id);
+        assert_eq!(
+            cloned.read_file("global.txt").unwrap(),
+            b"cloned without peer id"
         );
     }
 
@@ -8677,6 +9328,47 @@ mod tests {
             identity.did().to_string()
         );
         assert_eq!(cancelled["cancellation"]["reason"], "superseded");
+    }
+
+    #[test]
+    fn event_commands_record_sovereign_settlement_facts() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let payee = NodeIdentity::generate();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "settlement".into(),
+            "--base".into(),
+            base,
+            "--id".into(),
+            "settlement-1".into(),
+            "--task".into(),
+            "task-1".into(),
+            "--claim".into(),
+            "claim-1".into(),
+            "--payee".into(),
+            payee.did().to_string(),
+            "--amount".into(),
+            "42".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        let settlement = memory
+            .society()
+            .settlement("settlement-1")
+            .expect("settlement should be recorded");
+        assert_eq!(settlement.payer, *identity.did());
+        assert_eq!(settlement.payee, *payee.did());
+        assert_eq!(settlement.amount, 42);
+        assert!(matches!(settlement.proof, SettlementProof::Sovereign));
+
+        let view = society_json(&memory);
+        assert_eq!(view["settlements"][0]["id"], "settlement-1");
+        assert_eq!(view["settlements"][0]["proof"]["kind"], "Sovereign");
     }
 
     #[test]
