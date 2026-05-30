@@ -7,6 +7,7 @@ use libp2p::{
 };
 use libp2p_swarm::NetworkBehaviour as NetworkBehaviourDerive;
 
+use nexus_sync::client::SyncClient;
 use nexus_sync::codec::SyncCodec;
 use nexus_sync::message::{SyncRequest, SyncResponse};
 use nexus_sync::{ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC, SYNC_PROTOCOL};
@@ -84,7 +85,7 @@ impl CompositeBehaviour {
         local_peer_id: PeerId,
         public_key: libp2p::identity::PublicKey,
         gossipsub_keypair: libp2p::identity::Keypair,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let kademlia =
             kad::Behaviour::new(local_peer_id, kad::store::MemoryStore::new(local_peer_id));
 
@@ -92,36 +93,36 @@ impl CompositeBehaviour {
             .max_transmit_size(1_048_576)
             .heartbeat_interval(std::time::Duration::from_secs(10))
             .build()
-            .expect("valid gossipsub config");
+            .map_err(|err| format!("gossipsub config: {err}"))?;
         let mut gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(gossipsub_keypair),
             gs_config,
         )
-        .expect("valid gossipsub behaviour");
+        .map_err(|err| format!("gossipsub behaviour: {err}"))?;
 
         for topic in [ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC] {
             gossipsub
                 .subscribe(&gossipsub::IdentTopic::new(topic))
-                .expect("subscribe to gossipsub topic");
+                .map_err(|err| format!("subscribe to gossipsub topic {topic}: {err}"))?;
         }
 
+        let sync_protocol = StreamProtocol::try_from_owned(SYNC_PROTOCOL.to_string())
+            .map_err(|err| format!("sync protocol: {err}"))?;
         let sync = request_response::Behaviour::new(
-            [(
-                StreamProtocol::try_from_owned(SYNC_PROTOCOL.to_string()).unwrap(),
-                ProtocolSupport::Full,
-            )],
-            request_response::Config::default(),
+            [(sync_protocol, ProtocolSupport::Full)],
+            request_response::Config::default()
+                .with_request_timeout(SyncClient::DEFAULT_REQUEST_TIMEOUT),
         );
 
         let identify_config = identify::Config::new("/nexus/1.0.0".into(), public_key)
             .with_agent_version(format!("nexus/{}", env!("CARGO_PKG_VERSION")));
         let identify = identify::Behaviour::new(identify_config);
 
-        Self {
+        Ok(Self {
             kademlia,
             gossipsub,
             sync,
             identify,
-        }
+        })
     }
 }

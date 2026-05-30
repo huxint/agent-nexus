@@ -138,8 +138,8 @@ impl BlockStore for DiskBlockStore {
         let cid = node.cid();
         let path = self.block_path(&cid);
 
-        // Skip if already exists (content-addressed = immutable)
-        if path.exists() {
+        // Skip only after verifying the existing block still matches its CID.
+        if path.exists() && self.get(&cid).await.is_ok() {
             return Ok(cid);
         }
 
@@ -158,11 +158,26 @@ impl BlockStore for DiskBlockStore {
             return Err(StoreError::NotFound(*cid));
         }
         let cbor = std::fs::read(&path)?;
-        MerkleNode::from_cbor(&cbor).map_err(StoreError::Serialisation)
+        let node = MerkleNode::from_cbor(&cbor).map_err(StoreError::Serialisation)?;
+        let actual = node.cid();
+        if actual != *cid {
+            return Err(StoreError::Other(format!(
+                "block content CID mismatch: expected {}, got {}",
+                hex::encode(cid.as_bytes()),
+                hex::encode(actual.as_bytes())
+            )));
+        }
+        Ok(node)
     }
 
     async fn has(&self, cid: &Cid) -> StoreResult<bool> {
-        Ok(self.block_path(cid).exists())
+        match self.get(cid).await {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound(_)) => Ok(false),
+            Err(StoreError::Serialisation(_) | StoreError::Other(_)) => Ok(false),
+            Err(StoreError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -182,6 +197,12 @@ pub async fn store_tree(store: &impl BlockStore, root: MerkleNode) -> StoreResul
                 let child = store.get(&entry.cid).await?;
                 // Already stored — nothing to do; but in the future we may
                 // need to recurse for inline nodes.
+                let _ = child;
+            }
+        }
+        MerkleNode::ChunkedBlob { chunks, .. } => {
+            for chunk in chunks {
+                let child = store.get(chunk).await?;
                 let _ = child;
             }
         }
@@ -208,11 +229,20 @@ where
     let node = store.get(root_cid).await?;
     on_node(root_cid, &node);
 
-    if let MerkleNode::Tree { entries } = &node {
-        for entry in entries {
-            // Box the future to allow recursion in async context
-            Box::pin(fetch_tree(store, &entry.cid, on_node)).await?;
+    match &node {
+        MerkleNode::Tree { entries } => {
+            for entry in entries {
+                // Box the future to allow recursion in async context
+                Box::pin(fetch_tree(store, &entry.cid, on_node)).await?;
+            }
         }
+        MerkleNode::ChunkedBlob { chunks, .. } => {
+            for chunk in chunks {
+                // Box the future to allow recursion in async context
+                Box::pin(fetch_tree(store, chunk, on_node)).await?;
+            }
+        }
+        MerkleNode::Blob { .. } => {}
     }
 
     Ok(node)
@@ -268,10 +298,28 @@ mod tests {
         }]);
         let cid_sub = store.put(sub_tree).await.unwrap();
 
+        let cid_chunk_a = store
+            .put(MerkleNode::blob(b"large-".to_vec()))
+            .await
+            .unwrap();
+        let cid_chunk_b = store.put(MerkleNode::blob(b"file".to_vec())).await.unwrap();
+        let cid_chunked = store
+            .put(MerkleNode::chunked_blob(
+                vec![cid_chunk_a, cid_chunk_b],
+                "large-file".len() as u64,
+            ))
+            .await
+            .unwrap();
+
         let root_tree = MerkleNode::tree(vec![
             TreeEntry {
                 name: "hello.txt".into(),
                 cid: cid_hello,
+                kind: NodeKind::Blob,
+            },
+            TreeEntry {
+                name: "large.bin".into(),
+                cid: cid_chunked,
                 kind: NodeKind::Blob,
             },
             TreeEntry {
@@ -290,7 +338,42 @@ mod tests {
         .await
         .unwrap();
 
-        // Should have visited 4 nodes: root, hello, sub, data
-        assert_eq!(visited.len(), 4);
+        // Should have visited 7 nodes: root, hello, chunked file,
+        // two chunks, sub, and data.
+        assert_eq!(visited.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn disk_store_rejects_and_repairs_wrong_content_at_cid_path() {
+        let root = std::env::temp_dir().join(format!(
+            "nexus-storage-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = DiskBlockStore::new(&root);
+        let expected = MerkleNode::blob(b"expected".to_vec());
+        let expected_cid = expected.cid();
+        let wrong = MerkleNode::blob(b"wrong".to_vec());
+        let wrong_cbor = wrong.to_cbor().unwrap();
+        let path = store.block_path(&expected_cid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, wrong_cbor).unwrap();
+
+        let err = store.get(&expected_cid).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Other(message) if message.contains("block content CID mismatch")
+        ));
+        assert!(!store.has(&expected_cid).await.unwrap());
+
+        store.put(expected.clone()).await.unwrap();
+        assert!(store.has(&expected_cid).await.unwrap());
+        let repaired = store.get(&expected_cid).await.unwrap();
+        assert_eq!(repaired, expected);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

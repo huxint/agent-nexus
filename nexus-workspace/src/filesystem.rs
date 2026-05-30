@@ -35,6 +35,11 @@ fn list_files_recursive(
             continue;
         }
 
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+            continue;
+        }
+
         let path = entry.path();
         let metadata = entry.metadata()?;
         let relative = path.strip_prefix(base).unwrap_or(&path);

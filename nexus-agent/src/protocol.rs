@@ -119,7 +119,7 @@ pub enum SocialEventKind {
     /// Record an observed Merkle root for a workspace.
     WorkspaceSnapshotted { snapshot: WorkspaceSnapshot },
     /// Record a command run performed freely in a workspace.
-    WorkspaceRunRecorded { run: WorkspaceRun },
+    WorkspaceRunRecorded { run: Box<WorkspaceRun> },
     /// Publish a lightweight goal, need, offer, proposal, or status signal.
     IntentPublished { intent: AgentIntent },
     /// Respond to another agent's published intent.
@@ -693,7 +693,7 @@ mod tests {
             author.did().clone(),
             1,
             SocialEventKind::WorkspaceRunRecorded {
-                run: WorkspaceRun {
+                run: Box::new(WorkspaceRun {
                     workspace: WorkspaceId::from_bytes([12; 32]),
                     actor: actor.did().clone(),
                     command: "python".into(),
@@ -703,10 +703,12 @@ mod tests {
                     stderr: nexus_storage::Cid::hash_of(b""),
                     output_root: Some(nexus_storage::Cid::hash_of(b"root")),
                     resources: ResourceUsage::default(),
+                    context: None,
+                    failure: None,
                     started_at: 1,
                     finished_at: 2,
                     note: Some("autonomous run".into()),
-                },
+                }),
             },
         )
         .sign(&author)

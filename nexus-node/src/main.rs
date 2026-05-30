@@ -6,7 +6,7 @@
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
 //!   nexus-node clone --base <dir> [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
-//!   nexus-node exec --base <dir> --workspace <path> -- <command> [args...]
+//!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ use nexus_agent::{
     IntentActionPlan, IntentKind, IntentRecommendation, IntentResponse, IntentResponseKind,
     Interaction, InteractionOutcome, ProviderRecommendation, RelationKind, ReputationScore,
     SocialEdge, SocialEvent, SocialEventKind, SocialMemory, TaskClaimJudgment, TaskDispute,
-    WorkspaceRun, WorkspaceSnapshot,
+    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 use nexus_agent::{Task, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -33,11 +33,13 @@ use nexus_crypto::capability::sign_capability;
 use nexus_crypto::verify_did_signature;
 use nexus_crypto::NodeIdentity;
 use nexus_network::{Network, NetworkConfig, NetworkEvent};
-use nexus_runtime::{ExecOptions, ProcessOutput, ResourceUsage};
+use nexus_runtime::{ExecError, ExecOptions, ProcessOutput, ResourceUsage};
 use nexus_storage::{BlockStore, Cid, DiskBlockStore};
 use nexus_sync::message::{SyncRequest, SyncResponse};
 use nexus_sync::SyncClient;
-use nexus_workspace::{Workspace, WorkspaceConfig, WorkspaceServer, WorkspaceState};
+use nexus_workspace::{
+    Workspace, WorkspaceConfig, WorkspaceError, WorkspaceServer, WorkspaceState,
+};
 
 const WORKSPACE_ANNOUNCEMENT_VERSION: u32 = 1;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -132,7 +134,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event intent-response --base <DIR> --intent <ID> --kind <interested|accept|decline|counter|fulfilled> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--evidence <TEXT>]");
     eprintln!("  {prog} event workspace-join --base <DIR> --workspace <HEX>");
     eprintln!("  {prog} event workspace-snapshot --base <DIR> --workspace <HEX> --root <CID_HEX> [--label <TEXT>] [--note <TEXT>]");
-    eprintln!("  {prog} event workspace-run --base <DIR> --workspace <HEX> --command <CMD> [--arg <ARG>...] [--exit-code <N>] [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--started-at <TS>] [--finished-at <TS>] [--note <TEXT>]");
+    eprintln!("  {prog} event workspace-run --base <DIR> --workspace <HEX> --command <CMD> [--arg <ARG>...] [--exit-code <N>] [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--cwd <DIR>] [--env-key <KEY>] [--stdin <TEXT>|--stdin-cid <CID_HEX> --stdin-bytes <N>] [--timeout-ms <N>] [--failure-kind <KIND> --failure-message <TEXT>] [--started-at <TS>] [--finished-at <TS>] [--note <TEXT>]");
     eprintln!("  {prog} event capability --base <DIR> --subject <DID> --workspace <HEX> [--permission <PERM>...] [--expires-at <TS>] [--note <TEXT>]");
     eprintln!("  {prog} event collective --base <DIR> --id <ID> --name <NAME> --purpose <TEXT>");
     eprintln!("  {prog} event collective-join --base <DIR> --id <ID>");
@@ -548,7 +550,49 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let started_at = unix_now();
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = workspace.exec(&command, &arg_refs, &exec_options).await?;
+    let context = workspace_run_context_from_exec_options(&exec_options);
+    let wall_start = Instant::now();
+    let output = match workspace.exec(&command, &arg_refs, &exec_options).await {
+        Ok(output) => output,
+        Err(err) => {
+            let wall_time = wall_start.elapsed();
+            let finished_at = unix_now().max(started_at);
+            let output_root = workspace.snapshot().await.ok();
+            let run = WorkspaceRun {
+                workspace: workspace.id(),
+                actor: identity.did().clone(),
+                command: command.clone(),
+                args: command_args.clone(),
+                exit_code: -1,
+                stdout: workspace_run_failure_stdout(&err),
+                stderr: workspace_run_failure_stderr(&err),
+                output_root,
+                resources: workspace_run_failure_resources_from_error(&err, wall_time),
+                context,
+                failure: Some(workspace_run_failure_from_error(&err)),
+                started_at,
+                finished_at,
+                note: note.clone(),
+            };
+            match SocialEvent::new(
+                identity.did().clone(),
+                finished_at,
+                SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
+            )
+            .sign(&identity)
+            {
+                Ok(event) => {
+                    if let Err(record_err) =
+                        record_social_events(&memory_path, &mut memory, [event])
+                    {
+                        eprintln!("failed to record workspace run failure: {record_err}");
+                    }
+                }
+                Err(record_err) => eprintln!("failed to sign workspace run failure: {record_err}"),
+            }
+            return Err(Box::new(err));
+        }
+    };
     let finished_at = unix_now().max(started_at);
     let output_root = workspace.snapshot().await?;
 
@@ -562,6 +606,8 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         stderr: Cid::hash_of(&output.stderr),
         output_root: Some(output_root),
         resources: output.resources.clone(),
+        context,
+        failure: None,
         started_at,
         finished_at,
         note: note.clone(),
@@ -579,7 +625,7 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         SocialEvent::new(
             identity.did().clone(),
             finished_at,
-            SocialEventKind::WorkspaceRunRecorded { run },
+            SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
         )
         .sign(&identity)?,
         SocialEvent::new(
@@ -589,15 +635,7 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .sign(&identity)?,
     ];
-    let mut inserted = false;
-    for event in events {
-        if memory.ingest_event(event)? {
-            inserted = true;
-        }
-    }
-    if inserted {
-        save_social_memory(&memory_path, &memory)?;
-    }
+    record_social_events(&memory_path, &mut memory, events)?;
 
     print!("{}", String::from_utf8_lossy(&output.stdout));
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
@@ -1154,6 +1192,117 @@ fn save_social_memory(
     }
     std::fs::write(path, serde_json::to_vec_pretty(memory)?)?;
     Ok(())
+}
+
+fn record_social_events(
+    path: &Path,
+    memory: &mut SocialMemory,
+    events: impl IntoIterator<Item = SocialEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut inserted = false;
+    for event in events {
+        if memory.ingest_event(event)? {
+            inserted = true;
+        }
+    }
+    if inserted {
+        save_social_memory(path, memory)?;
+    }
+    Ok(())
+}
+
+fn workspace_run_failure_resources_from_error(
+    error: &WorkspaceError,
+    wall_time: Duration,
+) -> ResourceUsage {
+    match error {
+        WorkspaceError::Exec(error) => match error.as_ref() {
+            ExecError::Timeout { resources, .. } => resources.clone(),
+            _ => ResourceUsage {
+                wall_time,
+                process_count: 0,
+                ..Default::default()
+            },
+        },
+        _ => ResourceUsage {
+            wall_time,
+            process_count: 0,
+            ..Default::default()
+        },
+    }
+}
+
+fn workspace_run_failure_stdout(error: &WorkspaceError) -> Cid {
+    match error {
+        WorkspaceError::Exec(error) => match error.as_ref() {
+            ExecError::Timeout { stdout, .. } => Cid::hash_of(stdout),
+            _ => Cid::hash_of(b""),
+        },
+        _ => Cid::hash_of(b""),
+    }
+}
+
+fn workspace_run_failure_stderr(error: &WorkspaceError) -> Cid {
+    match error {
+        WorkspaceError::Exec(error) => match error.as_ref() {
+            ExecError::Timeout { stderr, .. } => Cid::hash_of(stderr),
+            _ => Cid::hash_of(b""),
+        },
+        _ => Cid::hash_of(b""),
+    }
+}
+
+fn workspace_run_failure_from_error(error: &WorkspaceError) -> WorkspaceRunFailure {
+    match error {
+        WorkspaceError::Exec(error) => workspace_run_failure_from_exec_error(error.as_ref()),
+        WorkspaceError::NotFound(message) => WorkspaceRunFailure {
+            kind: "workspace_not_found".into(),
+            message: message.clone(),
+        },
+        WorkspaceError::Io(error) => WorkspaceRunFailure {
+            kind: "io".into(),
+            message: error.to_string(),
+        },
+        WorkspaceError::Storage(error) => WorkspaceRunFailure {
+            kind: "storage".into(),
+            message: error.to_string(),
+        },
+        WorkspaceError::Json(error) => WorkspaceRunFailure {
+            kind: "json".into(),
+            message: error.to_string(),
+        },
+        WorkspaceError::AlreadyExists(message) => WorkspaceRunFailure {
+            kind: "workspace_already_exists".into(),
+            message: message.clone(),
+        },
+        WorkspaceError::PermissionDenied { reason } => WorkspaceRunFailure {
+            kind: "permission_denied".into(),
+            message: reason.clone(),
+        },
+        WorkspaceError::InvalidCapability(message) => WorkspaceRunFailure {
+            kind: "invalid_capability".into(),
+            message: message.clone(),
+        },
+        WorkspaceError::Other(message) => WorkspaceRunFailure {
+            kind: "workspace_error".into(),
+            message: message.clone(),
+        },
+    }
+}
+
+fn workspace_run_failure_from_exec_error(error: &ExecError) -> WorkspaceRunFailure {
+    let kind = match error {
+        ExecError::CommandNotFound(_) => "command_not_found",
+        ExecError::ExitCode(_) => "exit_code",
+        ExecError::Signalled => "signalled",
+        ExecError::Io(_) => "io",
+        ExecError::Timeout { .. } => "timeout",
+        ExecError::Other(_) => "exec_error",
+    };
+    WorkspaceRunFailure {
+        kind: kind.into(),
+        message: error.to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2571,10 +2720,58 @@ fn workspace_run_json(run: &WorkspaceRun) -> serde_json::Value {
         "stderr": hex::encode(run.stderr.as_bytes()),
         "output_root": run.output_root.map(|root| hex::encode(root.as_bytes())),
         "resources": run.resources,
+        "context": run.context.as_ref().map(workspace_run_context_json),
+        "failure": run.failure.as_ref().map(workspace_run_failure_json),
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "note": run.note,
     })
+}
+
+fn workspace_run_failure_json(failure: &WorkspaceRunFailure) -> serde_json::Value {
+    serde_json::json!({
+        "kind": failure.kind,
+        "message": failure.message,
+    })
+}
+
+fn workspace_run_context_json(context: &WorkspaceRunContext) -> serde_json::Value {
+    serde_json::json!({
+        "working_dir": context.working_dir.as_ref(),
+        "env_keys": &context.env_keys,
+        "stdin": context.stdin.as_ref().map(|stdin| serde_json::json!({
+            "bytes": stdin.bytes,
+            "cid": hex::encode(stdin.cid.as_bytes()),
+        })),
+        "timeout_ms": context.timeout_ms,
+    })
+}
+
+fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<WorkspaceRunContext> {
+    let mut env_keys = options
+        .env
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    env_keys.sort();
+    env_keys.dedup();
+
+    let context = WorkspaceRunContext {
+        working_dir: options
+            .working_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        env_keys,
+        stdin: options.stdin.as_ref().map(|stdin| WorkspaceRunStdin {
+            bytes: stdin.len() as u64,
+            cid: Cid::hash_of(stdin),
+        }),
+        timeout_ms: options
+            .timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+    };
+
+    (!context.is_empty()).then_some(context)
 }
 
 fn interaction_json(interaction: &Interaction) -> serde_json::Value {
@@ -3075,13 +3272,18 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let mut workspace = None;
     let mut command = None;
     let mut run_args = Vec::new();
-    let mut exit_code = 0;
+    let mut exit_code = None;
     let mut stdout = Cid::hash_of(b"");
     let mut stderr = Cid::hash_of(b"");
     let mut output_root = None;
     let mut started_at = None;
     let mut finished_at = None;
     let mut note = None;
+    let mut context = WorkspaceRunContext::default();
+    let mut stdin_cid = None;
+    let mut stdin_bytes = None;
+    let mut failure_kind = None;
+    let mut failure_message = None;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -3103,7 +3305,10 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
             }
             "--exit-code" => {
                 i += 1;
-                exit_code = parse_i32_arg(required_arg(args, i, "--exit-code")?, "--exit-code")?;
+                exit_code = Some(parse_i32_arg(
+                    required_arg(args, i, "--exit-code")?,
+                    "--exit-code",
+                )?);
             }
             "--stdout" => {
                 i += 1;
@@ -3125,6 +3330,59 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 i += 1;
                 output_root = Some(parse_cid(required_arg(args, i, "--output-root")?)?);
             }
+            "--cwd" | "--working-dir" => {
+                i += 1;
+                context.working_dir = Some(required_arg(args, i, "--cwd")?.to_string());
+            }
+            "--env-key" => {
+                i += 1;
+                let key = required_arg(args, i, "--env-key")?;
+                if key.is_empty() {
+                    return Err("--env-key cannot be empty".into());
+                }
+                context.env_keys.push(key.to_string());
+            }
+            "--stdin" => {
+                i += 1;
+                if context.stdin.is_some() || stdin_cid.is_some() || stdin_bytes.is_some() {
+                    return Err("only one stdin source may be provided".into());
+                }
+                let stdin = required_arg(args, i, "--stdin")?.as_bytes().to_vec();
+                context.stdin = Some(WorkspaceRunStdin {
+                    bytes: stdin.len() as u64,
+                    cid: Cid::hash_of(&stdin),
+                });
+            }
+            "--stdin-cid" => {
+                i += 1;
+                if context.stdin.is_some() {
+                    return Err("only one stdin source may be provided".into());
+                }
+                if stdin_cid.is_some() {
+                    return Err("--stdin-cid may only be provided once".into());
+                }
+                stdin_cid = Some(parse_cid(required_arg(args, i, "--stdin-cid")?)?);
+            }
+            "--stdin-bytes" => {
+                i += 1;
+                if context.stdin.is_some() {
+                    return Err("only one stdin source may be provided".into());
+                }
+                if stdin_bytes.is_some() {
+                    return Err("--stdin-bytes may only be provided once".into());
+                }
+                stdin_bytes = Some(parse_u64_arg(
+                    required_arg(args, i, "--stdin-bytes")?,
+                    "--stdin-bytes",
+                )?);
+            }
+            "--timeout-ms" => {
+                i += 1;
+                context.timeout_ms = Some(parse_u64_arg(
+                    required_arg(args, i, "--timeout-ms")?,
+                    "--timeout-ms",
+                )?);
+            }
             "--started-at" => {
                 i += 1;
                 started_at = Some(parse_u64_arg(
@@ -3143,6 +3401,18 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 i += 1;
                 note = Some(required_arg(args, i, "--note")?.to_string());
             }
+            "--failure-kind" => {
+                i += 1;
+                let kind = required_arg(args, i, "--failure-kind")?;
+                if kind.is_empty() {
+                    return Err("--failure-kind cannot be empty".into());
+                }
+                failure_kind = Some(kind.to_string());
+            }
+            "--failure-message" => {
+                i += 1;
+                failure_message = Some(required_arg(args, i, "--failure-message")?.to_string());
+            }
             other => return Err(format!("unknown workspace-run option: {other}").into()),
         }
         i += 1;
@@ -3151,11 +3421,29 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let now = unix_now();
     let started_at = started_at.unwrap_or(now);
     let finished_at = finished_at.unwrap_or(started_at);
+    match (stdin_cid, stdin_bytes) {
+        (Some(cid), Some(bytes)) => {
+            context.stdin = Some(WorkspaceRunStdin { bytes, cid });
+        }
+        (Some(_), None) => return Err("--stdin-cid requires --stdin-bytes".into()),
+        (None, Some(_)) => return Err("--stdin-bytes requires --stdin-cid".into()),
+        (None, None) => {}
+    }
+    context.env_keys.sort();
+    context.env_keys.dedup();
+    let context = (!context.is_empty()).then_some(context);
+    let failure = match (failure_kind, failure_message) {
+        (Some(kind), Some(message)) => Some(WorkspaceRunFailure { kind, message }),
+        (Some(_), None) => return Err("--failure-kind requires --failure-message".into()),
+        (None, Some(_)) => return Err("--failure-message requires --failure-kind".into()),
+        (None, None) => None,
+    };
+    let exit_code = exit_code.unwrap_or(if failure.is_some() { -1 } else { 0 });
     let event = signed_local_event(
         &base,
         |identity| {
             Ok(SocialEventKind::WorkspaceRunRecorded {
-                run: WorkspaceRun {
+                run: Box::new(WorkspaceRun {
                     workspace: workspace.ok_or("--workspace required")?,
                     actor: identity.did().clone(),
                     command: command.ok_or("--command required")?,
@@ -3168,10 +3456,12 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
                         process_count: 1,
                         ..Default::default()
                     },
+                    context,
+                    failure,
                     started_at,
                     finished_at,
                     note,
-                },
+                }),
             })
         },
         now,
@@ -6001,6 +6291,7 @@ mod tests {
             workspace["runs"][0]["output_root"],
             workspace["latest_snapshot"]["root"]
         );
+        assert!(workspace["runs"][0]["context"].is_null());
         assert_eq!(workspace["latest_snapshot"]["label"], "after:sh");
     }
 
@@ -6058,6 +6349,218 @@ mod tests {
             "cat > output.txt && printf \"$NEXUS_MODE\" >> output.txt"
         );
         assert_eq!(run["exit_code"], 0);
+        assert_eq!(run["context"]["working_dir"], "sub");
+        assert_eq!(
+            run["context"]["env_keys"],
+            serde_json::json!(["NEXUS_MODE"])
+        );
+        assert_eq!(run["context"]["stdin"]["bytes"], 6);
+        assert_eq!(
+            run["context"]["stdin"]["cid"],
+            hex::encode(Cid::hash_of(b"input-").as_bytes())
+        );
+        assert_eq!(run["context"]["timeout_ms"], 5000);
+        assert!(!run.to_string().contains("free"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_hashes_stdin_file_without_recording_contents() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let mut ws = Workspace::create(
+            &identity,
+            temp.path(),
+            WorkspaceConfig {
+                name: "exec-stdin-file-ws".into(),
+                description: "workspace exec stdin file".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ws.snapshot().await.unwrap();
+        let workspace_path = ws.root_dir().to_path_buf();
+        let stdin_path = temp.path().join("stdin.txt");
+        std::fs::write(&stdin_path, b"private-input").unwrap();
+
+        cmd_exec(&[
+            "nexus-node".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--stdin-file".into(),
+            stdin_path.to_string_lossy().to_string(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "cat > copied.txt".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(workspace_path.join("copied.txt")).unwrap(),
+            b"private-input"
+        );
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        let view = society_json(&memory);
+        let run = &view["workspaces"][0]["runs"][0];
+        assert_eq!(run["context"]["stdin"]["bytes"], 13);
+        assert_eq!(
+            run["context"]["stdin"]["cid"],
+            hex::encode(Cid::hash_of(b"private-input").as_bytes())
+        );
+        assert!(!run.to_string().contains("private-input"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_records_startup_failures_as_social_events() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let mut ws = Workspace::create(
+            &identity,
+            temp.path(),
+            WorkspaceConfig {
+                name: "exec-failure-ws".into(),
+                description: "workspace exec failure recording".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ws.write_file("sub/.keep", b"").unwrap();
+        let initial_root = ws.snapshot().await.unwrap();
+        let workspace_path = ws.root_dir().to_path_buf();
+
+        let err = cmd_exec(&[
+            "nexus-node".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--cwd".into(),
+            "sub".into(),
+            "--env".into(),
+            "NEXUS_SECRET=free".into(),
+            "--stdin".into(),
+            "private-input".into(),
+            "--timeout-ms".into(),
+            "5000".into(),
+            "--note".into(),
+            "startup failure".into(),
+            "--".into(),
+            "__nexus_missing_command_for_failure_record__".into(),
+        ])
+        .await
+        .expect_err("startup failure should be returned to the caller");
+
+        assert!(err.to_string().contains("command not found"));
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 1);
+        let view = society_json(&memory);
+        let workspace = &view["workspaces"][0];
+        assert_eq!(workspace["snapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            workspace["latest_snapshot"]["root"],
+            hex::encode(initial_root.as_bytes())
+        );
+        assert_eq!(workspace["latest_snapshot"]["label"], "workspace-run");
+        let run = &workspace["runs"][0];
+        assert_eq!(
+            run["command"],
+            "__nexus_missing_command_for_failure_record__"
+        );
+        assert_eq!(run["exit_code"], -1);
+        assert_eq!(run["stdout"], hex::encode(Cid::hash_of(b"").as_bytes()));
+        assert_eq!(run["stderr"], hex::encode(Cid::hash_of(b"").as_bytes()));
+        assert_eq!(run["output_root"], hex::encode(initial_root.as_bytes()));
+        assert_eq!(run["context"]["working_dir"], "sub");
+        assert_eq!(
+            run["context"]["env_keys"],
+            serde_json::json!(["NEXUS_SECRET"])
+        );
+        assert_eq!(run["context"]["stdin"]["bytes"], 13);
+        assert_eq!(
+            run["context"]["stdin"]["cid"],
+            hex::encode(Cid::hash_of(b"private-input").as_bytes())
+        );
+        assert_eq!(run["context"]["timeout_ms"], 5000);
+        assert_eq!(run["resources"]["process_count"], 0);
+        assert_eq!(run["failure"]["kind"], "command_not_found");
+        assert!(run["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("__nexus_missing_command_for_failure_record__"));
+        assert_eq!(run["note"], "startup failure");
+        assert!(!run.to_string().contains("free"));
+        assert!(!run.to_string().contains("private-input"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_records_timeout_failure_resources() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let mut ws = Workspace::create(
+            &identity,
+            temp.path(),
+            WorkspaceConfig {
+                name: "exec-timeout-ws".into(),
+                description: "workspace exec timeout recording".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let initial_root = ws.snapshot().await.unwrap();
+        let workspace_path = ws.root_dir().to_path_buf();
+
+        let err = cmd_exec(&[
+            "nexus-node".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--timeout-ms".into(),
+            "20".into(),
+            "--env".into(),
+            "NEXUS_TIMEOUT_STDOUT=partial-out".into(),
+            "--env".into(),
+            "NEXUS_TIMEOUT_STDERR=partial-err".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "printf \"$NEXUS_TIMEOUT_STDOUT\"; printf \"$NEXUS_TIMEOUT_STDERR\" >&2; sleep 1"
+                .into(),
+        ])
+        .await
+        .expect_err("timeout should be returned to the caller");
+
+        assert!(err.to_string().contains("timeout"));
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 1);
+        let view = society_json(&memory);
+        let run = &view["workspaces"][0]["runs"][0];
+        assert_eq!(run["command"], "sh");
+        assert_eq!(run["exit_code"], -1);
+        assert_eq!(
+            run["stdout"],
+            hex::encode(Cid::hash_of(b"partial-out").as_bytes())
+        );
+        assert_eq!(
+            run["stderr"],
+            hex::encode(Cid::hash_of(b"partial-err").as_bytes())
+        );
+        assert_eq!(run["output_root"], hex::encode(initial_root.as_bytes()));
+        assert_eq!(run["context"]["timeout_ms"], 20);
+        assert_eq!(run["failure"]["kind"], "timeout");
+        assert_eq!(run["resources"]["process_count"], 1);
+        let wall_time = &run["resources"]["wall_time"];
+        let wall_time_nanos = wall_time["secs"].as_u64().unwrap() * 1_000_000_000
+            + u64::from(wall_time["nanos"].as_u64().unwrap() as u32);
+        assert!(wall_time_nanos > 0);
+        assert!(!run.to_string().contains("partial-out"));
+        assert!(!run.to_string().contains("partial-err"));
     }
 
     #[test]
@@ -6719,6 +7222,16 @@ mod tests {
             "".into(),
             "--output-root".into(),
             hex::encode(output_root.as_bytes()),
+            "--cwd".into(),
+            "analysis".into(),
+            "--env-key".into(),
+            "PYTHONPATH".into(),
+            "--env-key".into(),
+            "NEXUS_MODE".into(),
+            "--stdin".into(),
+            "{}".into(),
+            "--timeout-ms".into(),
+            "30000".into(),
             "--started-at".into(),
             "10".into(),
             "--finished-at".into(),
@@ -6741,6 +7254,17 @@ mod tests {
         assert_eq!(run["stderr"], hex::encode(Cid::hash_of(b"").as_bytes()));
         assert_eq!(run["output_root"], hex::encode(output_root.as_bytes()));
         assert_eq!(run["resources"]["process_count"], 1);
+        assert_eq!(run["context"]["working_dir"], "analysis");
+        assert_eq!(
+            run["context"]["env_keys"],
+            serde_json::json!(["NEXUS_MODE", "PYTHONPATH"])
+        );
+        assert_eq!(run["context"]["stdin"]["bytes"], 2);
+        assert_eq!(
+            run["context"]["stdin"]["cid"],
+            hex::encode(Cid::hash_of(b"{}").as_bytes())
+        );
+        assert_eq!(run["context"]["timeout_ms"], 30000);
         assert_eq!(run["started_at"], 10);
         assert_eq!(run["finished_at"], 12);
         assert_eq!(run["note"], "autonomous analysis");
@@ -6763,6 +7287,40 @@ mod tests {
             view["workspaces"][0]["latest_snapshot"]["label"],
             "workspace-run"
         );
+    }
+
+    #[test]
+    fn event_workspace_run_failure_defaults_to_failure_exit_code() {
+        let temp = TempDir::new().unwrap();
+        load_or_create_identity(temp.path()).unwrap();
+        let workspace = WorkspaceId::from_bytes([78; 32]);
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "workspace-run".into(),
+            "--base".into(),
+            base,
+            "--workspace".into(),
+            workspace.to_string(),
+            "--command".into(),
+            "python".into(),
+            "--arg".into(),
+            "analysis.py".into(),
+            "--failure-kind".into(),
+            "timeout".into(),
+            "--failure-message".into(),
+            "external runner timed out".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        let view = society_json(&memory);
+        let run = &view["workspaces"][0]["runs"][0];
+        assert_eq!(run["exit_code"], -1);
+        assert_eq!(run["failure"]["kind"], "timeout");
+        assert_eq!(run["failure"]["message"], "external runner timed out");
     }
 
     #[test]

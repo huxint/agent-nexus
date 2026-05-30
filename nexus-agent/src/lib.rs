@@ -27,7 +27,7 @@ pub use society::{
     CollectiveVoteChoice, GovernanceSignal, IntentActionKind, IntentActionPlan, IntentKind,
     IntentRecommendation, IntentResponse, IntentResponseKind, Interaction, InteractionOutcome,
     ProviderRecommendation, RelationKind, SocialEdge, Society, TaskClaimJudgment, TaskDispute,
-    WorkspaceRun, WorkspaceSnapshot,
+    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
     ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid, TaskCancellation,
