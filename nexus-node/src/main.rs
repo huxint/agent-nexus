@@ -12,6 +12,7 @@
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -822,12 +823,9 @@ fn save_workspace_registry(
     entries.dedup();
 
     let path = workspace_registry_path(base);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_vec_pretty(&serde_json::json!({ "workspaces": entries }))?,
+    write_file_atomic(
+        &path,
+        &serde_json::to_vec_pretty(&serde_json::json!({ "workspaces": entries }))?,
     )?;
     Ok(())
 }
@@ -913,12 +911,9 @@ fn save_workspace_discovery(
     });
 
     let path = workspace_discovery_path(base);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_vec_pretty(&serde_json::json!({ "announcements": announcements }))?,
+    write_file_atomic(
+        &path,
+        &serde_json::to_vec_pretty(&serde_json::json!({ "announcements": announcements }))?,
     )?;
     Ok(())
 }
@@ -1189,11 +1184,47 @@ fn save_social_memory(
     path: &Path,
     memory: &SocialMemory,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_file_atomic(path, &serde_json::to_vec_pretty(memory)?)?;
+    Ok(())
+}
+
+fn write_file_atomic(path: &Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(memory)?)?;
-    Ok(())
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let tmp_path =
+        path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        sync_parent_dir(path);
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    write_result
+}
+
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 fn record_social_events(
@@ -6682,6 +6713,26 @@ mod tests {
         );
         assert!(ingest_social_event_bytes(&unsigned, &mut memory, &memory_path).is_err());
         assert_eq!(memory.event_count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_and_cleans_temp() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("nested").join("state.json");
+
+        write_file_atomic(&path, br#"{"version":1}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"version":1}"#);
+
+        write_file_atomic(&path, br#"{"version":2}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"version":2}"#);
+
+        let parent = path.parent().unwrap();
+        let leftovers = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]
