@@ -1,6 +1,7 @@
 //! Filesystem helpers — mapping between disk files and Merkle-DAG nodes.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A lightweight file entry returned when listing a directory.
 #[derive(Clone, Debug)]
@@ -61,6 +62,52 @@ fn list_files_recursive(
 /// Ensure a directory exists, creating it and all parents as needed.
 pub fn ensure_dir(path: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(path)
+}
+
+/// Atomically replace a file in place, flushing both the file and parent
+/// directory where the platform supports it.
+pub fn write_file_atomic(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path =
+        path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        sync_parent_dir(path);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// Recursively remove a directory and all its contents.

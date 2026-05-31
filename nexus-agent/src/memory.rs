@@ -75,6 +75,46 @@ impl SocialMemory {
         Ok(inserted)
     }
 
+    /// Append many verified events and rebuild the society view once.
+    pub fn ingest_events(
+        &mut self,
+        events: impl IntoIterator<Item = SocialEvent>,
+    ) -> Result<usize, SocialProtocolError> {
+        let mut inserted = 0;
+        for event in events {
+            if self.log.append(event)? {
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            self.society = self.log.to_society();
+        }
+        Ok(inserted)
+    }
+
+    /// Decode and ingest many JSON events, returning one result per input while
+    /// rebuilding the society view at most once.
+    pub fn ingest_json_batch<'a>(
+        &mut self,
+        events_json: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Vec<Result<bool, SocialProtocolError>> {
+        let mut inserted_any = false;
+        let results = events_json
+            .into_iter()
+            .map(|data| {
+                let event =
+                    SocialEvent::from_json(data).map_err(SocialProtocolError::EventDecode)?;
+                let inserted = self.log.append(event)?;
+                inserted_any |= inserted;
+                Ok(inserted)
+            })
+            .collect::<Vec<_>>();
+        if inserted_any {
+            self.society = self.log.to_society();
+        }
+        results
+    }
+
     /// Decode a social event from JSON bytes and ingest it.
     pub fn ingest_json(&mut self, data: &[u8]) -> Result<bool, SocialProtocolError> {
         let event = SocialEvent::from_json(data).map_err(SocialProtocolError::EventDecode)?;
@@ -160,5 +200,40 @@ mod tests {
         assert_eq!(decoded.event_count(), 1);
         assert!(decoded.society().has_agent(alice.did()));
         assert_eq!(decoded.events().len(), 1);
+    }
+
+    #[test]
+    fn memory_batch_ingest_rebuilds_society_once_for_many_events() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let events = [
+            SocialEvent::new(
+                alice.did().clone(),
+                1,
+                SocialEventKind::WorkspaceJoined {
+                    workspace: WorkspaceId::from_bytes([14; 32]),
+                },
+            )
+            .sign(&alice)
+            .unwrap(),
+            SocialEvent::new(
+                bob.did().clone(),
+                2,
+                SocialEventKind::RelationDeclared {
+                    peer: alice.did().clone(),
+                    relation: RelationKind::Collaborator,
+                    note: None,
+                },
+            )
+            .sign(&bob)
+            .unwrap(),
+        ];
+        let mut memory = SocialMemory::new();
+
+        assert_eq!(memory.ingest_events(events).unwrap(), 2);
+
+        assert_eq!(memory.event_count(), 2);
+        assert!(memory.society().has_agent(alice.did()));
+        assert!(memory.society().has_agent(bob.did()));
     }
 }

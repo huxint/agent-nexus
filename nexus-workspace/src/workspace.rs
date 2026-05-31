@@ -1,8 +1,10 @@
 //! Workspace — the core abstraction that ties storage, execution, and identity together.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use nexus_core::{Capability, Did, PermissionSet, WorkspaceId};
 use nexus_crypto::capability::verify_capability_for_caller;
@@ -64,6 +66,33 @@ struct LoadedWorkspaceMetadata {
     description: String,
     owner: Option<Did>,
     guests: Vec<Guest>,
+    needs_persist: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSnapshotCacheEntry {
+    signature: FileSignature,
+    cid: Cid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSignature {
+    len: u64,
+    modified_nanos: Option<u128>,
+}
+
+impl FileSignature {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos());
+        Self {
+            len: metadata.len(),
+            modified_nanos,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +130,9 @@ pub struct Workspace {
 
     /// Current Merkle root CID (updated on snapshot).
     root_cid: Option<Cid>,
+
+    /// File-level snapshot cache keyed by path relative to `root_dir`.
+    file_cache: HashMap<PathBuf, FileSnapshotCacheEntry>,
 
     /// Accumulated resource usage across all executions in this workspace.
     total_resources: ResourceUsage,
@@ -162,6 +194,7 @@ impl Workspace {
             store,
             guests: Vec::new(),
             root_cid: Some(root_cid),
+            file_cache: HashMap::new(),
             total_resources: ResourceUsage::default(),
         })
     }
@@ -183,9 +216,17 @@ impl Workspace {
         let metadata = Self::read_metadata(&root_dir)?;
 
         // Index the filesystem
-        let root_cid = Self::index_directory(store.as_ref(), &root_dir).await?;
+        let mut file_cache = HashMap::new();
+        let root_cid = Self::index_directory(
+            store.as_ref(),
+            &root_dir,
+            &root_dir,
+            &HashMap::new(),
+            &mut file_cache,
+        )
+        .await?;
 
-        Ok(Self {
+        let workspace = Self {
             id: metadata.id,
             name: metadata.name,
             description: metadata.description,
@@ -195,8 +236,13 @@ impl Workspace {
             executor: Executor::new(root_dir),
             guests: metadata.guests,
             root_cid: Some(root_cid),
+            file_cache,
             total_resources: ResourceUsage::default(),
-        })
+        };
+        if metadata.needs_persist {
+            workspace.persist_metadata()?;
+        }
+        Ok(workspace)
     }
 
     /// Materialize a workspace from an already-synced Merkle tree.
@@ -222,7 +268,14 @@ impl Workspace {
         filesystem::ensure_dir(&root_dir)?;
         let store: Arc<dyn BlockStore> =
             Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
-        Self::restore_tree(source_store, store.as_ref(), &root_cid, &root_dir).await?;
+        Self::restore_tree(
+            source_store,
+            store.as_ref(),
+            &root_cid,
+            &root_dir,
+            &root_dir,
+        )
+        .await?;
         Self::write_metadata(
             &root_dir,
             &config.name,
@@ -242,6 +295,7 @@ impl Workspace {
             store,
             guests: Vec::new(),
             root_cid: Some(root_cid),
+            file_cache: HashMap::new(),
             total_resources: ResourceUsage::default(),
         })
     }
@@ -350,8 +404,17 @@ impl Workspace {
     /// root CID.  The previous root CID is NOT overwritten — old snapshots
     /// remain reachable via the block store.
     pub async fn snapshot(&mut self) -> WorkspaceResult<Cid> {
-        let root_cid = Self::index_directory(self.store.as_ref(), &self.root_dir).await?;
+        let mut next_cache = HashMap::new();
+        let root_cid = Self::index_directory(
+            self.store.as_ref(),
+            &self.root_dir,
+            &self.root_dir,
+            &self.file_cache,
+            &mut next_cache,
+        )
+        .await?;
         self.root_cid = Some(root_cid);
+        self.file_cache = next_cache;
         Ok(root_cid)
     }
 
@@ -420,7 +483,13 @@ impl Workspace {
 
     /// Recursively index a directory tree into the block store.
     /// Returns the CID of the root tree node.
-    async fn index_directory(store: &dyn BlockStore, dir: &Path) -> WorkspaceResult<Cid> {
+    async fn index_directory(
+        store: &dyn BlockStore,
+        base: &Path,
+        dir: &Path,
+        previous_cache: &HashMap<PathBuf, FileSnapshotCacheEntry>,
+        next_cache: &mut HashMap<PathBuf, FileSnapshotCacheEntry>,
+    ) -> WorkspaceResult<Cid> {
         let mut entries = Vec::new();
         let read_dir = std::fs::read_dir(dir)?;
 
@@ -428,8 +497,8 @@ impl Workspace {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
 
-            // Skip nexus metadata
-            if name == ".nexus" {
+            // Skip only the workspace's own metadata directory.
+            if dir == base && name == ".nexus" {
                 continue;
             }
 
@@ -441,14 +510,22 @@ impl Workspace {
             }
 
             if file_type.is_dir() {
-                let child_cid = Box::pin(Self::index_directory(store, &path)).await?;
+                let child_cid = Box::pin(Self::index_directory(
+                    store,
+                    base,
+                    &path,
+                    previous_cache,
+                    next_cache,
+                ))
+                .await?;
                 entries.push(TreeEntry {
                     name,
                     cid: child_cid,
                     kind: NodeKind::Tree,
                 });
             } else if file_type.is_file() {
-                let child_cid = Self::index_file(store, &path).await?;
+                let child_cid =
+                    Self::index_file(store, base, &path, previous_cache, next_cache).await?;
                 entries.push(TreeEntry {
                     name,
                     cid: child_cid,
@@ -462,38 +539,56 @@ impl Workspace {
         Ok(cid)
     }
 
-    async fn index_file(store: &dyn BlockStore, path: &Path) -> WorkspaceResult<Cid> {
-        if std::fs::metadata(path)?.len() <= FILE_CHUNK_SIZE_BYTES as u64 {
-            let data = std::fs::read(path)?;
-            return Ok(store.put(MerkleNode::blob(data)).await?);
-        }
+    async fn index_file(
+        store: &dyn BlockStore,
+        base: &Path,
+        path: &Path,
+        previous_cache: &HashMap<PathBuf, FileSnapshotCacheEntry>,
+        next_cache: &mut HashMap<PathBuf, FileSnapshotCacheEntry>,
+    ) -> WorkspaceResult<Cid> {
+        let metadata = std::fs::metadata(path)?;
+        let signature = FileSignature::from_metadata(&metadata);
+        let relative = path.strip_prefix(base).unwrap_or(path).to_path_buf();
 
-        let mut file = std::fs::File::open(path)?;
-        let mut chunks = Vec::new();
-        let mut total_size = 0_u64;
-
-        loop {
-            let mut data = vec![0_u8; FILE_CHUNK_SIZE_BYTES];
-            let read = file.read(&mut data)?;
-            if read == 0 {
-                break;
+        if let Some(cached) = previous_cache.get(&relative) {
+            if cached.signature == signature && store.has(&cached.cid).await? {
+                next_cache.insert(relative, cached.clone());
+                return Ok(cached.cid);
             }
-            data.truncate(read);
-            total_size += read as u64;
-            chunks.push(store.put(MerkleNode::blob(data)).await?);
         }
 
-        if chunks.is_empty() {
-            return Ok(store.put(MerkleNode::blob(Vec::new())).await?);
-        }
+        let cid = if metadata.len() <= FILE_CHUNK_SIZE_BYTES as u64 {
+            let data = std::fs::read(path)?;
+            store.put(MerkleNode::blob(data)).await?
+        } else {
+            let mut file = std::fs::File::open(path)?;
+            let mut chunks = Vec::new();
+            let mut total_size = 0_u64;
 
-        if chunks.len() == 1 {
-            return Ok(chunks[0]);
-        }
+            loop {
+                let mut data = vec![0_u8; FILE_CHUNK_SIZE_BYTES];
+                let read = file.read(&mut data)?;
+                if read == 0 {
+                    break;
+                }
+                data.truncate(read);
+                total_size += read as u64;
+                chunks.push(store.put(MerkleNode::blob(data)).await?);
+            }
 
-        Ok(store
-            .put(MerkleNode::chunked_blob(chunks, total_size))
-            .await?)
+            if chunks.is_empty() {
+                store.put(MerkleNode::blob(Vec::new())).await?
+            } else if chunks.len() == 1 {
+                chunks[0]
+            } else {
+                store
+                    .put(MerkleNode::chunked_blob(chunks, total_size))
+                    .await?
+            }
+        };
+
+        next_cache.insert(relative, FileSnapshotCacheEntry { signature, cid });
+        Ok(cid)
     }
 
     async fn restore_tree(
@@ -501,6 +596,7 @@ impl Workspace {
         target_store: &dyn BlockStore,
         cid: &Cid,
         dir: &Path,
+        root_dir: &Path,
     ) -> WorkspaceResult<()> {
         let node = Self::verified_node(source_store, cid).await?;
         let entries = node.as_tree().ok_or_else(|| {
@@ -509,7 +605,7 @@ impl Workspace {
         target_store.put(node.clone()).await?;
 
         for entry in entries {
-            let path = checked_child_path(dir, &entry.name)?;
+            let path = checked_child_path(dir, root_dir, &entry.name)?;
             match entry.kind {
                 NodeKind::Blob => {
                     let node = Self::verified_node(source_store, &entry.cid).await?;
@@ -527,6 +623,7 @@ impl Workspace {
                         target_store,
                         &entry.cid,
                         &path,
+                        root_dir,
                     ))
                     .await?;
                 }
@@ -635,63 +732,68 @@ impl Workspace {
         };
 
         let config_path = nexus_dir.join("config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+        filesystem::write_file_atomic(
+            &config_path,
+            serde_json::to_string_pretty(&config)?.as_bytes(),
+        )?;
         Ok(())
     }
 
     /// Read workspace metadata from `.nexus/config.json`.
     fn read_metadata(root_dir: &Path) -> WorkspaceResult<LoadedWorkspaceMetadata> {
         let config_path = root_dir.join(".nexus").join("config.json");
-        if let Ok(data) = std::fs::read_to_string(&config_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                let name = json
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unnamed")
-                    .to_string();
-                let description = json
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let id = if let Some(id_hex) = json.get("id").and_then(|v| v.as_str()) {
-                    let bytes = hex::decode(id_hex).map_err(|e| {
-                        WorkspaceError::Other(format!("invalid workspace id hex: {e}"))
-                    })?;
-                    let arr: [u8; 32] = bytes
-                        .try_into()
-                        .map_err(|_| WorkspaceError::Other("invalid workspace id length".into()))?;
-                    WorkspaceId::from_bytes(arr)
-                } else {
-                    // Legacy: no ID in config, generate one
-                    let mut id_bytes = [0u8; 32];
-                    OsRng.fill_bytes(&mut id_bytes);
-                    WorkspaceId::from_bytes(id_bytes)
-                };
-
-                let owner = json
-                    .get("owner")
-                    .and_then(|v| v.as_str())
-                    .map(|did| Did::new(did.to_string()));
-                let guests = json
-                    .get("guests")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?
-                    .unwrap_or_default();
-
-                return Ok(LoadedWorkspaceMetadata {
-                    id,
-                    name,
-                    description,
-                    owner,
-                    guests,
-                });
-            }
+        if !config_path.exists() {
+            return Ok(Self::legacy_metadata(root_dir, true));
         }
 
-        // Fallback: generate new ID, use directory name
+        let data = std::fs::read_to_string(&config_path)?;
+        let json = serde_json::from_str::<serde_json::Value>(&data)?;
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let description = json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let (id, generated_id) = if let Some(id_hex) = json.get("id").and_then(|v| v.as_str()) {
+            let bytes = hex::decode(id_hex)
+                .map_err(|e| WorkspaceError::Other(format!("invalid workspace id hex: {e}")))?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| WorkspaceError::Other("invalid workspace id length".into()))?;
+            (WorkspaceId::from_bytes(arr), false)
+        } else {
+            let mut id_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut id_bytes);
+            (WorkspaceId::from_bytes(id_bytes), true)
+        };
+
+        let owner = json
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .map(|did| Did::new(did.to_string()));
+        let guests = json
+            .get("guests")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(LoadedWorkspaceMetadata {
+            id,
+            name,
+            description,
+            owner,
+            guests,
+            needs_persist: generated_id,
+        })
+    }
+
+    fn legacy_metadata(root_dir: &Path, needs_persist: bool) -> LoadedWorkspaceMetadata {
         let name = root_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -701,22 +803,24 @@ impl Workspace {
         OsRng.fill_bytes(&mut id_bytes);
         let id = WorkspaceId::from_bytes(id_bytes);
 
-        Ok(LoadedWorkspaceMetadata {
+        LoadedWorkspaceMetadata {
             id,
             name,
             description: String::new(),
             owner: None,
             guests: Vec::new(),
-        })
+            needs_persist,
+        }
     }
 }
 
-fn checked_child_path(base: &Path, name: &str) -> WorkspaceResult<PathBuf> {
+fn checked_child_path(base: &Path, root_dir: &Path, name: &str) -> WorkspaceResult<PathBuf> {
     let child = Path::new(name);
     let components = child.components().collect::<Vec<_>>();
     if child.is_absolute()
         || components.len() != 1
         || !matches!(components[0], std::path::Component::Normal(_))
+        || (base == root_dir && name == ".nexus")
     {
         return Err(WorkspaceError::Other(format!(
             "invalid workspace tree entry: {name}"
@@ -840,6 +944,25 @@ mod tests {
             .iter()
             .any(|entry| entry.path == Path::new("visible.txt")));
         assert!(files.iter().all(|entry| !entry.path.starts_with(".nexus")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_nested_nexus_directories() {
+        let (mut ws, _base) = setup_workspace().await;
+
+        ws.write_file("project/.nexus/data.txt", b"keep me")
+            .unwrap();
+        let root = ws.snapshot().await.unwrap();
+
+        let root_node = ws.store.get(&root).await.unwrap();
+        let project = root_node.lookup("project").expect("project tree");
+        let project_node = ws.store.get(&project.cid).await.unwrap();
+        let nested_nexus = project_node.lookup(".nexus").expect("nested .nexus tree");
+        let nested_node = ws.store.get(&nested_nexus.cid).await.unwrap();
+        let data = nested_node.lookup("data.txt").expect("nested data file");
+        let data_node = ws.store.get(&data.cid).await.unwrap();
+
+        assert_eq!(data_node.as_blob().unwrap(), b"keep me");
     }
 
     #[tokio::test]
@@ -1083,6 +1206,93 @@ mod tests {
 
         assert!(err.to_string().contains("invalid workspace tree entry"));
         assert!(!base.path().join("escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_from_store_rejects_root_nexus_tree() {
+        let owner = NodeIdentity::generate();
+        let base = TempDir::new().unwrap();
+        let source = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "source".into(),
+                description: "source workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let blob_cid = source
+            .store
+            .put(MerkleNode::blob(b"poison".to_vec()))
+            .await
+            .unwrap();
+        let nexus_cid = source
+            .store
+            .put(MerkleNode::tree(vec![TreeEntry {
+                name: "config.json".into(),
+                cid: blob_cid,
+                kind: NodeKind::Blob,
+            }]))
+            .await
+            .unwrap();
+        let root_cid = source
+            .store
+            .put(MerkleNode::tree(vec![TreeEntry {
+                name: ".nexus".into(),
+                cid: nexus_cid,
+                kind: NodeKind::Tree,
+            }]))
+            .await
+            .unwrap();
+
+        let err = match Workspace::materialize_from_store(
+            owner.did(),
+            base.path().join("clone"),
+            WorkspaceConfig {
+                name: "clone".into(),
+                description: "bad tree".into(),
+            },
+            source.id(),
+            root_cid,
+            source.store.as_ref(),
+        )
+        .await
+        {
+            Ok(_) => panic!("root .nexus tree should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("invalid workspace tree entry"));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_corrupt_workspace_metadata() {
+        let owner = NodeIdentity::generate();
+        let base = TempDir::new().unwrap();
+        let workspace = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "corrupt-config".into(),
+                description: "metadata must be strict".into(),
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            workspace.root_dir().join(".nexus/config.json"),
+            b"{not-json",
+        )
+        .unwrap();
+
+        let err = match Workspace::load(&owner, workspace.root_dir()).await {
+            Ok(_) => panic!("corrupt metadata should not create a new workspace id"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("JSON error"));
     }
 
     #[tokio::test]
