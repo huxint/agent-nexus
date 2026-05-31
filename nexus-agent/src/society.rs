@@ -473,6 +473,9 @@ pub struct ProviderRecommendation {
     /// Whether this recommendation has either local trust reachability or an
     /// independently anchored external witness behind high-confidence ranking.
     pub high_trust_eligible: bool,
+    /// Fraction of strong praise that appears to come from a closed, locally
+    /// unreachable mutual-praise cluster.
+    pub sybil_cluster_score: f64,
     /// Score derived from collective judgments about the provider's claims.
     pub governance_score: f64,
     /// Recent collective judgments that explain the governance score.
@@ -2416,12 +2419,16 @@ impl Society {
                 let reachability_score = requester
                     .map(|requester| self.trust_reachability_score(requester, &manifest.did))
                     .unwrap_or(1.0);
+                let sybil_cluster_score = requester
+                    .map(|requester| self.sybil_cluster_score(requester, &manifest.did))
+                    .unwrap_or(0.0);
                 let reputation_score = requester
                     .map(|requester| {
                         self.reachable_reputation_score(
                             requester,
                             &manifest.did,
                             reachability_score,
+                            sybil_cluster_score,
                         )
                     })
                     .unwrap_or(0.5);
@@ -2454,6 +2461,7 @@ impl Society {
                     reputation_score,
                     reachability_score,
                     high_trust_eligible,
+                    sybil_cluster_score,
                     governance_score,
                     governance_signals,
                     price_per_unit: capability_decl.price_per_unit,
@@ -2523,6 +2531,7 @@ impl Society {
         requester: &Did,
         target: &Did,
         target_reachability: f64,
+        sybil_cluster_score: f64,
     ) -> f64 {
         if let Some(score) = self.reputation(requester, target) {
             return score.composite();
@@ -2552,7 +2561,45 @@ impl Society {
             return 0.5;
         }
 
-        reachable_reputation(weighted_score / total_weight, target_reachability)
+        reachable_reputation(
+            weighted_score / total_weight,
+            target_reachability * (1.0 - sybil_cluster_score),
+        )
+    }
+
+    fn sybil_cluster_score(&self, requester: &Did, target: &Did) -> f64 {
+        if self.trust_reachability_score(requester, target) > 0.0 {
+            return 0.0;
+        }
+
+        let inbound_sources = self
+            .reputations
+            .iter()
+            .filter_map(|((source, subject), score)| {
+                (subject == target
+                    && source != requester
+                    && source != target
+                    && score.successes >= 2
+                    && score.failures == 0
+                    && score.composite() > 0.70)
+                    .then_some(source)
+            })
+            .collect::<Vec<_>>();
+
+        if inbound_sources.is_empty() {
+            return 0.0;
+        }
+
+        let closed_praise = inbound_sources
+            .iter()
+            .filter(|source| {
+                self.reputation(target, source).is_some_and(|score| {
+                    score.successes >= 2 && score.failures == 0 && score.composite() > 0.70
+                })
+            })
+            .count();
+
+        (closed_praise as f64 / inbound_sources.len() as f64).clamp(0.0, 1.0)
     }
 
     fn governance_signals_for(&self, target: &Did, limit: usize) -> Vec<GovernanceSignal> {
@@ -4349,6 +4396,47 @@ mod tests {
         assert!(witnessed_view.high_trust_eligible);
         assert_eq!(unwitnessed_view.reachability_score, 0.0);
         assert!(!unwitnessed_view.high_trust_eligible);
+    }
+
+    #[test]
+    fn provider_recommendations_downrank_closed_mutual_praise() {
+        let requester = did("requester");
+        let sybil_a = did("sybil-a");
+        let sybil_b = did("sybil-b");
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            sybil_a.clone(),
+            1,
+            SocialEventKind::ManifestPublished {
+                manifest: provider_manifest(sybil_a.clone(), "Sybil A", "python-exec", 10),
+            },
+        ));
+        for i in 0..4 {
+            society.record_interaction(Interaction::new(
+                sybil_b.clone(),
+                sybil_a.clone(),
+                None,
+                "mutual praise a",
+                InteractionOutcome::Success,
+                10 + i,
+            ));
+            society.record_interaction(Interaction::new(
+                sybil_a.clone(),
+                sybil_b.clone(),
+                None,
+                "mutual praise b",
+                InteractionOutcome::Success,
+                20 + i,
+            ));
+        }
+
+        let providers = society.recommend_providers(&requester, "python-exec", 10);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].reachability_score, 0.0);
+        assert_eq!(providers[0].sybil_cluster_score, 1.0);
+        assert!((providers[0].reputation_score - 0.5).abs() < 0.001);
+        assert!(providers[0].ranking_score <= 0.60);
     }
 
     #[test]
