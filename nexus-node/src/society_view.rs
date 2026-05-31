@@ -3,10 +3,10 @@ use std::path::Path;
 use nexus_agent::{
     capability_signature_id, task_result_claim_id, AgentIntent, CapabilityGrant,
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
-    ExecutionReceipt, GovernanceSignal, IntentRecommendation, IntentResponse, Interaction,
-    ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge, SocialMemory, Task,
-    TaskClaimJudgment, TaskResult, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
-    WorkspaceSnapshot,
+    ExecutionReceipt, GovernanceSignal, IdentityRevocation, IntentRecommendation, IntentResponse,
+    Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
+    SocialMemory, Task, TaskClaimJudgment, TaskResult, WorkspaceRun, WorkspaceRunContext,
+    WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -117,6 +117,7 @@ pub(crate) fn society_json_for_base(
         .filter(|did| agent_matches_filters(society, did, &options))
         .map(|did| {
             let manifest = society.agent_manifest(did);
+            let revocation = society.identity_revocation(did);
             let provider_recommendations = manifest
                 .map(|manifest| {
                     manifest
@@ -134,6 +135,8 @@ pub(crate) fn society_json_for_base(
                 .unwrap_or_default();
             serde_json::json!({
                 "did": did.to_string(),
+                "revoked": revocation.is_some(),
+                "revocation": revocation.map(identity_revocation_json),
                 "manifest": manifest,
                 "provider_recommendations": provider_recommendations,
                 "activity": agent_activity_json(society, did, &options),
@@ -919,6 +922,14 @@ fn capability_revocation_json(revocation: &CapabilityRevocation) -> serde_json::
     serde_json::json!({
         "issuer": revocation.issuer.to_string(),
         "capability_signature_id": revocation.capability_signature_id,
+        "reason": revocation.reason,
+        "revoked_at": revocation.revoked_at,
+    })
+}
+
+fn identity_revocation_json(revocation: &IdentityRevocation) -> serde_json::Value {
+    serde_json::json!({
+        "did": revocation.did.to_string(),
         "reason": revocation.reason,
         "revoked_at": revocation.revoked_at,
     })
