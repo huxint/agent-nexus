@@ -24,11 +24,11 @@ pub use registry::AgentRegistry;
 pub use society::{
     random_social_id, task_result_claim_id, AgentIntent, CapabilityGrant, Collective,
     CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal, CollectiveVote,
-    CollectiveVoteChoice, GovernanceSignal, IntentActionKind, IntentActionPlan, IntentKind,
-    IntentRecommendation, IntentResponse, IntentResponseKind, Interaction, InteractionOutcome,
-    ProviderRecommendation, RelationKind, SettlementRecord, SocialEdge, Society, TaskClaimJudgment,
-    TaskDispute, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
-    WorkspaceSnapshot,
+    CollectiveVoteChoice, FactTruthStatus, GovernanceSignal, IntentActionKind, IntentActionPlan,
+    IntentKind, IntentRecommendation, IntentResponse, IntentResponseKind, Interaction,
+    InteractionOutcome, ProviderRecommendation, RelationKind, SettlementRecord, SocialEdge,
+    Society, TaskClaimJudgment, TaskDispute, WorkspaceRun, WorkspaceRunContext,
+    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
     ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid, TaskCancellation,

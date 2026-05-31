@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 
 use nexus_core::{Capability, Did, WorkspaceId};
-use nexus_economy::{ReputationScore, SettlementError, SettlementProof};
+use nexus_economy::{
+    AuthorityAnchor, AuthorityKind, ReputationScore, SettlementError, SettlementProof,
+};
 use nexus_runtime::ResourceUsage;
 use nexus_storage::Cid;
 use serde::{Deserialize, Serialize};
@@ -267,7 +269,15 @@ pub struct CollectiveVote {
     pub timestamp: u64,
 }
 
-/// A recorded decision for a collective proposal.
+/// Whether a social fact is only signed by its claimant or independently anchored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactTruthStatus {
+    Claimed,
+    Anchored,
+}
+
+/// Possible outcome of a collective governance decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CollectiveDecisionOutcome {
     Accepted,
@@ -276,6 +286,7 @@ pub enum CollectiveDecisionOutcome {
     Disputed,
 }
 
+/// A recorded decision for a collective proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectiveDecision {
     pub proposal_id: String,
@@ -291,8 +302,21 @@ pub struct CollectiveDecision {
     /// Optional agent whose claim or conduct is being judged.
     #[serde(default)]
     pub target: Option<Did>,
+    /// Optional authority evidence that turns this from a signed claim into a
+    /// witnessed collective fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AuthorityAnchor>,
     pub reason: String,
     pub timestamp: u64,
+}
+
+impl CollectiveDecision {
+    pub fn validate_anchor(&self) -> Result<(), SettlementError> {
+        if let Some(anchor) = &self.anchor {
+            anchor.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// A governance decision that has been anchored to a task or exact result claim.
@@ -305,6 +329,7 @@ pub struct TaskClaimJudgment {
     pub task_id: Option<String>,
     pub claim_id: Option<String>,
     pub target: Option<Did>,
+    pub truth_status: FactTruthStatus,
     pub reason: String,
     pub timestamp: u64,
 }
@@ -346,6 +371,22 @@ impl SettlementRecord {
     pub fn validate(&self) -> Result<(), SettlementError> {
         self.proof
             .validate_for_settlement(&self.payer, &self.payee, self.amount)
+    }
+
+    pub fn truth_status(&self) -> FactTruthStatus {
+        match &self.proof {
+            SettlementProof::AnchoredCheckpoint(proof) if proof.validate().is_ok() => {
+                FactTruthStatus::Anchored
+            }
+            _ => FactTruthStatus::Claimed,
+        }
+    }
+
+    pub fn authority_anchor(&self) -> Option<&AuthorityAnchor> {
+        match &self.proof {
+            SettlementProof::AnchoredCheckpoint(proof) => Some(&proof.anchor),
+            _ => None,
+        }
     }
 }
 
@@ -433,6 +474,7 @@ pub struct GovernanceSignal {
     pub outcome: CollectiveDecisionOutcome,
     pub task_id: Option<String>,
     pub claim_id: Option<String>,
+    pub truth_status: FactTruthStatus,
     pub reason: String,
     pub timestamp: u64,
 }
@@ -1311,12 +1353,23 @@ impl Society {
             .get(&collective_proposal_key(collective_id, proposal_id))
     }
 
+    pub fn collective_decision_truth_status(
+        &self,
+        decision: &CollectiveDecision,
+    ) -> FactTruthStatus {
+        if self.collective_decision_anchor_valid(decision) {
+            FactTruthStatus::Anchored
+        } else {
+            FactTruthStatus::Claimed
+        }
+    }
+
     pub fn task_claim_judgments(&self, task_id: &str) -> Vec<TaskClaimJudgment> {
         let mut judgments: Vec<TaskClaimJudgment> = self
             .collective_decisions
             .values()
             .filter(|decision| decision.task_id.as_deref() == Some(task_id))
-            .map(task_claim_judgment_from_decision)
+            .map(|decision| task_claim_judgment_from_decision(self, decision))
             .collect();
         judgments.sort_by(task_claim_judgment_order);
         judgments
@@ -1330,7 +1383,7 @@ impl Society {
                 decision.task_id.as_deref() == Some(task_id)
                     && decision.claim_id.as_deref() == Some(claim_id)
             })
-            .map(task_claim_judgment_from_decision)
+            .map(|decision| task_claim_judgment_from_decision(self, decision))
             .collect();
         judgments.sort_by(task_claim_judgment_order);
         judgments
@@ -1982,6 +2035,27 @@ impl Society {
             .or_insert(settlement);
     }
 
+    fn collective_decision_anchor_valid(&self, decision: &CollectiveDecision) -> bool {
+        let Some(anchor) = decision.anchor.as_ref() else {
+            return false;
+        };
+        if anchor.validate().is_err() {
+            return false;
+        }
+        if anchor.kind != AuthorityKind::CollectiveQuorum {
+            return true;
+        }
+        let Some(collective) = self.collectives.get(&decision.collective_id) else {
+            return false;
+        };
+        let threshold = anchor.threshold.unwrap_or(0);
+        let unique_attestors = anchor.attestors.iter().collect::<HashSet<_>>();
+        unique_attestors.len() >= threshold
+            && unique_attestors
+                .iter()
+                .all(|attestor| collective.members.contains(*attestor))
+    }
+
     pub fn record_equivocation_proof(&mut self, proof: EquivocationProof) {
         if proof.verify().is_err() {
             return;
@@ -2248,6 +2322,7 @@ impl Society {
                 outcome: judgment.outcome,
                 task_id: judgment.task_id.clone(),
                 claim_id: judgment.claim_id.clone(),
+                truth_status: self.collective_decision_truth_status(judgment),
                 reason: judgment.reason.clone(),
                 timestamp: judgment.timestamp,
             })
@@ -2684,7 +2759,10 @@ fn is_derived_snapshot(snapshot: &WorkspaceSnapshot) -> bool {
     )
 }
 
-fn task_claim_judgment_from_decision(decision: &CollectiveDecision) -> TaskClaimJudgment {
+fn task_claim_judgment_from_decision(
+    society: &Society,
+    decision: &CollectiveDecision,
+) -> TaskClaimJudgment {
     TaskClaimJudgment {
         collective_id: decision.collective_id.clone(),
         proposal_id: decision.proposal_id.clone(),
@@ -2693,6 +2771,7 @@ fn task_claim_judgment_from_decision(decision: &CollectiveDecision) -> TaskClaim
         task_id: decision.task_id.clone(),
         claim_id: decision.claim_id.clone(),
         target: decision.target.clone(),
+        truth_status: society.collective_decision_truth_status(decision),
         reason: decision.reason.clone(),
         timestamp: decision.timestamp,
     }
@@ -2715,7 +2794,11 @@ fn governance_score_from_signals(signals: &[GovernanceSignal]) -> f64 {
             CollectiveDecisionOutcome::Deferred => 0.45,
             CollectiveDecisionOutcome::Disputed => 0.05,
         };
-        score = ema(score, observed);
+        let weighted = match signal.truth_status {
+            FactTruthStatus::Anchored => observed,
+            FactTruthStatus::Claimed => 0.5 + (observed - 0.5) * 0.5,
+        };
+        score = ema(score, weighted);
     }
     score.clamp(0.0, 1.0)
 }
@@ -2769,12 +2852,19 @@ mod tests {
     use nexus_core::PermissionSet;
     use nexus_crypto::capability::sign_capability;
     use nexus_crypto::NodeIdentity;
-    use nexus_economy::{LightningSettlement, MutualCreditSettlement, SettlementProof};
+    use nexus_economy::{
+        AnchoredCheckpoint, AuthorityAnchor, AuthorityKind, LightningSettlement,
+        MutualCreditSettlement, SettlementProof, StateCheckpoint,
+    };
     use nexus_runtime::{ProcessOutput, ResourceUsage};
     use sha2::{Digest, Sha256};
 
     fn did(s: &str) -> Did {
         Did::new(format!("did:key:{s}"))
+    }
+
+    fn hash_hex(byte: u8) -> String {
+        hex::encode([byte; 32])
     }
 
     #[test]
@@ -2872,6 +2962,75 @@ mod tests {
 
         assert!(society.settlement("settlement-forged").is_none());
         assert!(society.settlements().is_empty());
+    }
+
+    #[test]
+    fn settlement_truth_status_distinguishes_claimed_and_anchored_facts() {
+        let payer = did("payer");
+        let payee = did("payee");
+        let mut society = Society::new();
+        let claimed = SettlementRecord {
+            id: "settlement-claimed".into(),
+            task_id: Some("task-1".into()),
+            claim_id: None,
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount: 42,
+            proof: SettlementProof::Sovereign,
+            settled_at: 10,
+        };
+        society.apply_event(&SocialEvent::new(
+            payer.clone(),
+            10,
+            SocialEventKind::SettlementRecorded {
+                settlement: claimed,
+            },
+        ));
+
+        let checkpoint = StateCheckpoint {
+            version: 1,
+            subject: "settlement:settlement-anchored".into(),
+            social_root_hex: Some(hash_hex(1)),
+            workspace_root_hex: None,
+            ledger_root_hex: Some(hash_hex(2)),
+            policy_id: "settlement-finality-v1".into(),
+            timestamp: 11,
+        };
+        let anchor = AuthorityAnchor {
+            kind: AuthorityKind::CollectiveQuorum,
+            commitment_hex: checkpoint.commitment_hex().unwrap(),
+            locator: Some("collective:audit-lab/proposal:settlement-anchored".into()),
+            attestors: vec![did("alice"), did("bob")],
+            threshold: Some(2),
+        };
+        let anchored = SettlementRecord {
+            id: "settlement-anchored".into(),
+            task_id: Some("task-2".into()),
+            claim_id: None,
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount: 100,
+            proof: SettlementProof::AnchoredCheckpoint(AnchoredCheckpoint { checkpoint, anchor }),
+            settled_at: 11,
+        };
+        society.apply_event(&SocialEvent::new(
+            payer,
+            11,
+            SocialEventKind::SettlementRecorded {
+                settlement: anchored,
+            },
+        ));
+
+        assert_eq!(
+            society
+                .settlement("settlement-claimed")
+                .unwrap()
+                .truth_status(),
+            FactTruthStatus::Claimed
+        );
+        let stored = society.settlement("settlement-anchored").unwrap();
+        assert_eq!(stored.truth_status(), FactTruthStatus::Anchored);
+        assert!(stored.authority_anchor().is_some());
     }
 
     #[test]
@@ -3267,6 +3426,7 @@ mod tests {
                     task_id: None,
                     claim_id: None,
                     target: None,
+                    anchor: None,
                     reason: "approved by known members".into(),
                     timestamp: 5,
                 },
@@ -3353,6 +3513,7 @@ mod tests {
                     task_id: None,
                     claim_id: None,
                     target: None,
+                    anchor: None,
                     reason: "lab B declined".into(),
                     timestamp: 3,
                 },
@@ -3411,6 +3572,7 @@ mod tests {
                     task_id: Some("task-1".into()),
                     claim_id: Some("claim-1".into()),
                     target: Some(worker.clone()),
+                    anchor: None,
                     reason: "receipt was not signed".into(),
                     timestamp: 2,
                 },
@@ -3428,6 +3590,89 @@ mod tests {
         assert!(society
             .result_claim_judgments("task-1", "claim-2")
             .is_empty());
+    }
+
+    #[test]
+    fn collective_quorum_anchor_marks_decision_as_anchored_only_for_members() {
+        let alice = did("alice");
+        let bob = did("bob");
+        let outsider = did("outsider");
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            alice.clone(),
+            1,
+            SocialEventKind::CollectiveDeclared {
+                collective_id: "audit-lab".into(),
+                name: "Audit Lab".into(),
+                purpose: "witness disputed facts".into(),
+                members: vec![alice.clone(), bob.clone()],
+            },
+        ));
+        for (proposal_id, anchor) in [
+            (
+                "member-quorum",
+                AuthorityAnchor {
+                    kind: AuthorityKind::CollectiveQuorum,
+                    commitment_hex: hash_hex(7),
+                    locator: Some("proposal:member-quorum".into()),
+                    attestors: vec![alice.clone(), bob.clone()],
+                    threshold: Some(2),
+                },
+            ),
+            (
+                "outsider-quorum",
+                AuthorityAnchor {
+                    kind: AuthorityKind::CollectiveQuorum,
+                    commitment_hex: hash_hex(8),
+                    locator: Some("proposal:outsider-quorum".into()),
+                    attestors: vec![alice.clone(), outsider.clone()],
+                    threshold: Some(2),
+                },
+            ),
+        ] {
+            society.apply_event(&SocialEvent::new(
+                alice.clone(),
+                2,
+                SocialEventKind::CollectiveDecisionRecorded {
+                    decision: CollectiveDecision {
+                        proposal_id: proposal_id.into(),
+                        collective_id: "audit-lab".into(),
+                        decider: alice.clone(),
+                        outcome: CollectiveDecisionOutcome::Accepted,
+                        task_id: Some(format!("task-{proposal_id}")),
+                        claim_id: None,
+                        target: Some(bob.clone()),
+                        anchor: Some(anchor),
+                        reason: "quorum witness".into(),
+                        timestamp: 2,
+                    },
+                },
+            ));
+        }
+
+        let anchored = society
+            .collective_decision("audit-lab", "member-quorum")
+            .unwrap();
+        assert_eq!(
+            society.collective_decision_truth_status(anchored),
+            FactTruthStatus::Anchored
+        );
+        let claimed = society
+            .collective_decision("audit-lab", "outsider-quorum")
+            .unwrap();
+        assert_eq!(
+            society.collective_decision_truth_status(claimed),
+            FactTruthStatus::Claimed
+        );
+        assert_eq!(
+            society.task_claim_judgments("task-member-quorum")[0].truth_status,
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(
+            society.task_claim_judgments("task-outsider-quorum")[0].truth_status,
+            FactTruthStatus::Claimed
+        );
     }
 
     #[test]
@@ -3597,6 +3842,7 @@ mod tests {
                         task_id: Some(format!("task-{proposal_id}")),
                         claim_id: Some(format!("claim-{proposal_id}")),
                         target: Some(target),
+                        anchor: None,
                         reason: "governance signal for provider choice".into(),
                         timestamp: 2,
                     },

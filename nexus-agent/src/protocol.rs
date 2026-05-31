@@ -388,7 +388,9 @@ impl SocialEvent {
                 self.ensure_subject("collective vote", &vote.voter)
             }
             SocialEventKind::CollectiveDecisionRecorded { decision } => {
-                self.ensure_subject("collective decision", &decision.decider)
+                self.ensure_subject("collective decision", &decision.decider)?;
+                decision.validate_anchor()?;
+                Ok(())
             }
             SocialEventKind::WorkspaceJoined { .. }
             | SocialEventKind::RelationDeclared { .. }
