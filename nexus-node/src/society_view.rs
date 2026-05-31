@@ -916,6 +916,7 @@ fn provider_recommendation_json(recommendation: ProviderRecommendation) -> serde
         "reputation_score": recommendation.reputation_score,
         "reachability_score": recommendation.reachability_score,
         "high_trust_eligible": recommendation.high_trust_eligible,
+        "sybil_cluster_score": recommendation.sybil_cluster_score,
         "governance_score": recommendation.governance_score,
         "governance_signals": recommendation
             .governance_signals
