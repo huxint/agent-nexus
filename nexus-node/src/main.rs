@@ -2,12 +2,12 @@
 //!
 //! Usage:
 //!   nexus-node create --name <name> [--base <dir>]
-//!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>]
+//!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>] [--no-public-bootstrap]
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
-//!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>] --workspace <hex> --name <name>
+//!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
-//!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -52,6 +52,7 @@ const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SOCIAL_EVENTS_PER_RESPONSE: usize = 512;
 const MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE: usize = 256;
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceAnnouncement {
@@ -143,10 +144,10 @@ fn print_usage(prog: &str) {
     eprintln!("nexus-node — AI workspace node");
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
-    eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
+    eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>] [--no-public-bootstrap] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
     eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
-    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>]");
-    eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
+    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>] [--no-public-bootstrap]");
+    eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>] [--no-public-bootstrap] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -284,6 +285,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut name = None;
     let mut description = None;
     let mut online = false;
+    let mut use_public_bootstrap = true;
     let mut discovery_timeout = DEFAULT_DISCOVERY_TIMEOUT;
     let mut i = 2;
     while i < args.len() {
@@ -300,6 +302,9 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
                 online = true;
+            }
+            "--no-public-bootstrap" => {
+                use_public_bootstrap = false;
             }
             "--peer" => {
                 i += 1;
@@ -333,7 +338,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_id = workspace_id.ok_or("--workspace required")?;
     let name = name.ok_or("--name required")?;
     if bootstrap.is_empty() {
-        bootstrap = default_bootstrap_peers()?;
+        bootstrap = default_bootstrap_peers(&base, use_public_bootstrap)?;
         if !bootstrap.is_empty() && peer.is_none() {
             online = true;
         }
@@ -733,6 +738,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
     let mut bootstrap = Vec::new();
+    let mut use_public_bootstrap = true;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -748,6 +754,9 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
             }
+            "--no-public-bootstrap" => {
+                use_public_bootstrap = false;
+            }
             o => {
                 eprintln!("unknown: {o}");
                 return Ok(());
@@ -756,7 +765,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
     if bootstrap.is_empty() {
-        bootstrap = default_bootstrap_peers()?;
+        bootstrap = default_bootstrap_peers(&base, use_public_bootstrap)?;
     }
 
     let id_path = identity_path(&base);
@@ -1613,6 +1622,7 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
     let mut bootstrap = Vec::new();
     let mut online = false;
+    let mut use_public_bootstrap = true;
     let mut timeout = DEFAULT_DISCOVERY_TIMEOUT;
     let mut json = false;
     let mut filter = DiscoveryFilter::default();
@@ -1637,6 +1647,9 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
                 online = true;
+            }
+            "--no-public-bootstrap" => {
+                use_public_bootstrap = false;
             }
             "--timeout-ms" => {
                 i += 1;
@@ -1676,7 +1689,7 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
 
     if online && bootstrap.is_empty() {
-        bootstrap = default_bootstrap_peers()?;
+        bootstrap = default_bootstrap_peers(&base, use_public_bootstrap)?;
     }
     if online {
         let identity = load_or_create_identity(&base)?;
@@ -4909,16 +4922,96 @@ fn parse_bootstrap_list(value: &str) -> Result<Vec<libp2p::Multiaddr>, Box<dyn s
         .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
         .filter(|item| !item.is_empty())
     {
-        addrs.push(item.parse()?);
+        push_unique_bootstrap_addr(&mut addrs, item.parse()?);
     }
     Ok(addrs)
 }
 
-fn default_bootstrap_peers() -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+fn default_bootstrap_peers(
+    base: &Path,
+    use_public_defaults: bool,
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
     match std::env::var("NEXUS_BOOTSTRAP") {
-        Ok(value) => parse_bootstrap_list(&value),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(err) => Err(format!("read NEXUS_BOOTSTRAP: {err}").into()),
+        Ok(value) => return parse_bootstrap_list(&value),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(err) => return Err(format!("read NEXUS_BOOTSTRAP: {err}").into()),
+    }
+
+    let mut addrs = load_bootstrap_config_peers(base)?;
+    for addr in cached_workspace_bootstrap_peers(base) {
+        push_unique_bootstrap_addr(&mut addrs, addr);
+    }
+    if use_public_defaults {
+        if let Some(value) = option_env!("NEXUS_DEFAULT_BOOTSTRAP") {
+            for addr in parse_bootstrap_list(value)? {
+                push_unique_bootstrap_addr(&mut addrs, addr);
+            }
+        }
+        for item in DEFAULT_BOOTSTRAP_PEERS {
+            push_unique_bootstrap_addr(&mut addrs, item.parse()?);
+        }
+    }
+
+    Ok(addrs)
+}
+
+fn bootstrap_config_path(base: &Path) -> PathBuf {
+    base.join(".nexus-bootstrap.json")
+}
+
+fn load_bootstrap_config_peers(
+    base: &Path,
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let path = bootstrap_config_path(base);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let data = std::fs::read(&path)?;
+    let value: serde_json::Value = serde_json::from_slice(&data)?;
+    let entries = value
+        .get("peers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_else(|| value.as_array().cloned().unwrap_or_default());
+
+    let mut addrs = Vec::new();
+    for entry in entries {
+        let addr = entry
+            .as_str()
+            .ok_or_else(|| format!("invalid bootstrap peer in {}", path.display()))?;
+        push_unique_bootstrap_addr(&mut addrs, addr.parse()?);
+    }
+    Ok(addrs)
+}
+
+fn cached_workspace_bootstrap_peers(base: &Path) -> Vec<libp2p::Multiaddr> {
+    let announcements = match load_workspace_discovery(base) {
+        Ok(announcements) => announcements,
+        Err(err) => {
+            tracing::warn!("failed to read workspace discovery bootstrap cache: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut addrs = Vec::new();
+    for announcement in announcements {
+        if verify_workspace_announcement(&announcement).is_err() {
+            continue;
+        }
+        for addr in announcement.addrs {
+            match addr.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => push_unique_bootstrap_addr(&mut addrs, addr),
+                Err(err) => tracing::warn!("ignored cached bootstrap address {addr}: {err}"),
+            }
+        }
+    }
+    addrs
+}
+
+fn push_unique_bootstrap_addr(addrs: &mut Vec<libp2p::Multiaddr>, addr: libp2p::Multiaddr) {
+    if !addrs.iter().any(|existing| existing == &addr) {
+        addrs.push(addr);
     }
 }
 
@@ -5854,6 +5947,13 @@ mod tests {
         .unwrap()
     }
 
+    fn test_bootstrap_addr(port: u16) -> (String, libp2p::Multiaddr) {
+        let peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let addr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{peer}");
+        let parsed = addr.parse().unwrap();
+        (addr, parsed)
+    }
+
     #[tokio::test]
     async fn node_identity_persists_across_create_and_serve_paths() {
         let temp = TempDir::new().unwrap();
@@ -5944,6 +6044,44 @@ mod tests {
 
         let announcements = load_workspace_discovery(temp.path()).unwrap();
         assert_eq!(announcements, vec![latest]);
+    }
+
+    #[test]
+    fn bootstrap_config_and_discovery_cache_provide_peer_hints() {
+        let temp = TempDir::new().unwrap();
+        let (config_addr, config_peer) = test_bootstrap_addr(4011);
+        let (cache_addr, cache_peer) = test_bootstrap_addr(4012);
+
+        std::fs::write(
+            bootstrap_config_path(temp.path()),
+            serde_json::to_vec_pretty(&serde_json::json!({ "peers": [config_addr] })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_bootstrap_config_peers(temp.path()).unwrap(),
+            vec![config_peer]
+        );
+
+        let identity = NodeIdentity::generate();
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: "cached-peer".into(),
+            addrs: vec![cache_addr],
+            author: identity.did().clone(),
+            workspace: WorkspaceId::from_bytes([90; 32]).to_string(),
+            name: "cached-bootstrap-source".into(),
+            description: "cached workspace bootstrap hint".into(),
+            owner: identity.did().clone(),
+            root: None,
+            timestamp: 1,
+            signature: None,
+        };
+        let announcement = sign_workspace_announcement(announcement, &identity).unwrap();
+        record_workspace_announcement(temp.path(), announcement).unwrap();
+        assert_eq!(
+            cached_workspace_bootstrap_peers(temp.path()),
+            vec![cache_peer]
+        );
     }
 
     #[test]
@@ -6087,6 +6225,7 @@ mod tests {
             "--base".into(),
             temp.path().to_string_lossy().to_string(),
             "--lan".into(),
+            "--no-public-bootstrap".into(),
             "--listen".into(),
             "/ip4/127.0.0.1/udp/0/quic-v1".into(),
             "--timeout-ms".into(),
