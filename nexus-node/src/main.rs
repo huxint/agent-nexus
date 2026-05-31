@@ -33,8 +33,8 @@ use ids::{parse_cid, parse_workspace_id};
 use local_state::*;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
-    CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal, CollectiveVote,
-    CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt, IntentActionKind,
+    CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
+    CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt, IntentActionKind,
     IntentActionPlan, IntentKind, IntentResponse, IntentResponseKind, Interaction,
     InteractionOutcome, RelationKind, SettlementRecord, SocialEvent, SocialEventKind, SocialMemory,
     TaskDispute, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
@@ -114,6 +114,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event workspace-snapshot --base <DIR> --workspace <HEX> --root <CID_HEX> [--label <TEXT>] [--note <TEXT>]");
     eprintln!("  {prog} event workspace-run --base <DIR> --workspace <HEX> --command <CMD> [--arg <ARG>...] [--exit-code <N>] [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--cwd <DIR>] [--env-key <KEY>] [--stdin <TEXT>|--stdin-cid <CID_HEX> --stdin-bytes <N>] [--timeout-ms <N>] [--failure-kind <KIND> --failure-message <TEXT>] [--started-at <TS>] [--finished-at <TS>] [--note <TEXT>]");
     eprintln!("  {prog} event capability --base <DIR> --subject <DID> --workspace <HEX> [--permission <PERM>...] [--expires-at <TS>] [--note <TEXT>]");
+    eprintln!("  {prog} event capability-revoke --base <DIR> --capability <SIGNATURE_ID> [--reason <TEXT>] [--revoked-at <TS>]");
     eprintln!("  {prog} event collective --base <DIR> --id <ID> --name <NAME> --purpose <TEXT>");
     eprintln!("  {prog} event collective-join --base <DIR> --id <ID>");
     eprintln!("  {prog} event collective-workspace --base <DIR> --id <ID> --workspace <HEX>");
@@ -1571,6 +1572,9 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "workspace-snapshot" | "snapshot" => cmd_event_workspace_snapshot(args),
         "workspace-run" | "run" => cmd_event_workspace_run(args),
         "capability" | "capability-issue" | "invite" => cmd_event_capability(args),
+        "capability-revoke" | "capability-revoked" | "revoke-capability" => {
+            cmd_event_capability_revoke(args)
+        }
         "collective" | "collective-declare" | "collective-create" => cmd_event_collective(args),
         "collective-join" => cmd_event_collective_join(args),
         "collective-workspace" | "collective-attach-workspace" => {
@@ -2214,6 +2218,58 @@ fn cmd_event_capability(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     capability,
                     issued_at: now,
                     note,
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_capability_revoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut capability_signature_id = None;
+    let mut reason = None;
+    let mut revoked_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--capability" | "--capability-signature" | "--capability-signature-id" => {
+                i += 1;
+                capability_signature_id = Some(required_arg(args, i, "--capability")?.to_string());
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            "--revoked-at" => {
+                i += 1;
+                revoked_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--revoked-at")?,
+                    "--revoked-at",
+                )?);
+            }
+            other => return Err(format!("unknown capability-revoke option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::CapabilityRevoked {
+                revocation: CapabilityRevocation {
+                    issuer: identity.did().clone(),
+                    capability_signature_id: capability_signature_id
+                        .ok_or("--capability required")?,
+                    reason,
+                    revoked_at: revoked_at.unwrap_or(now),
                 },
             })
         },
@@ -5571,7 +5627,7 @@ mod tests {
             "nexus-node".into(),
             "exec".into(),
             "--base".into(),
-            base,
+            base.clone(),
             "--workspace".into(),
             workspace_path.to_string_lossy().to_string(),
             "--note".into(),
@@ -6501,7 +6557,7 @@ mod tests {
             "event".into(),
             "capability".into(),
             "--base".into(),
-            base,
+            base.clone(),
             "--subject".into(),
             subject.did().to_string(),
             "--workspace".into(),
@@ -6517,7 +6573,8 @@ mod tests {
         ])
         .unwrap();
 
-        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        let memory_path = temp.path().join(".nexus-social-memory.json");
+        let memory = load_social_memory(&memory_path).unwrap();
         let view = society_json(&memory);
         assert_eq!(view["events"], 1);
         assert_eq!(
@@ -6540,9 +6597,46 @@ mod tests {
             view["capability_grants"][0]["note"],
             "join shared workspace"
         );
+        assert_eq!(view["capability_grants"][0]["revoked"], false);
+        let capability_signature_id = view["capability_grants"][0]["capability_signature_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "capability-revoke".into(),
+            "--base".into(),
+            base,
+            "--capability".into(),
+            capability_signature_id.clone(),
+            "--reason".into(),
+            "access rotated".into(),
+            "--revoked-at".into(),
+            "123".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&memory_path).unwrap();
+        let view = society_json(&memory);
+        assert_eq!(view["events"], 2);
+        assert_eq!(view["capability_grants"][0]["revoked"], true);
+        assert_eq!(
+            view["capability_grants"][0]["revocation"]["capability_signature_id"],
+            capability_signature_id
+        );
+        assert_eq!(
+            view["capability_grants"][0]["revocation"]["reason"],
+            "access rotated"
+        );
         assert_eq!(
             view["workspaces"][0]["capability_grants"][0]["subject"],
             subject.did().to_string()
+        );
+        assert_eq!(
+            view["workspaces"][0]["capability_grants"][0]["revoked"],
+            true
         );
     }
 

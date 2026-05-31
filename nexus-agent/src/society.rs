@@ -127,6 +127,10 @@ fn capability_grant_key(grant: &CapabilityGrant) -> String {
     )
 }
 
+pub fn capability_signature_id(signature: &[u8]) -> String {
+    hex::encode(Cid::hash_of(signature).as_bytes())
+}
+
 fn workspace_snapshot_key(snapshot: &WorkspaceSnapshot) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -555,6 +559,15 @@ pub struct CapabilityGrant {
     pub note: Option<String>,
 }
 
+/// A signed social fact that revokes a previously issued capability token.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapabilityRevocation {
+    pub issuer: Did,
+    pub capability_signature_id: String,
+    pub reason: Option<String>,
+    pub revoked_at: u64,
+}
+
 /// A signed claim that an agent observed or created a workspace snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -771,6 +784,8 @@ pub struct Society {
     agent_workspaces: HashMap<Did, HashSet<WorkspaceId>>,
     #[serde(default)]
     capability_grants: HashMap<String, CapabilityGrant>,
+    #[serde(default)]
+    capability_revocations: HashMap<String, CapabilityRevocation>,
     #[serde(default)]
     workspace_snapshots: HashMap<String, WorkspaceSnapshot>,
     #[serde(default)]
@@ -1030,6 +1045,19 @@ impl Society {
             .or_insert(grant);
     }
 
+    pub fn record_capability_revocation(&mut self, revocation: CapabilityRevocation) {
+        self.register_agent(revocation.issuer.clone());
+        if self.capability_grants.values().any(|grant| {
+            grant.capability.issuer == revocation.issuer
+                && capability_signature_id(&grant.capability.signature)
+                    == revocation.capability_signature_id
+        }) {
+            self.capability_revocations
+                .entry(revocation.capability_signature_id.clone())
+                .or_insert(revocation);
+        }
+    }
+
     pub fn capability_grants(&self) -> Vec<&CapabilityGrant> {
         let mut grants: Vec<&CapabilityGrant> = self.capability_grants.values().collect();
         grants.sort_by(|a, b| {
@@ -1052,6 +1080,24 @@ impl Society {
                 .then_with(|| a.issued_at.cmp(&b.issued_at))
         });
         grants
+    }
+
+    pub fn capability_revocation(&self, grant: &CapabilityGrant) -> Option<&CapabilityRevocation> {
+        self.capability_revocations
+            .get(&capability_signature_id(&grant.capability.signature))
+            .filter(|revocation| revocation.issuer == grant.capability.issuer)
+    }
+
+    pub fn capability_revocations(&self) -> Vec<&CapabilityRevocation> {
+        let mut revocations: Vec<&CapabilityRevocation> =
+            self.capability_revocations.values().collect();
+        revocations.sort_by(|a, b| {
+            a.revoked_at
+                .cmp(&b.revoked_at)
+                .then_with(|| a.issuer.to_string().cmp(&b.issuer.to_string()))
+                .then_with(|| a.capability_signature_id.cmp(&b.capability_signature_id))
+        });
+        revocations
     }
 
     pub fn workspace_capability_grants(&self, workspace: &WorkspaceId) -> Vec<&CapabilityGrant> {
@@ -1836,6 +1882,9 @@ impl Society {
             }
             SocialEventKind::CapabilityIssued { grant } => {
                 self.record_capability_grant(grant.clone());
+            }
+            SocialEventKind::CapabilityRevoked { revocation } => {
+                self.record_capability_revocation(revocation.clone());
             }
             SocialEventKind::WorkspaceSnapshotted { snapshot } => {
                 self.record_workspace_snapshot(snapshot.clone());
@@ -3536,6 +3585,98 @@ mod tests {
             society.capability_grants()[0].capability.subject,
             subject.did().clone()
         );
+    }
+
+    #[test]
+    fn capability_revocation_marks_existing_grant_revoked() {
+        let issuer = NodeIdentity::generate();
+        let subject = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([18; 32]);
+        let grant = CapabilityGrant {
+            capability: sign_capability(
+                &issuer,
+                subject.did(),
+                workspace,
+                PermissionSet::READ_WRITE,
+                100,
+            )
+            .unwrap(),
+            issued_at: 1,
+            note: Some("join shared lab".into()),
+        };
+        let signature_id = capability_signature_id(&grant.capability.signature);
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            issuer.did().clone(),
+            1,
+            SocialEventKind::CapabilityIssued {
+                grant: grant.clone(),
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            issuer.did().clone(),
+            2,
+            SocialEventKind::CapabilityRevoked {
+                revocation: CapabilityRevocation {
+                    issuer: issuer.did().clone(),
+                    capability_signature_id: signature_id.clone(),
+                    reason: Some("access rotated".into()),
+                    revoked_at: 2,
+                },
+            },
+        ));
+
+        let stored = society.capability_grants()[0];
+        let revocation = society.capability_revocation(stored).unwrap();
+        assert_eq!(revocation.capability_signature_id, signature_id);
+        assert_eq!(society.capability_revocations().len(), 1);
+    }
+
+    #[test]
+    fn capability_revocation_by_non_issuer_is_ignored() {
+        let issuer = NodeIdentity::generate();
+        let subject = NodeIdentity::generate();
+        let attacker = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([19; 32]);
+        let grant = CapabilityGrant {
+            capability: sign_capability(
+                &issuer,
+                subject.did(),
+                workspace,
+                PermissionSet::READ_WRITE,
+                100,
+            )
+            .unwrap(),
+            issued_at: 1,
+            note: None,
+        };
+        let signature_id = capability_signature_id(&grant.capability.signature);
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            issuer.did().clone(),
+            1,
+            SocialEventKind::CapabilityIssued {
+                grant: grant.clone(),
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            attacker.did().clone(),
+            2,
+            SocialEventKind::CapabilityRevoked {
+                revocation: CapabilityRevocation {
+                    issuer: attacker.did().clone(),
+                    capability_signature_id: signature_id,
+                    reason: Some("forged revoke".into()),
+                    revoked_at: 2,
+                },
+            },
+        ));
+
+        let stored = society.capability_grants()[0];
+        assert!(society.capability_revocation(stored).is_none());
+        assert!(society.capability_revocations().is_empty());
     }
 
     #[test]

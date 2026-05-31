@@ -22,13 +22,13 @@ pub use nexus_economy::ReputationScore;
 pub use protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
 pub use registry::AgentRegistry;
 pub use society::{
-    random_social_id, task_result_claim_id, AgentIntent, CapabilityGrant, Collective,
-    CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal, CollectiveVote,
-    CollectiveVoteChoice, FactTruthStatus, GovernanceSignal, IntentActionKind, IntentActionPlan,
-    IntentKind, IntentRecommendation, IntentResponse, IntentResponseKind, Interaction,
-    InteractionOutcome, ProviderRecommendation, RelationKind, SettlementRecord, SocialEdge,
-    Society, TaskClaimJudgment, TaskDispute, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    capability_signature_id, random_social_id, task_result_claim_id, AgentIntent, CapabilityGrant,
+    CapabilityRevocation, Collective, CollectiveDecision, CollectiveDecisionOutcome,
+    CollectiveProposal, CollectiveVote, CollectiveVoteChoice, FactTruthStatus, GovernanceSignal,
+    IntentActionKind, IntentActionPlan, IntentKind, IntentRecommendation, IntentResponse,
+    IntentResponseKind, Interaction, InteractionOutcome, ProviderRecommendation, RelationKind,
+    SettlementRecord, SocialEdge, Society, TaskClaimJudgment, TaskDispute, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
     ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid,

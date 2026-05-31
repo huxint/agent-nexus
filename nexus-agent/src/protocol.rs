@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::AgentManifest;
 use crate::society::{
-    AgentIntent, CapabilityGrant, CollectiveDecision, CollectiveProposal, CollectiveVote,
-    IntentResponse, Interaction, RelationKind, SettlementRecord, TaskDispute, WorkspaceRun,
-    WorkspaceSnapshot,
+    AgentIntent, CapabilityGrant, CapabilityRevocation, CollectiveDecision, CollectiveProposal,
+    CollectiveVote, IntentResponse, Interaction, RelationKind, SettlementRecord, TaskDispute,
+    WorkspaceRun, WorkspaceSnapshot,
 };
 use crate::task::{
     ExecutionAttestation, ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer,
@@ -169,6 +169,8 @@ pub enum SocialEventKind {
     CollectiveDecisionRecorded { decision: CollectiveDecision },
     /// Publish a signed workspace capability grant as social trust metadata.
     CapabilityIssued { grant: CapabilityGrant },
+    /// Revoke a previously issued capability token.
+    CapabilityRevoked { revocation: CapabilityRevocation },
     /// Record an observed Merkle root for a workspace.
     WorkspaceSnapshotted { snapshot: WorkspaceSnapshot },
     /// Record a command run performed freely in a workspace.
@@ -352,6 +354,9 @@ impl SocialEvent {
                 self.ensure_subject("capability grant", &grant.capability.issuer)?;
                 verify_capability(&grant.capability, grant.issued_at)?;
                 Ok(())
+            }
+            SocialEventKind::CapabilityRevoked { revocation } => {
+                self.ensure_subject("capability revocation", &revocation.issuer)
             }
             SocialEventKind::WorkspaceSnapshotted { snapshot } => {
                 self.ensure_subject("workspace snapshot", &snapshot.actor)
@@ -835,6 +840,31 @@ mod tests {
                     capability,
                     issued_at: 1,
                     note: Some("invite into shared workspace".into()),
+                },
+            },
+        )
+        .sign(&author)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_capability_revocation_for_another_issuer() {
+        let author = NodeIdentity::generate();
+        let issuer = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            author.did().clone(),
+            1,
+            SocialEventKind::CapabilityRevoked {
+                revocation: CapabilityRevocation {
+                    issuer: issuer.did().clone(),
+                    capability_signature_id: "capability-id".into(),
+                    reason: Some("rotated access".into()),
+                    revoked_at: 1,
                 },
             },
         )
