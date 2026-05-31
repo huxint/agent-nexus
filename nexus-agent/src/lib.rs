@@ -25,12 +25,12 @@ pub use society::{
     capability_signature_id, random_social_id, task_result_claim_id, AgentIntent, CapabilityGrant,
     CapabilityRevocation, Collective, CollectiveDecision, CollectiveDecisionOutcome,
     CollectiveProposal, CollectiveVote, CollectiveVoteChoice, FactTruthStatus, GovernanceSignal,
-    IdentityRevocation, IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind,
-    IntentRecommendation, IntentResponse, IntentResponseKind, Interaction, InteractionOutcome,
-    ProviderRecommendation, RelationKind, SettlementRecord, SocialEdge, Society, TaskClaimJudgment,
-    TaskDispute, VerifiedCapability, WitnessedFactKind, WorkspaceOwnershipClaim,
-    WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
-    WorkspaceRunStdin, WorkspaceSnapshot,
+    IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation, IdentityRotation,
+    IntentActionKind, IntentActionPlan, IntentKind, IntentRecommendation, IntentResponse,
+    IntentResponseKind, Interaction, InteractionOutcome, ProviderRecommendation, RelationKind,
+    SettlementRecord, SocialEdge, Society, TaskClaimJudgment, TaskDispute, VerifiedCapability,
+    WitnessedFactKind, WorkspaceOwnershipClaim, WorkspaceOwnershipFact, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
     ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid,

@@ -3,11 +3,11 @@ use std::path::Path;
 use nexus_agent::{
     capability_signature_id, task_result_claim_id, AgentIntent, CapabilityGrant,
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
-    ExecutionReceipt, GovernanceSignal, IdentityRevocation, IdentityRotation, IntentRecommendation,
-    IntentResponse, Interaction, ProviderRecommendation, ReputationScore, SettlementRecord,
-    SocialEdge, SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability,
-    WitnessedFactKind, WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceSnapshot,
+    ExecutionReceipt, GovernanceSignal, IdentityRecoveryApproval, IdentityRecoveryPolicy,
+    IdentityRevocation, IdentityRotation, IntentRecommendation, IntentResponse, Interaction,
+    ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge, SocialMemory, Task,
+    TaskClaimJudgment, TaskResult, VerifiedCapability, WitnessedFactKind, WorkspaceOwnershipFact,
+    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -120,6 +120,8 @@ pub(crate) fn society_json_for_base(
             let manifest = society.agent_manifest(did);
             let revocation = society.identity_revocation(did);
             let rotation = society.identity_rotation(did);
+            let recovery_policy = society.identity_recovery_policy(did);
+            let recovery_approvals = society.identity_recovery_approvals(did);
             let active_identity = society.active_identity(did);
             let provider_recommendations = manifest
                 .map(|manifest| {
@@ -141,6 +143,12 @@ pub(crate) fn society_json_for_base(
                 "active_did": active_identity.to_string(),
                 "rotated": active_identity != *did,
                 "rotation": rotation.map(identity_rotation_json),
+                "recovery_policy": recovery_policy.map(identity_recovery_policy_json),
+                "recovery_approvals": recovery_approvals
+                    .into_iter()
+                    .map(identity_recovery_approval_json)
+                    .collect::<Vec<_>>(),
+                "recovery_threshold_met": society.identity_recovery_threshold_met(did),
                 "revoked": revocation.is_some(),
                 "revocation": revocation.map(identity_revocation_json),
                 "manifest": manifest,
@@ -1026,6 +1034,29 @@ fn identity_rotation_json(rotation: &IdentityRotation) -> serde_json::Value {
         "next": rotation.next.to_string(),
         "reason": rotation.reason,
         "rotated_at": rotation.rotated_at,
+    })
+}
+
+fn identity_recovery_policy_json(policy: &IdentityRecoveryPolicy) -> serde_json::Value {
+    serde_json::json!({
+        "identity": policy.identity.to_string(),
+        "guardians": policy
+            .guardians
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "threshold": policy.threshold,
+        "updated_at": policy.updated_at,
+    })
+}
+
+fn identity_recovery_approval_json(approval: &IdentityRecoveryApproval) -> serde_json::Value {
+    serde_json::json!({
+        "identity": approval.identity.to_string(),
+        "guardian": approval.guardian.to_string(),
+        "recovered": approval.recovered.to_string(),
+        "reason": approval.reason,
+        "approved_at": approval.approved_at,
     })
 }
 

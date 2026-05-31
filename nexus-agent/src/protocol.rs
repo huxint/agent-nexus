@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 use crate::manifest::AgentManifest;
 use crate::society::{
     AgentIntent, CapabilityGrant, CapabilityRevocation, CollectiveDecision, CollectiveProposal,
-    CollectiveVote, IdentityRevocation, IdentityRotation, IntentResponse, Interaction,
-    RelationKind, SettlementRecord, TaskDispute, WorkspaceRun, WorkspaceSnapshot,
+    CollectiveVote, IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation,
+    IdentityRotation, IntentResponse, Interaction, RelationKind, SettlementRecord, TaskDispute,
+    WorkspaceRun, WorkspaceSnapshot,
 };
 use crate::task::{
     ExecutionAttestation, ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer,
@@ -172,6 +173,10 @@ pub enum SocialEventKind {
     IdentityRevoked { revocation: IdentityRevocation },
     /// Link the author's current DID to a successor DID.
     IdentityRotated { rotation: IdentityRotation },
+    /// Declare guardians and threshold for social recovery.
+    IdentityRecoveryPolicy { policy: IdentityRecoveryPolicy },
+    /// Approve a recovery to a successor DID as a guardian.
+    IdentityRecoveryApproved { approval: IdentityRecoveryApproval },
     /// Join a workspace as a social presence event.
     WorkspaceJoined { workspace: WorkspaceId },
     /// Claim ownership of a workspace as signed social truth metadata.
@@ -549,6 +554,33 @@ impl SocialEvent {
                 parse_did(rotation.next.as_str()).map_err(|source| {
                     SocialProtocolError::InvalidIdentityRotationTarget {
                         target: rotation.next.clone(),
+                        source,
+                    }
+                })?;
+                Ok(())
+            }
+            SocialEventKind::IdentityRecoveryPolicy { policy } => {
+                self.ensure_subject("identity recovery policy", &policy.identity)
+            }
+            SocialEventKind::IdentityRecoveryApproved { approval } => {
+                self.ensure_subject("identity recovery approval", &approval.guardian)?;
+                if approval.guardian == approval.recovered {
+                    return Err(SocialProtocolError::AuthorSubjectMismatch {
+                        event: "identity recovery approval",
+                        author: self.author.clone(),
+                        subject: approval.guardian.clone(),
+                    });
+                }
+                if approval.identity == approval.recovered {
+                    return Err(SocialProtocolError::AuthorSubjectMismatch {
+                        event: "identity recovery approval",
+                        author: self.author.clone(),
+                        subject: approval.recovered.clone(),
+                    });
+                }
+                parse_did(approval.recovered.as_str()).map_err(|source| {
+                    SocialProtocolError::InvalidIdentityRotationTarget {
+                        target: approval.recovered.clone(),
                         source,
                     }
                 })?;
@@ -1299,6 +1331,77 @@ mod tests {
         assert!(matches!(
             event.validate().unwrap_err(),
             SocialProtocolError::InvalidIdentityRotationTargetSelf { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_accepts_identity_recovery_policy_and_guardian_approval() {
+        let identity = NodeIdentity::generate();
+        let guardian = NodeIdentity::generate();
+        let recovered = NodeIdentity::generate();
+
+        let policy = SocialEvent::new(
+            identity.did().clone(),
+            1,
+            SocialEventKind::IdentityRecoveryPolicy {
+                policy: IdentityRecoveryPolicy {
+                    identity: identity.did().clone(),
+                    guardians: vec![guardian.did().clone()],
+                    threshold: 1,
+                    updated_at: 1,
+                },
+            },
+        )
+        .sign(&identity)
+        .unwrap();
+        policy.validate().unwrap();
+
+        let approval = SocialEvent::new(
+            guardian.did().clone(),
+            2,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("lost old key".into()),
+                    approved_at: 2,
+                },
+            },
+        )
+        .sign(&guardian)
+        .unwrap();
+        approval.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_identity_recovery_approval_for_another_guardian() {
+        let identity = NodeIdentity::generate();
+        let guardian = NodeIdentity::generate();
+        let recovered = NodeIdentity::generate();
+        let attacker = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            attacker.did().clone(),
+            1,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("forged recovery".into()),
+                    approved_at: 1,
+                },
+            },
+        )
+        .sign(&attacker)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch {
+                event: "identity recovery approval",
+                ..
+            }
         ));
     }
 
