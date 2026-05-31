@@ -455,6 +455,7 @@ pub(crate) fn society_json_for_base(
 
     serde_json::json!({
         "events": memory.event_count(),
+        "policies": society_policies_json(),
         "agents": agents,
         "workspaces": workspaces,
         "discovered_workspaces": discovered_workspaces,
@@ -467,6 +468,18 @@ pub(crate) fn society_json_for_base(
         "capability_grants": capability_grants,
         "settlements": settlements,
         "tasks": tasks,
+    })
+}
+
+fn society_policies_json() -> serde_json::Value {
+    serde_json::json!({
+        "economy": {
+            "mode": "social_record",
+            "enforcement": "advisory",
+            "settlement_gate": false,
+            "reputation_gate": false,
+            "adr": "docs/adr/0003-economy-as-social-record.md",
+        },
     })
 }
 
@@ -1327,6 +1340,9 @@ fn settlement_json(
         "payee": settlement.payee.to_string(),
         "amount": settlement.amount,
         "truth_status": society.settlement_truth_status(settlement),
+        "enforcement": "social_record",
+        "gates_execution": false,
+        "gates_settlement": false,
         "anchor": settlement.authority_anchor(),
         "checkpoint_subject": settlement.checkpoint_subject(),
         "proof": settlement.proof,

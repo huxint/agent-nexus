@@ -6252,6 +6252,10 @@ mod tests {
 
         let view = society_json(&memory);
         assert_eq!(view["events"], 2);
+        assert_eq!(view["policies"]["economy"]["mode"], "social_record");
+        assert_eq!(view["policies"]["economy"]["enforcement"], "advisory");
+        assert_eq!(view["policies"]["economy"]["settlement_gate"], false);
+        assert_eq!(view["policies"]["economy"]["reputation_gate"], false);
         assert_eq!(view["agents"][0]["did"], identity.did().to_string());
         assert_eq!(view["agents"][0]["manifest"]["name"], "social-node");
         assert_eq!(
@@ -8214,6 +8218,9 @@ mod tests {
         let view = society_json(&memory);
         assert_eq!(view["settlements"][0]["id"], "settlement-1");
         assert_eq!(view["settlements"][0]["truth_status"], "claimed");
+        assert_eq!(view["settlements"][0]["enforcement"], "social_record");
+        assert_eq!(view["settlements"][0]["gates_execution"], false);
+        assert_eq!(view["settlements"][0]["gates_settlement"], false);
         assert!(view["settlements"][0]["anchor"].is_null());
         assert_eq!(view["settlements"][0]["proof"]["kind"], "Sovereign");
     }
