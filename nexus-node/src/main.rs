@@ -8,6 +8,7 @@
 //!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node bootstrap status --base <dir> [--json] [--no-public-bootstrap]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -115,6 +116,33 @@ struct DiscoveredCloneSource {
     root: Option<Cid>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PeerCacheEntry {
+    peer: String,
+    addrs: Vec<String>,
+    last_seen: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_connected: Option<u64>,
+    #[serde(default)]
+    failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_failure: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BootstrapStatus {
+    base: String,
+    public_defaults_enabled: bool,
+    env_configured: bool,
+    env_peers: Vec<String>,
+    config_peers: Vec<String>,
+    peer_cache: Vec<PeerCacheEntry>,
+    peer_cache_peers: Vec<String>,
+    discovery_cache_peers: Vec<String>,
+    public_default_peers: Vec<String>,
+    effective_peers: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -131,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "exec" => cmd_exec(&args).await?,
         "serve" => cmd_serve(&args).await?,
         "discover" => cmd_discover(&args).await?,
+        "bootstrap" => cmd_bootstrap(&args)?,
         "society" => cmd_society(&args)?,
         "act" => cmd_act(&args)?,
         "event" => cmd_event(&args)?,
@@ -148,6 +177,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
     eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>] [--no-public-bootstrap]");
     eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>] [--no-public-bootstrap] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
+    eprintln!("  {prog} bootstrap status --base <DIR> [--json] [--no-public-bootstrap]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -1579,6 +1609,9 @@ async fn refresh_online_discovery(
                         if peer_filter.map(|filter| filter != peer).unwrap_or(false) {
                             continue;
                         }
+                        if let Err(err) = mark_peer_cache_connected(base, peer, unix_now()) {
+                            tracing::warn!("failed to update peer cache for {peer}: {err}");
+                        }
                         if contacted.insert(peer) {
                             inserted += request_workspace_announcements_from_peer(
                                 network,
@@ -1749,6 +1782,81 @@ fn print_discovered_workspaces_text(base: &Path, workspaces: &[DiscoveredWorkspa
         for addr in &workspace.addrs {
             println!("  addr: {addr}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bootstrap
+// ---------------------------------------------------------------------------
+
+fn cmd_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.get(2).map(String::as_str) != Some("status") {
+        return Err("bootstrap subcommand required: status".into());
+    }
+
+    let mut base = PathBuf::from(".");
+    let mut json = false;
+    let mut use_public_bootstrap = true;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--json" => {
+                json = true;
+            }
+            "--no-public-bootstrap" => {
+                use_public_bootstrap = false;
+            }
+            other => return Err(format!("unknown bootstrap status option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let status = bootstrap_status(&base, use_public_bootstrap)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_bootstrap_status_text(&status);
+    }
+    Ok(())
+}
+
+fn print_bootstrap_status_text(status: &BootstrapStatus) {
+    println!("Bootstrap status: {}", status.base);
+    println!(
+        "public_default_peers: {}",
+        if status.public_defaults_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "NEXUS_BOOTSTRAP: {} peers{}",
+        status.env_peers.len(),
+        if status.env_configured {
+            " configured"
+        } else {
+            ""
+        }
+    );
+    println!("config_peers: {}", status.config_peers.len());
+    println!("peer_cache_entries: {}", status.peer_cache.len());
+    println!("peer_cache_peers: {}", status.peer_cache_peers.len());
+    println!(
+        "discovery_cache_peers: {}",
+        status.discovery_cache_peers.len()
+    );
+    println!(
+        "public_default_peers: {}",
+        status.public_default_peers.len()
+    );
+    println!("effective_peers: {}", status.effective_peers.len());
+    for peer in &status.effective_peers {
+        println!("  {peer}");
     }
 }
 
@@ -4938,20 +5046,82 @@ fn default_bootstrap_peers(
     }
 
     let mut addrs = load_bootstrap_config_peers(base)?;
+    for addr in peer_cache_bootstrap_peers(base) {
+        push_unique_bootstrap_addr(&mut addrs, addr);
+    }
     for addr in cached_workspace_bootstrap_peers(base) {
         push_unique_bootstrap_addr(&mut addrs, addr);
     }
     if use_public_defaults {
-        if let Some(value) = option_env!("NEXUS_DEFAULT_BOOTSTRAP") {
-            for addr in parse_bootstrap_list(value)? {
-                push_unique_bootstrap_addr(&mut addrs, addr);
-            }
-        }
-        for item in DEFAULT_BOOTSTRAP_PEERS {
-            push_unique_bootstrap_addr(&mut addrs, item.parse()?);
+        for addr in public_default_bootstrap_peers()? {
+            push_unique_bootstrap_addr(&mut addrs, addr);
         }
     }
 
+    Ok(addrs)
+}
+
+fn bootstrap_status(
+    base: &Path,
+    use_public_defaults: bool,
+) -> Result<BootstrapStatus, Box<dyn std::error::Error>> {
+    let (env_configured, env_peers) = match std::env::var("NEXUS_BOOTSTRAP") {
+        Ok(value) => (true, parse_bootstrap_list(&value)?),
+        Err(std::env::VarError::NotPresent) => (false, Vec::new()),
+        Err(err) => return Err(format!("read NEXUS_BOOTSTRAP: {err}").into()),
+    };
+    let config_peers = load_bootstrap_config_peers(base)?;
+    let peer_cache = load_peer_cache(base)?;
+    let peer_cache_peers = peer_cache_bootstrap_peers_from_entries(&peer_cache);
+    let discovery_cache_peers = cached_workspace_bootstrap_peers(base);
+    let public_default_peers = if use_public_defaults {
+        public_default_bootstrap_peers()?
+    } else {
+        Vec::new()
+    };
+
+    let mut effective_peers = Vec::new();
+    if env_configured {
+        for addr in &env_peers {
+            push_unique_bootstrap_addr(&mut effective_peers, addr.clone());
+        }
+    } else {
+        for source in [
+            config_peers.as_slice(),
+            peer_cache_peers.as_slice(),
+            discovery_cache_peers.as_slice(),
+            public_default_peers.as_slice(),
+        ] {
+            for addr in source {
+                push_unique_bootstrap_addr(&mut effective_peers, addr.clone());
+            }
+        }
+    }
+
+    Ok(BootstrapStatus {
+        base: base.display().to_string(),
+        public_defaults_enabled: use_public_defaults,
+        env_configured,
+        env_peers: stringify_multiaddrs(&env_peers),
+        config_peers: stringify_multiaddrs(&config_peers),
+        peer_cache,
+        peer_cache_peers: stringify_multiaddrs(&peer_cache_peers),
+        discovery_cache_peers: stringify_multiaddrs(&discovery_cache_peers),
+        public_default_peers: stringify_multiaddrs(&public_default_peers),
+        effective_peers: stringify_multiaddrs(&effective_peers),
+    })
+}
+
+fn public_default_bootstrap_peers() -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let mut addrs = Vec::new();
+    if let Some(value) = option_env!("NEXUS_DEFAULT_BOOTSTRAP") {
+        for addr in parse_bootstrap_list(value)? {
+            push_unique_bootstrap_addr(&mut addrs, addr);
+        }
+    }
+    for item in DEFAULT_BOOTSTRAP_PEERS {
+        push_unique_bootstrap_addr(&mut addrs, item.parse()?);
+    }
     Ok(addrs)
 }
 
@@ -5007,6 +5177,159 @@ fn cached_workspace_bootstrap_peers(base: &Path) -> Vec<libp2p::Multiaddr> {
         }
     }
     addrs
+}
+
+fn peer_cache_path(base: &Path) -> PathBuf {
+    base.join(".nexus-peer-cache.json")
+}
+
+fn load_peer_cache(base: &Path) -> Result<Vec<PeerCacheEntry>, Box<dyn std::error::Error>> {
+    let path = peer_cache_path(base);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let data = std::fs::read(&path)?;
+    let value: serde_json::Value = serde_json::from_slice(&data)?;
+    let entries = value
+        .get("peers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_else(|| value.as_array().cloned().unwrap_or_default());
+
+    let mut peers = Vec::new();
+    for entry in entries {
+        let mut peer = serde_json::from_value::<PeerCacheEntry>(entry)?;
+        peer.addrs.sort();
+        peer.addrs.dedup();
+        peers.push(peer);
+    }
+    peers.sort_by(|a, b| a.peer.cmp(&b.peer));
+    Ok(peers)
+}
+
+fn save_peer_cache(
+    base: &Path,
+    peers: &[PeerCacheEntry],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut peers = peers.to_vec();
+    peers.sort_by(|a, b| a.peer.cmp(&b.peer));
+    let path = peer_cache_path(base);
+    write_file_atomic(
+        &path,
+        &serde_json::to_vec_pretty(&serde_json::json!({ "peers": peers }))?,
+    )?;
+    Ok(())
+}
+
+fn cache_peer_from_announcement(
+    base: &Path,
+    announcement: &WorkspaceAnnouncement,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    upsert_peer_cache(
+        base,
+        &announcement.peer,
+        &announcement.addrs,
+        now,
+        None,
+        None,
+    )
+}
+
+fn mark_peer_cache_connected(
+    base: &Path,
+    peer: libp2p::PeerId,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    upsert_peer_cache(base, &peer.to_string(), &[], now, Some(now), Some(false))
+}
+
+fn mark_peer_cache_failure(
+    base: &Path,
+    peer: libp2p::PeerId,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    upsert_peer_cache(base, &peer.to_string(), &[], now, None, Some(true))
+}
+
+fn upsert_peer_cache(
+    base: &Path,
+    peer: &str,
+    addrs: &[String],
+    now: u64,
+    connected_at: Option<u64>,
+    failed: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = load_peer_cache(base)?;
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.peer == peer) {
+        existing.last_seen = existing.last_seen.max(now);
+        if let Some(connected_at) = connected_at {
+            existing.last_connected = Some(connected_at);
+            existing.failures = 0;
+            existing.last_failure = None;
+        }
+        if failed == Some(true) {
+            existing.failures = existing.failures.saturating_add(1);
+            existing.last_failure = Some(now);
+        }
+        for addr in addrs {
+            if !existing.addrs.contains(addr) {
+                existing.addrs.push(addr.clone());
+            }
+        }
+        existing.addrs.sort();
+        existing.addrs.dedup();
+    } else {
+        let mut addrs = addrs.to_vec();
+        addrs.sort();
+        addrs.dedup();
+        entries.push(PeerCacheEntry {
+            peer: peer.to_string(),
+            addrs,
+            last_seen: now,
+            last_connected: connected_at,
+            failures: u32::from(failed == Some(true)),
+            last_failure: failed.and_then(|failed| failed.then_some(now)),
+        });
+    }
+    save_peer_cache(base, &entries)
+}
+
+fn peer_cache_bootstrap_peers(base: &Path) -> Vec<libp2p::Multiaddr> {
+    match load_peer_cache(base) {
+        Ok(entries) => peer_cache_bootstrap_peers_from_entries(&entries),
+        Err(err) => {
+            tracing::warn!("failed to read peer bootstrap cache: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn peer_cache_bootstrap_peers_from_entries(entries: &[PeerCacheEntry]) -> Vec<libp2p::Multiaddr> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|a, b| {
+        a.failures
+            .cmp(&b.failures)
+            .then_with(|| b.last_connected.cmp(&a.last_connected))
+            .then_with(|| b.last_seen.cmp(&a.last_seen))
+            .then_with(|| a.peer.cmp(&b.peer))
+    });
+
+    let mut addrs = Vec::new();
+    for entry in entries {
+        for addr in entry.addrs {
+            match addr.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => push_unique_bootstrap_addr(&mut addrs, addr),
+                Err(err) => tracing::warn!("ignored peer cache address {addr}: {err}"),
+            }
+        }
+    }
+    addrs
+}
+
+fn stringify_multiaddrs(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
+    addrs.iter().map(ToString::to_string).collect()
 }
 
 fn push_unique_bootstrap_addr(addrs: &mut Vec<libp2p::Multiaddr>, addr: libp2p::Multiaddr) {
@@ -5678,6 +6001,12 @@ fn record_workspace_announcement_bytes(
         }
     }
     verify_workspace_announcement(&announcement)?;
+    if let Err(err) = cache_peer_from_announcement(base, &announcement, unix_now()) {
+        tracing::warn!(
+            "failed to cache bootstrap hint from workspace announcement {}: {err}",
+            announcement.peer
+        );
+    }
     record_workspace_announcement(base, announcement)
 }
 
@@ -5711,6 +6040,9 @@ async fn request_workspace_announcements_from_peer(
         }
         Err(err) => {
             tracing::debug!("workspace announcement request to {} failed: {err}", peer);
+            if let Err(cache_err) = mark_peer_cache_failure(base, peer, unix_now()) {
+                tracing::warn!("failed to update peer cache failure for {peer}: {cache_err}");
+            }
         }
     }
 
@@ -6051,6 +6383,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (config_addr, config_peer) = test_bootstrap_addr(4011);
         let (cache_addr, cache_peer) = test_bootstrap_addr(4012);
+        let (peer_cache_addr, peer_cache_peer) = test_bootstrap_addr(4013);
 
         std::fs::write(
             bootstrap_config_path(temp.path()),
@@ -6059,7 +6392,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_bootstrap_config_peers(temp.path()).unwrap(),
-            vec![config_peer]
+            vec![config_peer.clone()]
         );
 
         let identity = NodeIdentity::generate();
@@ -6082,6 +6415,33 @@ mod tests {
             cached_workspace_bootstrap_peers(temp.path()),
             vec![cache_peer]
         );
+
+        upsert_peer_cache(
+            temp.path(),
+            "peer-cache-source",
+            &[peer_cache_addr],
+            2,
+            Some(3),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            peer_cache_bootstrap_peers(temp.path()),
+            vec![peer_cache_peer.clone()]
+        );
+
+        let entries = load_peer_cache(temp.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].last_connected, Some(3));
+        assert_eq!(entries[0].failures, 0);
+
+        if std::env::var("NEXUS_BOOTSTRAP").is_err() {
+            let status = bootstrap_status(temp.path(), false).unwrap();
+            assert!(status.effective_peers.contains(&config_peer.to_string()));
+            assert!(status
+                .effective_peers
+                .contains(&peer_cache_peer.to_string()));
+        }
     }
 
     #[test]
