@@ -99,6 +99,24 @@ fn anchor_collective_id(anchor: &AuthorityAnchor) -> Option<&str> {
     (!collective_id.is_empty()).then_some(collective_id)
 }
 
+fn decision_anchor_subject_matches(
+    anchor: &AuthorityAnchor,
+    decision: &CollectiveDecision,
+) -> bool {
+    let Some(locator) = anchor.locator.as_deref() else {
+        return true;
+    };
+    locator.contains(&format!("proposal:{}", decision.proposal_id))
+        || decision
+            .task_id
+            .as_ref()
+            .is_some_and(|task_id| locator.contains(&format!("task:{task_id}")))
+        || decision
+            .claim_id
+            .as_ref()
+            .is_some_and(|claim_id| locator.contains(&format!("claim:{claim_id}")))
+}
+
 fn capability_grant_key(grant: &CapabilityGrant) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -452,6 +470,9 @@ pub struct ProviderRecommendation {
     /// How strongly this provider is reachable from the requester's local
     /// trust graph. Unknown or disconnected peers keep reputation neutral.
     pub reachability_score: f64,
+    /// Whether this recommendation has either local trust reachability or an
+    /// independently anchored external witness behind high-confidence ranking.
+    pub high_trust_eligible: bool,
     /// Score derived from collective judgments about the provider's claims.
     pub governance_score: f64,
     /// Recent collective judgments that explain the governance score.
@@ -2156,6 +2177,9 @@ impl Society {
         if anchor.validate().is_err() {
             return false;
         }
+        if !decision_anchor_subject_matches(anchor, decision) {
+            return false;
+        }
         if anchor.kind != AuthorityKind::CollectiveQuorum {
             return true;
         }
@@ -2403,15 +2427,24 @@ impl Society {
                     .unwrap_or(0.5);
                 let governance_signals = self.governance_signals_for(&manifest.did, 5);
                 let governance_score = governance_score_from_signals(&governance_signals);
+                let has_anchored_witness = governance_signals.iter().any(|signal| {
+                    signal.truth_status == FactTruthStatus::Anchored
+                        && signal.outcome == CollectiveDecisionOutcome::Accepted
+                });
+                let high_trust_eligible =
+                    requester.is_none() || reachability_score > 0.0 || has_anchored_witness;
                 let price_score = if max_price == 0 {
                     1.0
                 } else {
                     1.0 - (capability_decl.price_per_unit as f64 / max_price as f64)
                 };
-                let ranking_score = social_score * 0.45
+                let mut ranking_score = social_score * 0.45
                     + reputation_score * 0.25
                     + governance_score * 0.20
                     + price_score * 0.10;
+                if !high_trust_eligible {
+                    ranking_score = ranking_score.min(0.60);
+                }
 
                 ProviderRecommendation {
                     did: manifest.did.clone(),
@@ -2420,6 +2453,7 @@ impl Society {
                     social_score,
                     reputation_score,
                     reachability_score,
+                    high_trust_eligible,
                     governance_score,
                     governance_signals,
                     price_per_unit: capability_decl.price_per_unit,
@@ -4242,6 +4276,79 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert!(providers[0].reachability_score > 0.30);
         assert!(providers[0].reputation_score > 0.5);
+    }
+
+    #[test]
+    fn provider_recommendations_require_anchor_or_reachability_for_high_trust() {
+        let requester = did("requester");
+        let witnessed = did("witnessed");
+        let unwitnessed = did("unwitnessed");
+        let alice = did("alice");
+        let bob = did("bob");
+        let mut society = Society::new();
+
+        for (did, name) in [
+            (witnessed.clone(), "Witnessed"),
+            (unwitnessed.clone(), "Unwitnessed"),
+        ] {
+            society.apply_event(&SocialEvent::new(
+                did.clone(),
+                1,
+                SocialEventKind::ManifestPublished {
+                    manifest: provider_manifest(did, name, "python-exec", 10),
+                },
+            ));
+        }
+        society.apply_event(&SocialEvent::new(
+            alice.clone(),
+            2,
+            SocialEventKind::CollectiveDeclared {
+                collective_id: "audit-lab".into(),
+                name: "Audit Lab".into(),
+                purpose: "witness provider claims".into(),
+                members: vec![alice.clone(), bob.clone()],
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            alice,
+            3,
+            SocialEventKind::CollectiveDecisionRecorded {
+                decision: CollectiveDecision {
+                    proposal_id: "approve-witnessed".into(),
+                    collective_id: "audit-lab".into(),
+                    decider: bob.clone(),
+                    outcome: CollectiveDecisionOutcome::Accepted,
+                    task_id: None,
+                    claim_id: None,
+                    target: Some(witnessed.clone()),
+                    anchor: Some(AuthorityAnchor {
+                        kind: AuthorityKind::CollectiveQuorum,
+                        commitment_hex: hash_hex(9),
+                        locator: Some("collective:audit-lab/proposal:approve-witnessed".into()),
+                        attestors: vec![bob.clone(), did("alice")],
+                        threshold: Some(2),
+                    }),
+                    reason: "provider claim witnessed".into(),
+                    timestamp: 3,
+                },
+            },
+        ));
+
+        let providers = society.recommend_providers(&requester, "python-exec", 10);
+        let witnessed_view = providers
+            .iter()
+            .find(|provider| provider.did == witnessed)
+            .unwrap();
+        let unwitnessed_view = providers
+            .iter()
+            .find(|provider| provider.did == unwitnessed)
+            .unwrap();
+
+        assert_eq!(witnessed_view.reachability_score, 0.0);
+        assert!(witnessed_view.governance_score > 0.5);
+        assert!(witnessed_view.high_trust_eligible);
+        assert_eq!(unwitnessed_view.reachability_score, 0.0);
+        assert!(!unwitnessed_view.high_trust_eligible);
     }
 
     #[test]
