@@ -65,6 +65,26 @@ fn settlement_key(settlement: &SettlementRecord) -> String {
     settlement.id.clone()
 }
 
+fn checkpoint_subject_matches_settlement(subject: &str, settlement: &SettlementRecord) -> bool {
+    subject == format!("settlement:{}", settlement.id)
+        || settlement.task_id.as_ref().is_some_and(|task_id| {
+            subject == format!("task:{task_id}:settlement:{}", settlement.id)
+        })
+        || settlement.claim_id.as_ref().is_some_and(|claim_id| {
+            subject == format!("claim:{claim_id}:settlement:{}", settlement.id)
+        })
+}
+
+fn anchor_collective_id(anchor: &AuthorityAnchor) -> Option<&str> {
+    let locator = anchor.locator.as_deref()?;
+    let (_, after_collective) = locator.split_once("collective:")?;
+    let collective_id = after_collective
+        .split(['/', '#', '?', ' '])
+        .next()
+        .unwrap_or_default();
+    (!collective_id.is_empty()).then_some(collective_id)
+}
+
 fn capability_grant_key(grant: &CapabilityGrant) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -385,6 +405,13 @@ impl SettlementRecord {
     pub fn authority_anchor(&self) -> Option<&AuthorityAnchor> {
         match &self.proof {
             SettlementProof::AnchoredCheckpoint(proof) => Some(&proof.anchor),
+            _ => None,
+        }
+    }
+
+    pub fn checkpoint_subject(&self) -> Option<&str> {
+        match &self.proof {
+            SettlementProof::AnchoredCheckpoint(proof) => Some(proof.checkpoint.subject.as_str()),
             _ => None,
         }
     }
@@ -799,6 +826,14 @@ impl Society {
 
     pub fn settlement(&self, id: &str) -> Option<&SettlementRecord> {
         self.settlements.get(id)
+    }
+
+    pub fn settlement_truth_status(&self, settlement: &SettlementRecord) -> FactTruthStatus {
+        if self.settlement_anchor_valid(settlement) {
+            FactTruthStatus::Anchored
+        } else {
+            FactTruthStatus::Claimed
+        }
     }
 
     pub fn task_settlements(&self, task_id: &str) -> Vec<&SettlementRecord> {
@@ -2056,6 +2091,34 @@ impl Society {
                 .all(|attestor| collective.members.contains(*attestor))
     }
 
+    fn settlement_anchor_valid(&self, settlement: &SettlementRecord) -> bool {
+        let SettlementProof::AnchoredCheckpoint(proof) = &settlement.proof else {
+            return false;
+        };
+        if proof.validate().is_err() {
+            return false;
+        }
+        if !checkpoint_subject_matches_settlement(&proof.checkpoint.subject, settlement) {
+            return false;
+        }
+        let anchor = &proof.anchor;
+        if anchor.kind != AuthorityKind::CollectiveQuorum {
+            return true;
+        }
+        let Some(collective_id) = anchor_collective_id(anchor) else {
+            return false;
+        };
+        let Some(collective) = self.collectives.get(collective_id) else {
+            return false;
+        };
+        let threshold = anchor.threshold.unwrap_or(0);
+        let unique_attestors = anchor.attestors.iter().collect::<HashSet<_>>();
+        unique_attestors.len() >= threshold
+            && unique_attestors
+                .iter()
+                .all(|attestor| collective.members.contains(*attestor))
+    }
+
     pub fn record_equivocation_proof(&mut self, proof: EquivocationProof) {
         if proof.verify().is_err() {
             return;
@@ -2968,7 +3031,19 @@ mod tests {
     fn settlement_truth_status_distinguishes_claimed_and_anchored_facts() {
         let payer = did("payer");
         let payee = did("payee");
+        let alice = did("alice");
+        let bob = did("bob");
         let mut society = Society::new();
+        society.apply_event(&SocialEvent::new(
+            alice.clone(),
+            9,
+            SocialEventKind::CollectiveDeclared {
+                collective_id: "audit-lab".into(),
+                name: "Audit Lab".into(),
+                purpose: "witness settlement finality".into(),
+                members: vec![alice.clone(), bob.clone()],
+            },
+        ));
         let claimed = SettlementRecord {
             id: "settlement-claimed".into(),
             task_id: Some("task-1".into()),
@@ -3000,7 +3075,7 @@ mod tests {
             kind: AuthorityKind::CollectiveQuorum,
             commitment_hex: checkpoint.commitment_hex().unwrap(),
             locator: Some("collective:audit-lab/proposal:settlement-anchored".into()),
-            attestors: vec![did("alice"), did("bob")],
+            attestors: vec![alice, bob],
             threshold: Some(2),
         };
         let anchored = SettlementRecord {
@@ -3022,15 +3097,118 @@ mod tests {
         ));
 
         assert_eq!(
-            society
-                .settlement("settlement-claimed")
-                .unwrap()
-                .truth_status(),
+            society.settlement_truth_status(society.settlement("settlement-claimed").unwrap()),
             FactTruthStatus::Claimed
         );
         let stored = society.settlement("settlement-anchored").unwrap();
-        assert_eq!(stored.truth_status(), FactTruthStatus::Anchored);
+        assert_eq!(
+            society.settlement_truth_status(stored),
+            FactTruthStatus::Anchored
+        );
         assert!(stored.authority_anchor().is_some());
+    }
+
+    #[test]
+    fn collective_quorum_settlement_requires_member_attestors_and_matching_subject() {
+        let payer = did("payer");
+        let payee = did("payee");
+        let alice = did("alice");
+        let bob = did("bob");
+        let outsider = did("outsider");
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            alice.clone(),
+            1,
+            SocialEventKind::CollectiveDeclared {
+                collective_id: "audit-lab".into(),
+                name: "Audit Lab".into(),
+                purpose: "witness settlement finality".into(),
+                members: vec![alice.clone(), bob.clone()],
+            },
+        ));
+
+        for (id, subject, attestors) in [
+            (
+                "settlement-member-quorum",
+                "settlement:settlement-member-quorum",
+                vec![alice.clone(), bob.clone()],
+            ),
+            (
+                "settlement-outsider-quorum",
+                "settlement:settlement-outsider-quorum",
+                vec![alice.clone(), outsider],
+            ),
+            (
+                "settlement-wrong-subject",
+                "settlement:someone-else",
+                vec![alice, bob],
+            ),
+        ] {
+            let checkpoint = StateCheckpoint {
+                version: 1,
+                subject: subject.into(),
+                social_root_hex: Some(hash_hex(id.len() as u8)),
+                workspace_root_hex: None,
+                ledger_root_hex: Some(hash_hex(id.len() as u8 + 1)),
+                policy_id: "settlement-finality-v1".into(),
+                timestamp: 20,
+            };
+            let settlement = SettlementRecord {
+                id: id.into(),
+                task_id: None,
+                claim_id: None,
+                payer: payer.clone(),
+                payee: payee.clone(),
+                amount: 10,
+                proof: SettlementProof::AnchoredCheckpoint(AnchoredCheckpoint {
+                    anchor: AuthorityAnchor {
+                        kind: AuthorityKind::CollectiveQuorum,
+                        commitment_hex: checkpoint.commitment_hex().unwrap(),
+                        locator: Some("collective:audit-lab/proposal:settlement-finality".into()),
+                        attestors,
+                        threshold: Some(2),
+                    },
+                    checkpoint,
+                }),
+                settled_at: 20,
+            };
+            society.apply_event(&SocialEvent::new(
+                payer.clone(),
+                20,
+                SocialEventKind::SettlementRecorded { settlement },
+            ));
+        }
+
+        assert_eq!(
+            society
+                .settlement_truth_status(society.settlement("settlement-member-quorum").unwrap()),
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(
+            society
+                .settlement("settlement-outsider-quorum")
+                .unwrap()
+                .truth_status(),
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(
+            society
+                .settlement_truth_status(society.settlement("settlement-outsider-quorum").unwrap()),
+            FactTruthStatus::Claimed
+        );
+        assert_eq!(
+            society
+                .settlement("settlement-wrong-subject")
+                .unwrap()
+                .truth_status(),
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(
+            society
+                .settlement_truth_status(society.settlement("settlement-wrong-subject").unwrap()),
+            FactTruthStatus::Claimed
+        );
     }
 
     #[test]
