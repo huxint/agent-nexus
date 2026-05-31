@@ -69,6 +69,25 @@ pub enum SocialProtocolError {
     #[error("social event id {actual} does not match content hash {expected}")]
     EventIdMismatch { actual: String, expected: String },
 
+    #[error("genesis event for {author} must use seq=0 and prev=None")]
+    InvalidChainGenesis { author: Did },
+
+    #[error("event for {author} links to {actual:?}, expected {expected:?}")]
+    InvalidChainLink {
+        author: Did,
+        actual: Option<String>,
+        expected: Option<String>,
+    },
+
+    #[error("equivocation proof authors differ: {left} != {right}")]
+    EquivocationAuthorMismatch { left: Did, right: Did },
+
+    #[error("equivocation proof seq values differ: {left} != {right}")]
+    EquivocationSeqMismatch { left: u64, right: u64 },
+
+    #[error("equivocation proof events are identical: {event_id}")]
+    EquivocationEventsIdentical { event_id: String },
+
     #[error("failed to serialize social event signing payload: {0}")]
     PayloadSerialization(#[from] serde_json::Error),
 
@@ -81,16 +100,30 @@ pub enum SocialProtocolError {
 pub struct SocialEvent {
     pub id: String,
     pub author: Did,
+    pub seq: u64,
+    pub prev: Option<String>,
     pub timestamp: u64,
     pub kind: SocialEventKind,
     /// Optional detached Ed25519 signature over [`Self::signing_payload`].
     pub signature: Option<Vec<u8>>,
 }
 
+/// Cryptographic evidence that one author signed two incompatible events for
+/// the same sequence number.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EquivocationProof {
+    pub author: Did,
+    pub seq: u64,
+    pub event_a: Box<SocialEvent>,
+    pub event_b: Box<SocialEvent>,
+}
+
 /// Event kinds that form the AI society protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum SocialEventKind {
+    /// Publish a verifiable proof that an author forked their own event chain.
+    EquivocationObserved { proof: Box<EquivocationProof> },
     /// Publish or refresh an agent's public profile.
     ManifestPublished { manifest: AgentManifest },
     /// Join a workspace as a social presence event.
@@ -151,11 +184,23 @@ pub enum SocialEventKind {
 
 impl SocialEvent {
     pub fn new(author: Did, timestamp: u64, kind: SocialEventKind) -> Self {
-        let id = Self::content_id_for(&author, timestamp, &kind)
+        Self::new_chained(author, 0, None, timestamp, kind)
+    }
+
+    pub fn new_chained(
+        author: Did,
+        seq: u64,
+        prev: Option<String>,
+        timestamp: u64,
+        kind: SocialEventKind,
+    ) -> Self {
+        let id = Self::content_id_for(&author, seq, prev.as_deref(), timestamp, &kind)
             .expect("social event content should serialize");
         Self {
             id,
             author,
+            seq,
+            prev,
             timestamp,
             kind,
             signature: None,
@@ -167,27 +212,45 @@ impl SocialEvent {
     /// The event id and signature are excluded so the id can be the hash of
     /// the payload being signed instead of an independent mutable field.
     pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
-        Self::signing_payload_for(&self.author, self.timestamp, &self.kind)
+        Self::signing_payload_for(
+            &self.author,
+            self.seq,
+            self.prev.as_deref(),
+            self.timestamp,
+            &self.kind,
+        )
     }
 
     pub fn content_id(&self) -> Result<String, serde_json::Error> {
-        Self::content_id_for(&self.author, self.timestamp, &self.kind)
+        Self::content_id_for(
+            &self.author,
+            self.seq,
+            self.prev.as_deref(),
+            self.timestamp,
+            &self.kind,
+        )
     }
 
     fn signing_payload_for(
         author: &Did,
+        seq: u64,
+        prev: Option<&str>,
         timestamp: u64,
         kind: &SocialEventKind,
     ) -> Result<Vec<u8>, serde_json::Error> {
         #[derive(Serialize)]
         struct Payload<'a> {
             author: &'a Did,
+            seq: u64,
+            prev: Option<&'a str>,
             timestamp: u64,
             kind: &'a SocialEventKind,
         }
 
         serde_json::to_vec(&Payload {
             author,
+            seq,
+            prev,
             timestamp,
             kind,
         })
@@ -195,10 +258,12 @@ impl SocialEvent {
 
     fn content_id_for(
         author: &Did,
+        seq: u64,
+        prev: Option<&str>,
         timestamp: u64,
         kind: &SocialEventKind,
     ) -> Result<String, serde_json::Error> {
-        let payload = Self::signing_payload_for(author, timestamp, kind)?;
+        let payload = Self::signing_payload_for(author, seq, prev, timestamp, kind)?;
         Ok(hex::encode(Sha256::digest(payload)))
     }
 
@@ -309,6 +374,7 @@ impl SocialEvent {
                 settlement.validate()?;
                 Ok(())
             }
+            SocialEventKind::EquivocationObserved { proof } => proof.verify(),
             SocialEventKind::CollectiveDeclared { members, .. } => {
                 for member in members {
                     self.ensure_subject("collective membership", member)?;
@@ -353,6 +419,57 @@ impl SocialEvent {
 
     pub fn from_json(data: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(data)
+    }
+}
+
+impl EquivocationProof {
+    pub fn new(event_a: SocialEvent, event_b: SocialEvent) -> Result<Self, SocialProtocolError> {
+        let proof = Self {
+            author: event_a.author.clone(),
+            seq: event_a.seq,
+            event_a: Box::new(event_a),
+            event_b: Box::new(event_b),
+        };
+        proof.verify()?;
+        Ok(proof)
+    }
+
+    pub fn verify(&self) -> Result<(), SocialProtocolError> {
+        self.event_a.validate()?;
+        self.event_b.validate()?;
+        if self.event_a.author != self.event_b.author {
+            return Err(SocialProtocolError::EquivocationAuthorMismatch {
+                left: self.event_a.author.clone(),
+                right: self.event_b.author.clone(),
+            });
+        }
+        if self.event_a.seq != self.event_b.seq {
+            return Err(SocialProtocolError::EquivocationSeqMismatch {
+                left: self.event_a.seq,
+                right: self.event_b.seq,
+            });
+        }
+        if self.event_a.id == self.event_b.id {
+            return Err(SocialProtocolError::EquivocationEventsIdentical {
+                event_id: self.event_a.id.clone(),
+            });
+        }
+        if self.author != self.event_a.author || self.seq != self.event_a.seq {
+            return Err(SocialProtocolError::EquivocationAuthorMismatch {
+                left: self.author.clone(),
+                right: self.event_a.author.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn evidence_key(&self) -> String {
+        let (left, right) = if self.event_a.id <= self.event_b.id {
+            (&self.event_a.id, &self.event_b.id)
+        } else {
+            (&self.event_b.id, &self.event_a.id)
+        };
+        format!("{}|{}|{}|{}", self.author, self.seq, left, right)
     }
 }
 

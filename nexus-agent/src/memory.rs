@@ -7,8 +7,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::event_log::SocialEventLog;
-use crate::protocol::{SocialEvent, SocialProtocolError};
+use crate::protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::Society;
+use nexus_crypto::NodeIdentity;
 
 /// A node's verified social event log plus its replayed society view.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -49,6 +50,38 @@ impl SocialMemory {
 
     pub fn events(&self) -> &[SocialEvent] {
         self.log.events()
+    }
+
+    pub fn pending_events(&self) -> &[SocialEvent] {
+        self.log.pending_events()
+    }
+
+    pub fn sign_event(
+        &self,
+        identity: &NodeIdentity,
+        timestamp: u64,
+        kind: SocialEventKind,
+    ) -> Result<SocialEvent, SocialProtocolError> {
+        let (seq, prev) = self.log.next_position(identity.did());
+        SocialEvent::new_chained(identity.did().clone(), seq, prev, timestamp, kind).sign(identity)
+    }
+
+    pub fn sign_event_sequence(
+        &self,
+        identity: &NodeIdentity,
+        events: impl IntoIterator<Item = (u64, SocialEventKind)>,
+    ) -> Result<Vec<SocialEvent>, SocialProtocolError> {
+        let (mut seq, mut prev) = self.log.next_position(identity.did());
+        let mut signed = Vec::new();
+        for (timestamp, kind) in events {
+            let event =
+                SocialEvent::new_chained(identity.did().clone(), seq, prev, timestamp, kind)
+                    .sign(identity)?;
+            seq = seq.saturating_add(1);
+            prev = Some(event.id.clone());
+            signed.push(event);
+        }
+        Ok(signed)
     }
 
     pub fn society(&self) -> &Society {
