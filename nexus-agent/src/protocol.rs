@@ -79,6 +79,16 @@ pub enum SocialProtocolError {
         expected: Option<String>,
     },
 
+    #[error(
+        "event from {author} has timestamp {timestamp}, which is more than {max_future_skew_secs}s after observed time {observed_at}"
+    )]
+    EventTimestampTooFarAhead {
+        author: Did,
+        timestamp: u64,
+        observed_at: u64,
+        max_future_skew_secs: u64,
+    },
+
     #[error("equivocation proof authors differ: {left} != {right}")]
     EquivocationAuthorMismatch { left: Did, right: Did },
 

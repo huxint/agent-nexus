@@ -5,6 +5,7 @@
 //! can replay accepted events into a [`Society`](crate::society::Society).
 
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nexus_core::Did;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,12 +13,31 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::protocol::{EquivocationProof, SocialEvent, SocialProtocolError};
 use crate::society::Society;
 
+/// Accepted clock skew for signed social events.
+///
+/// Social timestamps are author-provided metadata, not ordering authority, but
+/// rejecting implausible future claims prevents an author from pre-dating later
+/// local observations by years and then having that timestamp displayed as
+/// current fact.
+pub const MAX_FUTURE_TIMESTAMP_SKEW_SECS: u64 = 5 * 60;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 /// Append-only set of signed social events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SocialEventLog {
     events: Vec<SocialEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    observed_at: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<SocialEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_observed_at: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     equivocation_proofs: Vec<EquivocationProof>,
     #[serde(skip)]
@@ -41,14 +61,28 @@ impl<'de> Deserialize<'de> for SocialEventLog {
         struct StoredLog {
             events: Vec<SocialEvent>,
             #[serde(default)]
+            observed_at: Vec<u64>,
+            #[serde(default)]
             pending: Vec<SocialEvent>,
+            #[serde(default)]
+            pending_observed_at: Vec<u64>,
             #[serde(default)]
             equivocation_proofs: Vec<EquivocationProof>,
         }
 
         let stored = StoredLog::deserialize(deserializer)?;
-        Self::from_parts(stored.events, stored.pending, stored.equivocation_proofs)
-            .map_err(serde::de::Error::custom)
+        Self::from_parts(
+            stored
+                .events
+                .into_iter()
+                .zip(fill_observed_times(stored.observed_at)),
+            stored
+                .pending
+                .into_iter()
+                .zip(fill_observed_times(stored.pending_observed_at)),
+            stored.equivocation_proofs,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -63,20 +97,25 @@ impl SocialEventLog {
     pub fn from_events(
         events: impl IntoIterator<Item = SocialEvent>,
     ) -> Result<Self, SocialProtocolError> {
-        Self::from_parts(events, std::iter::empty(), std::iter::empty())
+        let now = unix_now();
+        Self::from_parts(
+            events.into_iter().map(|event| (event, now)),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
     }
 
     fn from_parts(
-        events: impl IntoIterator<Item = SocialEvent>,
-        pending: impl IntoIterator<Item = SocialEvent>,
+        events: impl IntoIterator<Item = (SocialEvent, u64)>,
+        pending: impl IntoIterator<Item = (SocialEvent, u64)>,
         equivocation_proofs: impl IntoIterator<Item = EquivocationProof>,
     ) -> Result<Self, SocialProtocolError> {
         let mut log = Self::new();
-        for event in events {
-            log.append(event)?;
+        for (event, observed_at) in events {
+            log.append_observed(event, observed_at)?;
         }
-        for event in pending {
-            log.append(event)?;
+        for (event, observed_at) in pending {
+            log.append_observed(event, observed_at)?;
         }
         for proof in equivocation_proofs {
             log.record_equivocation(proof)?;
@@ -94,6 +133,10 @@ impl SocialEventLog {
 
     pub fn events(&self) -> &[SocialEvent] {
         &self.events
+    }
+
+    pub fn observed_times(&self) -> &[u64] {
+        &self.observed_at
     }
 
     pub fn pending_events(&self) -> &[SocialEvent] {
@@ -117,7 +160,20 @@ impl SocialEventLog {
 
     /// Append a signed event. Returns `true` when the event is newly inserted.
     pub fn append(&mut self, event: SocialEvent) -> Result<bool, SocialProtocolError> {
+        self.append_observed(event, unix_now())
+    }
+
+    /// Append a signed event with the local observation timestamp.
+    ///
+    /// This is primarily useful for deterministic tests and persistence
+    /// rebuilds. Normal callers should use [`Self::append`].
+    pub fn append_observed(
+        &mut self,
+        event: SocialEvent,
+        observed_at: u64,
+    ) -> Result<bool, SocialProtocolError> {
         event.validate()?;
+        self.validate_observed_timestamp(&event, observed_at)?;
 
         if let Some(existing) = self.index.get(&event.id) {
             let existing_payload = self.events[*existing].signing_payload()?;
@@ -149,10 +205,11 @@ impl SocialEventLog {
 
         if self.can_accept(&event)? {
             let author = event.author.clone();
-            self.accept_event(event)?;
+            self.accept_event(event, observed_at)?;
             self.drain_pending_for(&author)?;
         } else {
             self.pending_index.insert(event.id.clone());
+            self.pending_observed_at.push(observed_at);
             self.pending.push(event);
         }
         Ok(true)
@@ -199,7 +256,29 @@ impl SocialEventLog {
         }
     }
 
-    fn accept_event(&mut self, event: SocialEvent) -> Result<(), SocialProtocolError> {
+    fn validate_observed_timestamp(
+        &self,
+        event: &SocialEvent,
+        observed_at: u64,
+    ) -> Result<(), SocialProtocolError> {
+        let latest_allowed = observed_at.saturating_add(MAX_FUTURE_TIMESTAMP_SKEW_SECS);
+        if event.timestamp <= latest_allowed {
+            Ok(())
+        } else {
+            Err(SocialProtocolError::EventTimestampTooFarAhead {
+                author: event.author.clone(),
+                timestamp: event.timestamp,
+                observed_at,
+                max_future_skew_secs: MAX_FUTURE_TIMESTAMP_SKEW_SECS,
+            })
+        }
+    }
+
+    fn accept_event(
+        &mut self,
+        event: SocialEvent,
+        observed_at: u64,
+    ) -> Result<(), SocialProtocolError> {
         let index = self.events.len();
         self.index.insert(event.id.clone(), index);
         self.seq_index
@@ -207,6 +286,7 @@ impl SocialEventLog {
         self.heads
             .insert(event.author.clone(), (event.seq, event.id.clone()));
         self.record_pending_equivocations(&event)?;
+        self.observed_at.push(observed_at);
         self.events.push(event);
         Ok(())
     }
@@ -220,8 +300,9 @@ impl SocialEventLog {
             };
 
             let event = self.pending.remove(position);
+            let observed_at = self.pending_observed_at.remove(position);
             self.pending_index.remove(&event.id);
-            self.accept_event(event)?;
+            self.accept_event(event, observed_at)?;
         }
         Ok(())
     }
@@ -235,6 +316,7 @@ impl SocialEventLog {
             let pending = &self.pending[position];
             if pending.author == accepted.author && pending.seq == accepted.seq {
                 let pending = self.pending.remove(position);
+                self.pending_observed_at.remove(position);
                 self.pending_index.remove(&pending.id);
                 if pending.id != accepted.id {
                     self.record_equivocation(EquivocationProof::new(accepted.clone(), pending)?)?;
@@ -260,15 +342,18 @@ impl SocialEventLog {
     }
 
     /// Replay events in deterministic causal order into a society graph.
+    ///
+    /// Each author chain is ordered by `seq`/`prev`; author-provided
+    /// timestamps are fact metadata and never decide replay order. Cross-author
+    /// ties use the content hash id and DID so independently merged logs
+    /// converge without trusting one author's clock.
     pub fn replay_into(&self, society: &mut Society) {
         let mut events: Vec<&SocialEvent> = self.events.iter().collect();
         events.sort_by(|a, b| {
-            a.author
-                .to_string()
-                .cmp(&b.author.to_string())
-                .then_with(|| a.seq.cmp(&b.seq))
-                .then_with(|| a.timestamp.cmp(&b.timestamp))
+            a.seq
+                .cmp(&b.seq)
                 .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.author.to_string().cmp(&b.author.to_string()))
         });
 
         for event in events {
@@ -294,12 +379,23 @@ impl SocialEventLog {
         self.heads.clear();
         self.equivocation_index.clear();
 
-        let events = std::mem::take(&mut self.events);
-        let pending = std::mem::take(&mut self.pending);
+        let events = std::mem::take(&mut self.events)
+            .into_iter()
+            .zip(fill_observed_times(std::mem::take(&mut self.observed_at)));
+        let pending = std::mem::take(&mut self.pending)
+            .into_iter()
+            .zip(fill_observed_times(std::mem::take(
+                &mut self.pending_observed_at,
+            )));
         let proofs = std::mem::take(&mut self.equivocation_proofs);
         *self = Self::from_parts(events, pending, proofs)?;
         Ok(())
     }
+}
+
+fn fill_observed_times(observed_at: Vec<u64>) -> impl Iterator<Item = u64> {
+    let fallback = unix_now();
+    observed_at.into_iter().chain(std::iter::repeat(fallback))
 }
 
 #[cfg(test)]
@@ -427,6 +523,107 @@ mod tests {
             society.edge(alice.did(), bob.did()).unwrap().kind,
             RelationKind::Collaborator
         );
+    }
+
+    #[test]
+    fn log_rejects_events_too_far_ahead_of_observation_time() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let observed_at = 1_700_000_000;
+        let event = signed_relation(
+            &alice,
+            &bob,
+            observed_at + MAX_FUTURE_TIMESTAMP_SKEW_SECS + 1,
+        );
+
+        let err = SocialEventLog::new()
+            .append_observed(event, observed_at)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SocialProtocolError::EventTimestampTooFarAhead { .. }
+        ));
+    }
+
+    #[test]
+    fn event_observation_time_survives_pending_drain_and_rebuild() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = SocialEvent::new_chained(
+            alice.did().clone(),
+            0,
+            None,
+            100,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([17; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let second = SocialEvent::new_chained(
+            alice.did().clone(),
+            1,
+            Some(first.id.clone()),
+            90,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: None,
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append_observed(second, 200).unwrap());
+        assert!(log.append_observed(first, 150).unwrap());
+
+        assert_eq!(log.observed_times(), &[150, 200]);
+
+        let json = serde_json::to_vec(&log).unwrap();
+        let decoded: SocialEventLog = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.observed_times(), &[150, 200]);
+    }
+
+    #[test]
+    fn replay_uses_author_sequence_not_self_reported_timestamp() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = SocialEvent::new_chained(
+            alice.did().clone(),
+            0,
+            None,
+            1_000,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("first in Alice's chain".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let second = SocialEvent::new_chained(
+            alice.did().clone(),
+            1,
+            Some(first.id.clone()),
+            10,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Blocked,
+                note: Some("second in Alice's chain despite older timestamp".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append_observed(second, 1_100).unwrap());
+        assert!(log.append_observed(first, 1_100).unwrap());
+
+        let society = log.to_society();
+        let edge = society.edge(alice.did(), bob.did()).unwrap();
+        assert_eq!(edge.kind, RelationKind::Blocked);
+        assert_eq!(edge.updated_at, 10);
     }
 
     #[test]
