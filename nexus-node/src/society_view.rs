@@ -1333,6 +1333,7 @@ fn workspace_run_context_json(context: &WorkspaceRunContext) -> serde_json::Valu
             "cid": hex::encode(stdin.cid.as_bytes()),
         })),
         "timeout_ms": context.timeout_ms,
+        "isolation": context.isolation.as_ref(),
     })
 }
 

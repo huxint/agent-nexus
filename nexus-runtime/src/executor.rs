@@ -1,8 +1,8 @@
 //! Process executor — spawns native processes in a workspace directory.
 //!
-//! No sandboxing or resource limits. The executor records OS-observed resource
-//! usage for billing and auditability, while keeping cwd and ambient env inside
-//! the workspace boundary.
+//! Native execution remains the default for an owner's own workspace. Callers
+//! can request an isolation profile for foreign or task-derived workspaces; the
+//! executor records OS-observed resource usage for billing and auditability.
 
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -54,6 +54,9 @@ pub enum ExecError {
         workspace: String,
     },
 
+    #[error("execution isolation profile {profile} is unavailable: {reason}")]
+    IsolationUnavailable { profile: String, reason: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -72,6 +75,29 @@ pub struct ProcessOutput {
 
     /// Resource consumption during execution.
     pub resources: ResourceUsage,
+}
+
+/// Requested process isolation profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecIsolation {
+    /// Run as a native process with the executor's cwd/env boundary only.
+    #[default]
+    Native,
+    /// Use the strongest supported local profile. Currently resolves to
+    /// bubblewrap on Linux and fails closed when no backend is available.
+    Auto,
+    /// Run through Linux bubblewrap with only the workspace bound read-write.
+    Bubblewrap,
+}
+
+impl ExecIsolation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Auto => "auto",
+            Self::Bubblewrap => "bubblewrap",
+        }
+    }
 }
 
 /// Options for running a process.
@@ -101,6 +127,9 @@ pub struct ExecOptions {
 
     /// Maximum captured stderr bytes.
     pub max_stderr_bytes: Option<usize>,
+
+    /// Optional execution isolation profile.
+    pub isolation: ExecIsolation,
 }
 
 pub const DEFAULT_CAPTURE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -116,8 +145,23 @@ impl Default for ExecOptions {
             capture_stderr: true,
             max_stdout_bytes: Some(DEFAULT_CAPTURE_LIMIT_BYTES),
             max_stderr_bytes: Some(DEFAULT_CAPTURE_LIMIT_BYTES),
+            isolation: ExecIsolation::Native,
         }
     }
+}
+
+#[derive(Debug)]
+struct LaunchPlan {
+    program: PathBuf,
+    args: Vec<String>,
+    current_dir: PathBuf,
+    environment: LaunchEnvironment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchEnvironment {
+    Direct,
+    Wrapper,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +219,22 @@ impl Executor {
         let working_dir = self
             .resolve_working_dir(options.working_dir.as_deref())
             .map_err(|error| *error)?;
+        let workspace_dir = self.workspace_dir.canonicalize().map_err(ExecError::Io)?;
+        let launch = launch_plan(&workspace_dir, &working_dir, program, args, options)
+            .map_err(|error| *error)?;
 
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(args);
-        cmd.current_dir(&working_dir);
+        let mut cmd = std::process::Command::new(&launch.program);
+        cmd.args(&launch.args);
+        cmd.current_dir(&launch.current_dir);
         configure_child_process_group(&mut cmd);
 
-        configure_child_environment(&mut cmd, &self.workspace_dir, &working_dir, options);
+        configure_launch_environment(
+            &mut cmd,
+            &workspace_dir,
+            &working_dir,
+            options,
+            launch.environment,
+        );
 
         if options.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -295,14 +348,23 @@ impl Executor {
         let working_dir = self
             .resolve_working_dir(options.working_dir.as_deref())
             .map_err(|error| *error)?;
+        let workspace_dir = self.workspace_dir.canonicalize().map_err(ExecError::Io)?;
+        let launch = launch_plan(&workspace_dir, &working_dir, program, args, options)
+            .map_err(|error| *error)?;
 
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        cmd.current_dir(&working_dir);
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.args);
+        cmd.current_dir(&launch.current_dir);
         cmd.kill_on_drop(true);
         configure_child_process_group(&mut cmd);
 
-        configure_child_environment(&mut cmd, &self.workspace_dir, &working_dir, options);
+        configure_launch_environment(
+            &mut cmd,
+            &workspace_dir,
+            &working_dir,
+            options,
+            launch.environment,
+        );
 
         if options.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -413,6 +475,185 @@ impl Executor {
             }));
         }
         Ok(resolved)
+    }
+}
+
+fn launch_plan(
+    workspace_dir: &Path,
+    working_dir: &Path,
+    program: &str,
+    args: &[&str],
+    options: &ExecOptions,
+) -> Result<LaunchPlan, Box<ExecError>> {
+    match options.isolation {
+        ExecIsolation::Native => Ok(LaunchPlan {
+            program: PathBuf::from(program),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            current_dir: working_dir.to_path_buf(),
+            environment: LaunchEnvironment::Direct,
+        }),
+        ExecIsolation::Auto | ExecIsolation::Bubblewrap => {
+            #[cfg(target_os = "linux")]
+            {
+                bubblewrap_launch_plan(workspace_dir, working_dir, program, args, options)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(Box::new(ExecError::IsolationUnavailable {
+                    profile: options.isolation.as_str().into(),
+                    reason: "supported only on Linux in this build".into(),
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bubblewrap_launch_plan(
+    workspace_dir: &Path,
+    working_dir: &Path,
+    program: &str,
+    args: &[&str],
+    options: &ExecOptions,
+) -> Result<LaunchPlan, Box<ExecError>> {
+    let bwrap = std::env::var_os("NEXUS_BWRAP_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/sbin/bwrap"));
+
+    if !bwrap.exists() {
+        return Err(Box::new(ExecError::IsolationUnavailable {
+            profile: options.isolation.as_str().into(),
+            reason: format!("bubblewrap binary not found at {}", bwrap.display()),
+        }));
+    }
+
+    const SANDBOX_WORKSPACE: &str = "/workspace";
+    let sandbox_working_dir =
+        sandbox_path_for_workspace_child(workspace_dir, working_dir, SANDBOX_WORKSPACE)?;
+    let mut wrapper_args = vec![
+        "--die-with-parent".to_string(),
+        "--unshare-all".to_string(),
+        "--share-net".to_string(),
+        "--chdir".to_string(),
+        sandbox_working_dir.clone(),
+        "--ro-bind".to_string(),
+        "/usr".to_string(),
+        "/usr".to_string(),
+        "--ro-bind-try".to_string(),
+        "/bin".to_string(),
+        "/bin".to_string(),
+        "--ro-bind-try".to_string(),
+        "/sbin".to_string(),
+        "/sbin".to_string(),
+        "--ro-bind-try".to_string(),
+        "/lib".to_string(),
+        "/lib".to_string(),
+        "--ro-bind-try".to_string(),
+        "/lib64".to_string(),
+        "/lib64".to_string(),
+        "--bind".to_string(),
+        workspace_dir.display().to_string(),
+        SANDBOX_WORKSPACE.to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+    ];
+    append_bubblewrap_env(
+        &mut wrapper_args,
+        SANDBOX_WORKSPACE,
+        &sandbox_working_dir,
+        options,
+    );
+    wrapper_args.extend(["--".to_string(), program.to_string()]);
+    wrapper_args.extend(args.iter().map(|arg| (*arg).to_string()));
+
+    Ok(LaunchPlan {
+        program: bwrap,
+        args: wrapper_args,
+        current_dir: PathBuf::from("/"),
+        environment: LaunchEnvironment::Wrapper,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_path_for_workspace_child(
+    workspace_dir: &Path,
+    child: &Path,
+    sandbox_workspace: &str,
+) -> Result<String, Box<ExecError>> {
+    let relative = child.strip_prefix(workspace_dir).map_err(|_| {
+        Box::new(ExecError::WorkingDirectoryOutsideWorkspace {
+            requested: child.display().to_string(),
+            workspace: workspace_dir.display().to_string(),
+        })
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Ok(sandbox_workspace.to_string());
+    }
+    Ok(Path::new(sandbox_workspace)
+        .join(relative)
+        .display()
+        .to_string())
+}
+
+fn configure_launch_environment<C: ChildEnvironment>(
+    cmd: &mut C,
+    workspace_dir: &Path,
+    working_dir: &Path,
+    options: &ExecOptions,
+    environment: LaunchEnvironment,
+) {
+    match environment {
+        LaunchEnvironment::Direct => {
+            configure_child_environment(cmd, workspace_dir, working_dir, options)
+        }
+        LaunchEnvironment::Wrapper => {
+            cmd.clear_env();
+            cmd.set_env("PATH", DEFAULT_EXEC_PATH);
+            cmd.set_env("NEXUS_WORKSPACE_ROOT", &workspace_dir.display().to_string());
+            cmd.set_env("NEXUS_WORKING_DIR", &working_dir.display().to_string());
+            for key in SAFE_INHERITED_ENV_KEYS {
+                if let Ok(value) = std::env::var(key) {
+                    cmd.set_env(key, &value);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn append_bubblewrap_env(
+    wrapper_args: &mut Vec<String>,
+    sandbox_workspace: &str,
+    sandbox_working_dir: &str,
+    options: &ExecOptions,
+) {
+    wrapper_args.extend([
+        "--clearenv".to_string(),
+        "--setenv".to_string(),
+        "PATH".to_string(),
+        DEFAULT_EXEC_PATH.to_string(),
+        "--setenv".to_string(),
+        "HOME".to_string(),
+        sandbox_workspace.to_string(),
+        "--setenv".to_string(),
+        "PWD".to_string(),
+        sandbox_working_dir.to_string(),
+        "--setenv".to_string(),
+        "NEXUS_WORKSPACE_ROOT".to_string(),
+        sandbox_workspace.to_string(),
+    ]);
+
+    for key in SAFE_INHERITED_ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            wrapper_args.extend(["--setenv".to_string(), (*key).to_string(), value]);
+        }
+    }
+    for (key, value) in &options.env {
+        wrapper_args.extend(["--setenv".to_string(), key.clone(), value.clone()]);
     }
 }
 
@@ -1144,6 +1385,65 @@ mod tests {
             parts,
             vec!["visible", "unset", temp.path().to_str().unwrap()]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_isolation_runs_with_only_workspace_writable() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            isolation: ExecIsolation::Bubblewrap,
+            env: vec![("NEXUS_ALLOWED".into(), "visible".into())],
+            ..Default::default()
+        };
+
+        let result = executor
+            .exec(
+                "sh",
+                &[
+                    "-c",
+                    "echo workspace > output.txt && printf '%s|%s|%s' \"$NEXUS_ALLOWED\" \"${HOME}\" \"${NEXUS_WORKSPACE_ROOT}\"",
+                ],
+                &opts,
+            )
+            .await
+            .expect("bubblewrap command should run");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read(temp.path().join("output.txt")).expect("workspace output"),
+            b"workspace\n"
+        );
+        let output = String::from_utf8_lossy(&result.stdout);
+        let parts = output.split('|').collect::<Vec<_>>();
+        assert_eq!(parts, vec!["visible", "/workspace", "/workspace"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_isolation_hides_host_home_paths() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"host-secret").expect("secret");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            isolation: ExecIsolation::Bubblewrap,
+            ..Default::default()
+        };
+        let command = format!(
+            "if cat '{}' >/dev/null 2>&1; then printf leaked; else printf blocked; fi",
+            secret.display()
+        );
+
+        let result = executor
+            .exec("sh", &["-c", &command], &opts)
+            .await
+            .expect("sandboxed command should complete");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"blocked");
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
-//! Nexus Runtime — native process executor (no sandbox).
+//! Nexus Runtime — native process executor with optional isolation.
 //!
 //! Agents have **absolute freedom**: they can spawn arbitrary processes,
-//! access the filesystem, and use the network directly.
+//! access the filesystem, and use the network directly when native execution
+//! is selected.
 //!
-//! The framework does not enforce local sandboxing. Identity, reputation,
-//! credit, and social relationships decide who agents choose to work with;
-//! the workspace itself stays a real computer.
+//! The framework keeps native execution as the default for an owner's own
+//! workspace. Callers can request an isolation profile for cloned or otherwise
+//! foreign workspaces; identity, reputation, credit, and social relationships
+//! still decide who agents choose to work with.
 //!
 //! ## Design
 //!
@@ -16,5 +18,5 @@
 mod executor;
 mod resources;
 
-pub use executor::{ExecError, ExecOptions, Executor, ProcessOutput};
+pub use executor::{ExecError, ExecIsolation, ExecOptions, Executor, ProcessOutput};
 pub use resources::ResourceUsage;

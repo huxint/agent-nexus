@@ -6,7 +6,7 @@
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
 //!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
-//!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
+//!   nexus-node exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
@@ -50,7 +50,7 @@ use nexus_economy::SettlementProof;
 use nexus_network::{
     global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkEvent,
 };
-use nexus_runtime::{ExecError, ExecOptions, ProcessOutput, ResourceUsage};
+use nexus_runtime::{ExecError, ExecIsolation, ExecOptions, ProcessOutput, ResourceUsage};
 use nexus_storage::{BlockStore, Cid, DiskBlockStore};
 #[cfg(test)]
 use nexus_sync::codec::MAX_SYNC_MESSAGE_BYTES;
@@ -125,7 +125,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
     eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
-    eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
+    eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--isolation auto|native|bubblewrap] [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
     eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap]");
     eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
     eprintln!(
@@ -561,6 +561,7 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut workspace_path = None;
     let mut note = None;
     let mut exec_options = ExecOptions::default();
+    let mut isolation_explicit = false;
     let mut stdin_source = None::<&'static str>;
     let mut command_start = None;
     let mut i = 2;
@@ -607,6 +608,16 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
                 exec_options.timeout = Some(Duration::from_millis(millis));
             }
+            "--isolation" => {
+                i += 1;
+                exec_options.isolation =
+                    parse_exec_isolation(required_arg(args, i, "--isolation")?)?;
+                isolation_explicit = true;
+            }
+            "--native" | "--no-isolation" => {
+                exec_options.isolation = ExecIsolation::Native;
+                isolation_explicit = true;
+            }
             "--" => {
                 command_start = Some(i + 1);
                 break;
@@ -634,6 +645,7 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut memory = load_social_memory(&memory_path)?;
     let mut workspace = Workspace::load(&identity, &workspace_path).await?;
     register_workspace_path(&base, workspace.root_dir())?;
+    apply_default_exec_isolation(&identity, &workspace, &mut exec_options, isolation_explicit);
 
     let started_at = unix_now();
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1003,11 +1015,38 @@ fn workspace_run_failure_from_exec_error(error: &ExecError) -> WorkspaceRunFailu
         ExecError::Io(_) => "io",
         ExecError::Timeout { .. } => "timeout",
         ExecError::WorkingDirectoryOutsideWorkspace { .. } => "cwd_outside_workspace",
+        ExecError::IsolationUnavailable { .. } => "isolation_unavailable",
         ExecError::Other(_) => "exec_error",
     };
     WorkspaceRunFailure {
         kind: kind.into(),
         message: error.to_string(),
+    }
+}
+
+fn parse_exec_isolation(value: &str) -> Result<ExecIsolation, Box<dyn std::error::Error>> {
+    match normalize_symbol(value).as_str() {
+        "native" | "none" | "off" => Ok(ExecIsolation::Native),
+        "auto" => Ok(ExecIsolation::Auto),
+        "bubblewrap" | "bwrap" => Ok(ExecIsolation::Bubblewrap),
+        other => Err(format!("invalid --isolation: {other}").into()),
+    }
+}
+
+fn apply_default_exec_isolation(
+    identity: &NodeIdentity,
+    workspace: &Workspace,
+    options: &mut ExecOptions,
+    isolation_explicit: bool,
+) {
+    if isolation_explicit {
+        return;
+    }
+    if options.isolation != ExecIsolation::Native {
+        return;
+    }
+    if workspace.owner() != identity.did() {
+        options.isolation = ExecIsolation::Auto;
     }
 }
 
@@ -1620,6 +1659,7 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
         timeout_ms: options
             .timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        isolation: WorkspaceRunContext::isolation_from_exec_options(options.isolation),
     };
 
     (!context.is_empty()).then_some(context)
@@ -2527,6 +2567,12 @@ fn cmd_event_workspace_run(args: &[String]) -> Result<(), Box<dyn std::error::Er
                     required_arg(args, i, "--timeout-ms")?,
                     "--timeout-ms",
                 )?);
+            }
+            "--isolation" => {
+                i += 1;
+                context.isolation = WorkspaceRunContext::isolation_from_exec_options(
+                    parse_exec_isolation(required_arg(args, i, "--isolation")?)?,
+                );
             }
             "--started-at" => {
                 i += 1;
@@ -6384,6 +6430,7 @@ mod tests {
         );
         assert_eq!(run["exit_code"], 0);
         assert_eq!(run["context"]["working_dir"], "sub");
+        assert!(run["context"]["isolation"].is_null());
         assert_eq!(
             run["context"]["env_keys"],
             serde_json::json!(["NEXUS_MODE"])
@@ -6395,6 +6442,102 @@ mod tests {
         );
         assert_eq!(run["context"]["timeout_ms"], 5000);
         assert!(!run.to_string().contains("free"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exec_command_isolates_foreign_workspace_by_default() {
+        let owner_base = TempDir::new().unwrap();
+        let owner = load_or_create_identity(owner_base.path()).unwrap();
+        let mut ws = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "foreign-exec-ws".into(),
+                description: "workspace owned by another DID".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ws.snapshot().await.unwrap();
+        let workspace_path = ws.root_dir().to_path_buf();
+
+        let guest_base = TempDir::new().unwrap();
+        load_or_create_identity(guest_base.path()).unwrap();
+        let secret_path = guest_base.path().join("host-secret.txt");
+        std::fs::write(&secret_path, b"base secret").unwrap();
+        let command = format!(
+            "if cat '{}' >/dev/null 2>&1; then printf leaked; else printf blocked; fi",
+            secret_path.display()
+        );
+
+        cmd_exec(&[
+            "nexus-node".into(),
+            "exec".into(),
+            "--base".into(),
+            guest_base.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            command,
+        ])
+        .await
+        .unwrap();
+
+        let memory =
+            load_social_memory(&guest_base.path().join(".nexus-social-memory.json")).unwrap();
+        let view = society_json(&memory);
+        let run = &view["workspaces"][0]["runs"][0];
+        assert_eq!(run["exit_code"], 0);
+        assert_eq!(run["context"]["isolation"], "auto");
+    }
+
+    #[tokio::test]
+    async fn exec_command_allows_explicit_native_override_for_foreign_workspace() {
+        let owner_base = TempDir::new().unwrap();
+        let owner = load_or_create_identity(owner_base.path()).unwrap();
+        let mut ws = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "foreign-native-ws".into(),
+                description: "native override".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ws.snapshot().await.unwrap();
+        let workspace_path = ws.root_dir().to_path_buf();
+
+        let guest_base = TempDir::new().unwrap();
+        load_or_create_identity(guest_base.path()).unwrap();
+        cmd_exec(&[
+            "nexus-node".into(),
+            "exec".into(),
+            "--base".into(),
+            guest_base.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--isolation".into(),
+            "native".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "printf native > native.txt".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(workspace_path.join("native.txt")).unwrap(),
+            b"native"
+        );
+        let memory =
+            load_social_memory(&guest_base.path().join(".nexus-social-memory.json")).unwrap();
+        let view = society_json(&memory);
+        assert!(view["workspaces"][0]["runs"][0]["context"].is_null());
     }
 
     #[tokio::test]
@@ -7447,6 +7590,8 @@ mod tests {
             "{}".into(),
             "--timeout-ms".into(),
             "30000".into(),
+            "--isolation".into(),
+            "bubblewrap".into(),
             "--started-at".into(),
             "10".into(),
             "--finished-at".into(),
@@ -7480,6 +7625,7 @@ mod tests {
             hex::encode(Cid::hash_of(b"{}").as_bytes())
         );
         assert_eq!(run["context"]["timeout_ms"], 30000);
+        assert_eq!(run["context"]["isolation"], "bubblewrap");
         assert_eq!(run["started_at"], 10);
         assert_eq!(run["finished_at"], 12);
         assert_eq!(run["note"], "autonomous analysis");
