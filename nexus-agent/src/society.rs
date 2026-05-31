@@ -449,6 +449,9 @@ pub struct ProviderRecommendation {
     pub capability: CapabilityDecl,
     pub social_score: f64,
     pub reputation_score: f64,
+    /// How strongly this provider is reachable from the requester's local
+    /// trust graph. Unknown or disconnected peers keep reputation neutral.
+    pub reachability_score: f64,
     /// Score derived from collective judgments about the provider's claims.
     pub governance_score: f64,
     /// Recent collective judgments that explain the governance score.
@@ -2386,9 +2389,17 @@ impl Society {
                     .and_then(|requester| self.edge(requester, &manifest.did))
                     .map(SocialEdge::score)
                     .unwrap_or(0.5);
+                let reachability_score = requester
+                    .map(|requester| self.trust_reachability_score(requester, &manifest.did))
+                    .unwrap_or(1.0);
                 let reputation_score = requester
-                    .and_then(|requester| self.reputation(requester, &manifest.did))
-                    .map(ReputationScore::composite)
+                    .map(|requester| {
+                        self.reachable_reputation_score(
+                            requester,
+                            &manifest.did,
+                            reachability_score,
+                        )
+                    })
                     .unwrap_or(0.5);
                 let governance_signals = self.governance_signals_for(&manifest.did, 5);
                 let governance_score = governance_score_from_signals(&governance_signals);
@@ -2408,6 +2419,7 @@ impl Society {
                     capability: capability_decl.clone(),
                     social_score,
                     reputation_score,
+                    reachability_score,
                     governance_score,
                     governance_signals,
                     price_per_unit: capability_decl.price_per_unit,
@@ -2435,6 +2447,78 @@ impl Society {
         });
         providers.truncate(limit);
         providers
+    }
+
+    fn trust_reachability_score(&self, from: &Did, to: &Did) -> f64 {
+        if from == to {
+            return 1.0;
+        }
+        if self.edge(from, to).is_some() || self.reputation(from, to).is_some() {
+            return 1.0;
+        }
+
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = HashSet::new();
+        queue.push_back((from.clone(), 1.0));
+        visited.insert(from.clone());
+
+        while let Some((current, confidence)) = queue.pop_front() {
+            for edge in self.edges.values().filter(|edge| edge.from == current) {
+                if edge.kind == RelationKind::Blocked || edge.failures > edge.successes {
+                    continue;
+                }
+                let edge_score = edge.score();
+                if edge_score < 0.55 {
+                    continue;
+                }
+                let next_confidence = confidence * edge_score;
+                if edge.to == *to {
+                    return next_confidence.clamp(0.0, 1.0);
+                }
+                if next_confidence >= 0.30 && visited.insert(edge.to.clone()) {
+                    queue.push_back((edge.to.clone(), next_confidence));
+                }
+            }
+        }
+
+        0.0
+    }
+
+    fn reachable_reputation_score(
+        &self,
+        requester: &Did,
+        target: &Did,
+        target_reachability: f64,
+    ) -> f64 {
+        if let Some(score) = self.reputation(requester, target) {
+            return score.composite();
+        }
+
+        let mut weighted_score = 0.0;
+        let mut total_weight = 0.0;
+        for ((source, subject), score) in &self.reputations {
+            if subject != target {
+                continue;
+            }
+
+            let source_reachability = if source == requester {
+                1.0
+            } else {
+                self.trust_reachability_score(requester, source)
+            };
+            if source_reachability <= 0.0 {
+                continue;
+            }
+
+            weighted_score += score.composite() * source_reachability;
+            total_weight += source_reachability;
+        }
+
+        if total_weight <= 0.0 {
+            return 0.5;
+        }
+
+        reachable_reputation(weighted_score / total_weight, target_reachability)
     }
 
     fn governance_signals_for(&self, target: &Did, limit: usize) -> Vec<GovernanceSignal> {
@@ -2508,6 +2592,10 @@ impl Interaction {
 
 fn ema(current: f64, observed: f64) -> f64 {
     (current * 0.75 + observed * 0.25).clamp(0.0, 1.0)
+}
+
+fn reachable_reputation(raw: f64, reachability: f64) -> f64 {
+    (0.5 + (raw - 0.5) * reachability).clamp(0.0, 1.0)
 }
 
 fn format_args_for_note(args: &[String]) -> String {
@@ -4051,6 +4139,109 @@ mod tests {
         assert_eq!(providers[0].governance_score, 0.5);
         assert_eq!(providers[1].did, cheap);
         assert!(providers.iter().all(|provider| provider.did != blocked));
+    }
+
+    #[test]
+    fn provider_recommendations_do_not_import_disconnected_reputation() {
+        let requester = did("requester");
+        let direct = did("direct");
+        let sybil = did("sybil");
+        let sybil_peer = did("sybil-peer");
+        let mut society = Society::new();
+
+        for (did, name, price) in [(direct.clone(), "Direct", 10), (sybil.clone(), "Sybil", 10)] {
+            society.apply_event(&SocialEvent::new(
+                did.clone(),
+                1,
+                SocialEventKind::ManifestPublished {
+                    manifest: provider_manifest(did, name, "python-exec", price),
+                },
+            ));
+        }
+
+        society.relate(
+            requester.clone(),
+            direct.clone(),
+            RelationKind::Collaborator,
+            2,
+        );
+        society.record_interaction(Interaction::new(
+            requester.clone(),
+            direct.clone(),
+            None,
+            "local trial",
+            InteractionOutcome::Success,
+            3,
+        ));
+        for i in 0..8 {
+            society.record_interaction(Interaction::new(
+                sybil_peer.clone(),
+                sybil.clone(),
+                None,
+                "closed loop praise",
+                InteractionOutcome::Success,
+                10 + i,
+            ));
+        }
+
+        let providers = society.recommend_providers(&requester, "python-exec", 10);
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].did, direct);
+        let sybil_view = providers
+            .iter()
+            .find(|provider| provider.did == sybil)
+            .unwrap();
+        assert_eq!(sybil_view.reachability_score, 0.0);
+        assert!((sybil_view.reputation_score - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn provider_recommendations_use_reachable_reputation() {
+        let requester = did("requester");
+        let introducer = did("introducer");
+        let provider = did("provider");
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            provider.clone(),
+            1,
+            SocialEventKind::ManifestPublished {
+                manifest: provider_manifest(provider.clone(), "Provider", "python-exec", 10),
+            },
+        ));
+        society.relate(
+            requester.clone(),
+            introducer.clone(),
+            RelationKind::Collaborator,
+            2,
+        );
+        society.record_interaction(Interaction::new(
+            requester.clone(),
+            introducer.clone(),
+            None,
+            "trusted introducer",
+            InteractionOutcome::Success,
+            3,
+        ));
+        society.relate(
+            introducer.clone(),
+            provider.clone(),
+            RelationKind::Collaborator,
+            4,
+        );
+        society.record_interaction(Interaction::new(
+            introducer,
+            provider.clone(),
+            None,
+            "introduced provider success",
+            InteractionOutcome::Success,
+            5,
+        ));
+
+        let providers = society.recommend_providers(&requester, "python-exec", 10);
+        assert_eq!(providers.len(), 1);
+        assert!(providers[0].reachability_score > 0.30);
+        assert!(providers[0].reputation_score > 0.5);
     }
 
     #[test]
