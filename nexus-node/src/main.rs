@@ -6642,6 +6642,16 @@ mod tests {
         assert_eq!(view["policies"]["economy"]["enforcement"], "advisory");
         assert_eq!(view["policies"]["economy"]["settlement_gate"], false);
         assert_eq!(view["policies"]["economy"]["reputation_gate"], false);
+        assert_eq!(view["policies"]["truth"]["default_status"], "claimed");
+        assert_eq!(view["policies"]["truth"]["anchored_status"], "anchored");
+        assert_eq!(
+            view["policies"]["truth"]["witness_required_for"],
+            serde_json::json!([
+                "workspace_ownership_transfer",
+                "settlement_finality",
+                "collective_decision"
+            ])
+        );
         assert_eq!(view["agents"][0]["did"], identity.did().to_string());
         assert_eq!(view["agents"][0]["manifest"]["name"], "social-node");
         assert_eq!(

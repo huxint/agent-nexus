@@ -5,8 +5,9 @@ use nexus_agent::{
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
     ExecutionReceipt, GovernanceSignal, IdentityRevocation, IntentRecommendation, IntentResponse,
     Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
-    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WorkspaceOwnershipFact,
-    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
+    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WitnessedFactKind,
+    WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
+    WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -481,6 +482,19 @@ pub(crate) fn society_json_for_base(
 
 fn society_policies_json() -> serde_json::Value {
     serde_json::json!({
+        "truth": {
+            "default_status": "claimed",
+            "anchored_status": "anchored",
+            "witness_required_for": WitnessedFactKind::ALL
+                .into_iter()
+                .map(WitnessedFactKind::as_str)
+                .collect::<Vec<_>>(),
+            "authority_anchor": {
+                "collective_quorum": "requires threshold member attestors and matching subject",
+                "external": "requires valid anchor payload and matching subject",
+            },
+            "adr": "docs/adr/0001-subjective-vs-consensus-truth.md",
+        },
         "economy": {
             "mode": "social_record",
             "enforcement": "advisory",
