@@ -2,10 +2,10 @@ use std::path::Path;
 
 use nexus_agent::{
     task_result_claim_id, AgentIntent, CapabilityGrant, Collective, CollectiveProposal,
-    CollectiveVote, ExecutionReceipt, GovernanceSignal, IntentRecommendation, IntentResponse,
-    Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
-    SocialMemory, Task, TaskClaimJudgment, TaskResult, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceSnapshot,
+    CollectiveVote, ExecutionAttestation, ExecutionReceipt, GovernanceSignal, IntentRecommendation,
+    IntentResponse, Interaction, ProviderRecommendation, ReputationScore, SettlementRecord,
+    SocialEdge, SocialMemory, Task, TaskClaimJudgment, TaskResult, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -334,7 +334,7 @@ pub(crate) fn society_json_for_base(
                         "cancelled_at": cancellation.cancelled_at,
                     })
                 }),
-                "result": society.task_result(&task.id).map(task_result_json),
+                "result": society.task_result(&task.id).map(|result| task_result_json(society, result)),
                 "result_claims": society
                     .task_result_claims(&task.id)
                     .into_iter()
@@ -359,6 +359,11 @@ pub(crate) fn society_json_for_base(
                             "timestamp": dispute.timestamp,
                         })
                     })
+                    .collect::<Vec<_>>(),
+                "execution_attestations": society
+                    .task_execution_attestations(&task.id)
+                    .into_iter()
+                    .map(execution_attestation_json)
                     .collect::<Vec<_>>(),
                 "settlements": society
                     .task_settlements(&task.id)
@@ -483,6 +488,12 @@ fn agent_matches_filters(
                         .task_result_claims(task_id)
                         .into_iter()
                         .any(|result| result.executor == *did)
+                    || society
+                        .task_execution_attestations(task_id)
+                        .into_iter()
+                        .any(|attestation| {
+                            attestation.executor == *did || attestation.attestor == *did
+                        })
                     || society
                         .task_disputes(task_id)
                         .into_iter()
@@ -809,6 +820,10 @@ fn task_involves_agent(society: &nexus_agent::Society, task: &Task, agent: &Did)
             .into_iter()
             .any(|result| result.executor == *agent)
         || society
+            .task_execution_attestations(&task.id)
+            .into_iter()
+            .any(|attestation| attestation.executor == *agent || attestation.attestor == *agent)
+        || society
             .task_disputes(&task.id)
             .into_iter()
             .any(|dispute| dispute.disputer == *agent || dispute.target == *agent)
@@ -1016,7 +1031,7 @@ fn agent_activity_json(
             |result| task_result_activity_timestamp(result),
         )
             .into_iter()
-            .map(task_result_json)
+            .map(|result| task_result_json(society, result))
             .collect::<Vec<_>>(),
         "task_result_claims": activity_window(
             society.agent_task_result_claims(agent),
@@ -1167,7 +1182,7 @@ fn reputation_json((from, to, score): (&Did, &Did, &ReputationScore)) -> serde_j
     })
 }
 
-fn task_result_json(result: &TaskResult) -> serde_json::Value {
+fn task_result_json(society: &nexus_agent::Society, result: &TaskResult) -> serde_json::Value {
     serde_json::json!({
         "task_id": result.task_id,
         "executor": result.executor.to_string(),
@@ -1177,24 +1192,46 @@ fn task_result_json(result: &TaskResult) -> serde_json::Value {
         "stderr": result.stderr,
         "actual_cost": result.actual_cost,
         "error": result.error,
-        "resource_evidence": task_result_resource_evidence_json(result),
+        "resource_evidence": task_result_resource_evidence_json(society, result),
         "receipt": result.receipt.as_deref().map(execution_receipt_json),
+        "attestations": society.task_result_attestations(result).into_iter().map(execution_attestation_json).collect::<Vec<_>>(),
     })
 }
 
-fn task_result_resource_evidence_json(result: &TaskResult) -> serde_json::Value {
+fn task_result_resource_evidence_json(
+    society: &nexus_agent::Society,
+    result: &TaskResult,
+) -> serde_json::Value {
     match result.receipt.as_deref() {
-        Some(receipt) => serde_json::json!({
-            "measurement_status": "signed_executor_claim",
-            "source": "receipt.resources",
-            "signed_by": receipt.executor.to_string(),
-            "signature_scope": "execution_receipt",
-            "receipt_signature_valid": receipt.verify_signature().is_ok(),
-            "output_cids_match_result": receipt.stdout_cid == Cid::hash_of(result.stdout.as_bytes())
-                && receipt.stderr_cid == Cid::hash_of(result.stderr.as_bytes()),
-            "independent_verification": "not_performed",
-            "verified_measurement": false,
-        }),
+        Some(receipt) => {
+            let receipt_signature_valid = receipt.verify_signature().is_ok();
+            let output_cids_match_result = receipt.stdout_cid
+                == Cid::hash_of(result.stdout.as_bytes())
+                && receipt.stderr_cid == Cid::hash_of(result.stderr.as_bytes());
+            let matching_attestations = society.task_result_attestations(result).len();
+            let has_independent_reexecution = matching_attestations > 0;
+
+            serde_json::json!({
+                "measurement_status": if has_independent_reexecution {
+                    "independent_reexecution_cross_checked"
+                } else {
+                    "signed_executor_claim"
+                },
+                "source": "receipt.resources",
+                "signed_by": receipt.executor.to_string(),
+                "signature_scope": "execution_receipt",
+                "receipt_signature_valid": receipt_signature_valid,
+                "output_cids_match_result": output_cids_match_result,
+                "matching_attestations": matching_attestations,
+                "independent_verification": if has_independent_reexecution {
+                    "attested_reexecution"
+                } else {
+                    "not_performed"
+                },
+                "verified_output": has_independent_reexecution,
+                "verified_measurement": false,
+            })
+        }
         None => serde_json::json!({
             "measurement_status": "self_reported",
             "source": null,
@@ -1202,7 +1239,9 @@ fn task_result_resource_evidence_json(result: &TaskResult) -> serde_json::Value 
             "signature_scope": "social_event",
             "receipt_signature_valid": null,
             "output_cids_match_result": null,
+            "matching_attestations": 0,
             "independent_verification": "not_performed",
+            "verified_output": false,
             "verified_measurement": false,
         }),
     }
@@ -1232,7 +1271,7 @@ fn task_result_claim_json(
     result: &TaskResult,
 ) -> serde_json::Value {
     let claim_id = task_result_claim_id(result);
-    let mut value = task_result_json(result);
+    let mut value = task_result_json(society, result);
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "claim_id".into(),
@@ -1294,6 +1333,36 @@ fn execution_receipt_resource_evidence_json(receipt: &ExecutionReceipt) -> serde
         "signature_scope": "execution_receipt",
         "receipt_signature_valid": receipt.verify_signature().is_ok(),
         "independent_verification": "not_performed",
+        "verified_measurement": false,
+    })
+}
+
+fn execution_attestation_json(attestation: &ExecutionAttestation) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": attestation.task_id,
+        "executor": attestation.executor.to_string(),
+        "attestor": attestation.attestor.to_string(),
+        "receipt_signature_hex": attestation.receipt_signature_hex,
+        "stdout_cid": hex::encode(attestation.stdout_cid.as_bytes()),
+        "stderr_cid": hex::encode(attestation.stderr_cid.as_bytes()),
+        "output_root": attestation.output_root.map(|root| hex::encode(root.as_bytes())),
+        "resources": attestation.resources,
+        "resource_evidence": execution_attestation_resource_evidence_json(attestation),
+        "observed_at": attestation.observed_at,
+        "signature": attestation.signature.as_ref().map(hex::encode),
+    })
+}
+
+fn execution_attestation_resource_evidence_json(
+    attestation: &ExecutionAttestation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "measurement_status": "signed_attestor_claim",
+        "source": "attestation.resources",
+        "signed_by": attestation.attestor.to_string(),
+        "signature_scope": "execution_attestation",
+        "attestation_signature_valid": attestation.verify_signature().is_ok(),
+        "independent_verification": "attested_reexecution",
         "verified_measurement": false,
     })
 }

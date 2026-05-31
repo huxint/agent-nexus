@@ -134,6 +134,11 @@ pub struct TaskResult {
     /// Optional signed proof of the execution that produced this result.
     #[serde(default)]
     pub receipt: Option<Box<ExecutionReceipt>>,
+
+    /// Optional third-party re-execution attestations that challenge the
+    /// executor's receipt by independently reproducing the same output CIDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<ExecutionAttestation>,
 }
 
 /// Signed evidence that an agent executed a task in a free workspace.
@@ -151,6 +156,22 @@ pub struct ExecutionReceipt {
     pub resources: ResourceUsage,
     pub started_at: u64,
     pub finished_at: u64,
+    pub signature: Option<Vec<u8>>,
+}
+
+/// Third-party evidence that an agent re-executed a receipt and observed the
+/// same output CIDs. This is a challengeable fact, not a sandbox boundary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionAttestation {
+    pub task_id: String,
+    pub executor: Did,
+    pub attestor: Did,
+    pub receipt_signature_hex: String,
+    pub stdout_cid: Cid,
+    pub stderr_cid: Cid,
+    pub output_root: Option<Cid>,
+    pub resources: ResourceUsage,
+    pub observed_at: u64,
     pub signature: Option<Vec<u8>>,
 }
 
@@ -200,11 +221,139 @@ pub enum ExecutionReceiptError {
     #[error("execution receipt output CIDs do not match task result output")]
     OutputCidMismatch,
 
+    #[error("execution attestation attestor {attestor} must differ from executor {executor}")]
+    AttestorIsExecutor { attestor: Did, executor: Did },
+
+    #[error("execution attestation attestor {attestor} does not match signer {signer}")]
+    AttestorSignerMismatch { attestor: Did, signer: Did },
+
+    #[error("execution attestation is missing an attestor signature")]
+    MissingAttestationSignature,
+
+    #[error("execution attestation requires an execution receipt")]
+    AttestationRequiresReceipt,
+
+    #[error("execution attestation does not match execution receipt")]
+    AttestationReceiptMismatch,
+
+    #[error("execution attestation output CIDs do not match task result output")]
+    AttestationOutputMismatch,
+
     #[error("successful task result must have zero exit code")]
     SuccessExitCodeMismatch,
 
     #[error("failed to serialize execution receipt signing payload: {0}")]
     PayloadSerialization(#[from] serde_json::Error),
+}
+
+impl ExecutionAttestation {
+    pub fn from_process_output(
+        receipt: &ExecutionReceipt,
+        attestor: Did,
+        output: &ProcessOutput,
+        output_root: Option<Cid>,
+        observed_at: u64,
+    ) -> Self {
+        Self {
+            task_id: receipt.task_id.clone(),
+            executor: receipt.executor.clone(),
+            attestor,
+            receipt_signature_hex: receipt_signature_hex(receipt).unwrap_or_default(),
+            stdout_cid: Cid::hash_of(&output.stdout),
+            stderr_cid: Cid::hash_of(&output.stderr),
+            output_root,
+            resources: output.resources.clone(),
+            observed_at,
+            signature: None,
+        }
+    }
+
+    pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            task_id: &'a str,
+            executor: &'a Did,
+            attestor: &'a Did,
+            receipt_signature_hex: &'a str,
+            stdout_cid: Cid,
+            stderr_cid: Cid,
+            output_root: Option<Cid>,
+            resources: &'a ResourceUsage,
+            observed_at: u64,
+        }
+
+        serde_json::to_vec(&Payload {
+            task_id: &self.task_id,
+            executor: &self.executor,
+            attestor: &self.attestor,
+            receipt_signature_hex: &self.receipt_signature_hex,
+            stdout_cid: self.stdout_cid,
+            stderr_cid: self.stderr_cid,
+            output_root: self.output_root,
+            resources: &self.resources,
+            observed_at: self.observed_at,
+        })
+    }
+
+    pub fn sign(mut self, identity: &NodeIdentity) -> Result<Self, ExecutionReceiptError> {
+        let signer = identity.did().clone();
+        if self.attestor != signer {
+            return Err(ExecutionReceiptError::AttestorSignerMismatch {
+                attestor: self.attestor,
+                signer,
+            });
+        }
+        if self.attestor == self.executor {
+            return Err(ExecutionReceiptError::AttestorIsExecutor {
+                attestor: self.attestor,
+                executor: self.executor,
+            });
+        }
+
+        let payload = self.signing_payload()?;
+        self.signature = Some(identity.sign(&payload).to_bytes().to_vec());
+        Ok(self)
+    }
+
+    pub fn verify_signature(&self) -> Result<(), ExecutionReceiptError> {
+        if self.attestor == self.executor {
+            return Err(ExecutionReceiptError::AttestorIsExecutor {
+                attestor: self.attestor.clone(),
+                executor: self.executor.clone(),
+            });
+        }
+        let signature = self
+            .signature
+            .as_deref()
+            .ok_or(ExecutionReceiptError::MissingAttestationSignature)?;
+        let signature = Signature::from_slice(signature)
+            .map_err(|_| ExecutionReceiptError::InvalidSignatureBytes)?;
+        let key_bytes = parse_did(self.attestor.as_str())?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)?;
+        let payload = self.signing_payload()?;
+
+        NodeIdentity::verify(&verifying_key, &payload, &signature)
+            .map_err(|_| ExecutionReceiptError::SignatureVerificationFailed)
+    }
+
+    pub fn validate_against_receipt(
+        &self,
+        receipt: &ExecutionReceipt,
+    ) -> Result<(), ExecutionReceiptError> {
+        self.verify_signature()?;
+        if self.task_id != receipt.task_id
+            || self.executor != receipt.executor
+            || self.receipt_signature_hex != receipt_signature_hex(receipt)?
+            || self.stdout_cid != receipt.stdout_cid
+            || self.stderr_cid != receipt.stderr_cid
+            || self
+                .output_root
+                .is_some_and(|output_root| Some(output_root) != receipt.output_root)
+        {
+            return Err(ExecutionReceiptError::AttestationReceiptMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl ExecutionReceipt {
@@ -303,6 +452,12 @@ impl ExecutionReceipt {
 impl TaskResult {
     pub fn validate_receipt(&self) -> Result<(), ExecutionReceiptError> {
         let Some(receipt) = &self.receipt else {
+            if !self.attestations.is_empty() {
+                return Err(ExecutionReceiptError::AttestationRequiresReceipt);
+            }
+            if self.success && self.exit_code != 0 {
+                return Err(ExecutionReceiptError::SuccessExitCodeMismatch);
+            }
             return Ok(());
         };
 
@@ -321,9 +476,25 @@ impl TaskResult {
         if self.success && self.exit_code != 0 {
             return Err(ExecutionReceiptError::SuccessExitCodeMismatch);
         }
+        for attestation in &self.attestations {
+            attestation.validate_against_receipt(receipt)?;
+            if attestation.stdout_cid != Cid::hash_of(self.stdout.as_bytes())
+                || attestation.stderr_cid != Cid::hash_of(self.stderr.as_bytes())
+            {
+                return Err(ExecutionReceiptError::AttestationOutputMismatch);
+            }
+        }
 
         Ok(())
     }
+}
+
+fn receipt_signature_hex(receipt: &ExecutionReceipt) -> Result<String, ExecutionReceiptError> {
+    receipt
+        .signature
+        .as_deref()
+        .map(hex::encode)
+        .ok_or(ExecutionReceiptError::MissingSignature)
 }
 
 impl TaskSpec {
@@ -508,6 +679,19 @@ mod tests {
         Did::new(format!("did:key:{s}"))
     }
 
+    fn successful_output(stdout: &[u8], stderr: &[u8]) -> ProcessOutput {
+        ProcessOutput {
+            exit_code: 0,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            resources: ResourceUsage {
+                wall_time: Duration::from_millis(25),
+                process_count: 1,
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn task_lifecycle() {
         let publisher = did("publisher");
@@ -587,16 +771,7 @@ mod tests {
     #[test]
     fn execution_receipt_signs_process_output_cids() {
         let executor = NodeIdentity::generate();
-        let output = ProcessOutput {
-            exit_code: 0,
-            stdout: b"hello".to_vec(),
-            stderr: b"warning".to_vec(),
-            resources: ResourceUsage {
-                wall_time: Duration::from_millis(25),
-                process_count: 1,
-                ..Default::default()
-            },
-        };
+        let output = successful_output(b"hello", b"warning");
         let receipt = ExecutionReceipt::from_process_output(
             "task-1",
             executor.did().clone(),
@@ -625,8 +800,208 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(receipt)),
+            attestations: Vec::new(),
         };
         result.validate_receipt().unwrap();
+    }
+
+    #[test]
+    fn execution_attestation_cross_checks_receipt_output() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let output = successful_output(b"hello", b"");
+        let output_root = Cid::hash_of(b"workspace-root");
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["hello".into()],
+            &output,
+            Some(output_root),
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            Some(output_root),
+            12,
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        attestation.verify_signature().unwrap();
+        let result = TaskResult {
+            task_id: "task-1".into(),
+            executor: executor.did().clone(),
+            success: true,
+            exit_code: 0,
+            stdout: "hello".into(),
+            stderr: String::new(),
+            actual_cost: 1,
+            error: None,
+            receipt: Some(Box::new(receipt)),
+            attestations: vec![attestation],
+        };
+
+        result.validate_receipt().unwrap();
+    }
+
+    #[test]
+    fn execution_attestation_rejects_self_attestation() {
+        let executor = NodeIdentity::generate();
+        let output = successful_output(b"hello", b"");
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["hello".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+
+        let err = ExecutionAttestation::from_process_output(
+            &receipt,
+            executor.did().clone(),
+            &output,
+            None,
+            12,
+        )
+        .sign(&executor)
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExecutionReceiptError::AttestorIsExecutor { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_attestation_rejects_mismatched_receipt_or_result() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let output = successful_output(b"hello", b"");
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["hello".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+
+        let mut wrong_receipt_attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            12,
+        );
+        wrong_receipt_attestation.receipt_signature_hex = "bad-signature".into();
+        let wrong_receipt_attestation = wrong_receipt_attestation.sign(&attestor).unwrap();
+        let result = TaskResult {
+            task_id: "task-1".into(),
+            executor: executor.did().clone(),
+            success: true,
+            exit_code: 0,
+            stdout: "hello".into(),
+            stderr: String::new(),
+            actual_cost: 1,
+            error: None,
+            receipt: Some(Box::new(receipt.clone())),
+            attestations: vec![wrong_receipt_attestation],
+        };
+        assert!(matches!(
+            result.validate_receipt().unwrap_err(),
+            ExecutionReceiptError::AttestationReceiptMismatch
+        ));
+
+        let forged_output = successful_output(b"forged", b"");
+        let output_mismatch_attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &forged_output,
+            None,
+            13,
+        )
+        .sign(&attestor)
+        .unwrap();
+        let result = TaskResult {
+            task_id: "task-1".into(),
+            executor: executor.did().clone(),
+            success: true,
+            exit_code: 0,
+            stdout: "hello".into(),
+            stderr: String::new(),
+            actual_cost: 1,
+            error: None,
+            receipt: Some(Box::new(receipt)),
+            attestations: vec![output_mismatch_attestation],
+        };
+        assert!(matches!(
+            result.validate_receipt().unwrap_err(),
+            ExecutionReceiptError::AttestationReceiptMismatch
+        ));
+    }
+
+    #[test]
+    fn execution_attestation_requires_receipt() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let output = successful_output(b"hello", b"");
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["hello".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            12,
+        )
+        .sign(&attestor)
+        .unwrap();
+        let result = TaskResult {
+            task_id: "task-1".into(),
+            executor: executor.did().clone(),
+            success: true,
+            exit_code: 0,
+            stdout: "hello".into(),
+            stderr: String::new(),
+            actual_cost: 1,
+            error: None,
+            receipt: None,
+            attestations: vec![attestation],
+        };
+
+        assert!(matches!(
+            result.validate_receipt().unwrap_err(),
+            ExecutionReceiptError::AttestationRequiresReceipt
+        ));
     }
 
     #[test]
@@ -669,6 +1044,7 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(receipt.clone())),
+            attestations: Vec::new(),
         };
         assert!(matches!(
             mismatched.validate_receipt().unwrap_err(),
@@ -685,6 +1061,7 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(receipt.clone())),
+            attestations: Vec::new(),
         };
         assert!(matches!(
             output_mismatched.validate_receipt().unwrap_err(),
@@ -720,6 +1097,7 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(failed_receipt)),
+            attestations: Vec::new(),
         };
         assert!(matches!(
             inconsistent_success.validate_receipt().unwrap_err(),
