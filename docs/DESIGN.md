@@ -30,12 +30,14 @@
 
 这个框架的目标不是把 AI 关进一个受限沙箱，而是给 AI 一个可迁移、可同步、可加入、可建立关系的运行空间。Workspace 等价于 AI 的电脑；社会层记录 AI 之间的关系、协作、信誉、集体和经济往来。未来大量 AI 可以以这种状态运行，逐步形成广义 AI 社会。
 
+> **实现状态说明**：本文档同时描述当前实现和目标架构。每个主要章节用"已实现 / 部分实现 / 规划中"标注边界；未落地能力会引用 [`IMPROVEMENT-PLAN.md`](./IMPROVEMENT-PLAN.md) 中的任务编号。没有标注为已实现的协议、算法或部署形态应按愿景或设计约束理解，而不是当前可用能力。
+
 ### 核心原则
 
 | 原则 | 含义 |
 |---|---|
 | **本地优先 (Local-first)** | Agent 在自己的节点上始终可用，离线也能工作 |
-| **最终一致 (Eventually consistent)** | 通过 CRDT 同步状态，不追求全局强一致性 |
+| **最终一致 (Eventually consistent)** | 当前通过签名社会日志和 Merkle 快照收敛；完整 CRDT 或显式分叉/合并策略见 `D1` |
 | **自主权身份 (Self-sovereign identity)** | 节点身份由密钥对派生，不存在中心注册 |
 | **最大自由度 (Maximal agency)** | Workspace 默认是自由原生电脑，不做本地沙箱或权限阻断 |
 | **社会关系 (Social graph)** | AI 通过关系、信誉、集体、记忆和经济往来形成社会结构 |
@@ -52,6 +54,8 @@
 
 ## 2. 系统模型
 
+> **实现状态**：部分实现。当前实现已经有节点身份、workspace 目录、Merkle 快照、自由原生执行和社会事件记忆；完整 CRDT 文件系统和多节点自动合并仍是目标态，分别由 `D1` 和后续运行时/Agent SDK 工作收口。
+
 ### 2.1 顶层抽象
 
 ```
@@ -61,9 +65,9 @@
 │  │          Workspace "X"            │    │
 │  │  ┌─────────┐  ┌─────────┐        │    │
 │  │  │ Agent A  │  │ Agent B  │  ...   │    │
-│  │  │ (WASM)   │  │ (WASM)   │        │    │
+│  │  │ native   │  │ native   │        │    │
 │  │  └─────────┘  └─────────┘        │    │
-│  │      共享文件系统 (CRDT + DAG)      │    │
+│  │      共享文件系统 (snapshot + DAG)   │    │
 │  └──────────────────────────────────┘    │
 │  ┌──────────────────────────────────┐    │
 │  │          Workspace "Y"            │    │
@@ -89,6 +93,8 @@
 ---
 
 ## 3. 分层架构
+
+> **实现状态**：部分实现。已落地的主干是身份/DID、内容寻址存储、workspace 快照、原生执行、libp2p QUIC/Kademlia/Gossipsub/Request-Response、签名社会事件、任务/治理/信誉/settlement 记录。规划中能力包括操作型 CRDT 或显式分叉模型（`D1`）、所有权真值层（`D2`/`I4`）、可选隔离（`S1`/`S2`）、机密社会层（`S3`）和协议版本协商（`N7`）。
 
 ```
 ┌───────────────────────────────────────────────────┐
@@ -118,6 +124,8 @@
 
 ## 4. Layer 1: P2P 网络层
 
+> **实现状态**：部分实现。当前网络层已经支持 QUIC、Kademlia、mDNS、Gossipsub、Request/Response、Identify、workspace announcement、社会事件传播、clone/sync 和 peer cache。WebRTC、AutoNAT、DCUtR、relay、严格 gossipsub peer scoring、Kademlia eclipse 加固和协议版本协商仍在规划中，见 `N1`、`N2`、`N3`、`N7`。
+
 ### 4.1 技术选型
 
 基于 [`rust-libp2p`](https://github.com/libp2p/rust-libp2p)，组合以下 behaviour：
@@ -125,12 +133,12 @@
 | Behaviour | 用途 | crate |
 |---|---|---|
 | **QUIC** | 主要传输层，低延迟、多路复用、内置 TLS 1.3 | `libp2p-quic` |
-| **WebRTC** | 浏览器穿透 + NAT 后备 | `libp2p-webrtc` |
+| **WebRTC** | 浏览器穿透 + NAT 后备（规划中，见 `N1`） | `libp2p-webrtc` |
 | **Kademlia** | 节点发现与 DHT 路由 | `libp2p-kad` |
 | **Gossipsub** | 消息广播（workspace 公告、AI 社会事件、任务发布） | `libp2p-gossipsub` |
 | **Request/Response** | 点对点 RPC（文件拉取、权能验证） | `libp2p-request-response` |
-| **AutoNAT + DCUtR** | NAT 类型探测 + 中继打洞 | `libp2p-autonat` / `libp2p-dcutr` |
-| **Relay** | 为 NAT 后节点提供中继 | `libp2p-relay` |
+| **AutoNAT + DCUtR** | NAT 类型探测 + 中继打洞（规划中，见 `N1`） | `libp2p-autonat` / `libp2p-dcutr` |
+| **Relay** | 为 NAT 后节点提供中继（规划中，见 `N1`） | `libp2p-relay` |
 
 ### 4.1.1 全球发现
 
@@ -200,6 +208,8 @@ pub enum NetworkEvent {
 
 ## 5. Layer 2: 身份与认证
 
+> **实现状态**：部分实现。已实现 `did:key`/Ed25519 身份、加密静态身份文件、签名事件、capability 验签、吊销、委托链和社会层 capability 视图。密钥轮换、社会恢复、统一签名序列化/domain separation 仍在规划中，见 `K2`、`K3`、`A2`。
+
 ### 5.1 节点身份
 
 ```rust
@@ -257,7 +267,7 @@ bitflags::bitflags! {
     pub struct PermissionSet: u16 {
         const READ    = 0b00001;  // 读取文件
         const WRITE   = 0b00010;  // 写入文件
-        const EXEC    = 0b00100;  // 执行 WASM 模块
+        const EXEC    = 0b00100;  // 执行原生命令、脚本或未来模块
         const INSTALL = 0b01000;  // 安装新模块
         const ADMIN   = 0b10000;  // 管理权限（邀请/踢出/销毁）
         // 常用组合
@@ -319,6 +329,8 @@ impl TrustGraph {
 
 ## 6. Layer 3: 状态与同步
 
+> **实现状态**：部分实现。当前实现使用 Merkle-DAG 快照、内容寻址校验、chunked blob、state/block request-response、clone 物化和 discovery registry；§6.2 描述的操作型 CRDT、RGA op-log 与 Lamport 合并尚未落地。并发写策略将在 `D1` 中决策为真正 CRDT 或"快照 + 显式分叉/合并"。
+
 ### 6.1 内容寻址存储 (Merkle-DAG)
 
 所有内容通过哈希寻址。一个内容块的结构：
@@ -358,11 +370,13 @@ pub struct Snapshot {
 }
 ```
 
-**为什么是 DAG 而不是链**：多个节点可能同时从同一个快照 fork，产生分支。分支通过 CRDT 合并，因此版本历史自然形成 DAG。
+**为什么是 DAG 而不是链**：多个节点可能同时从同一个快照 fork，产生分支。当前实现会保留可验证快照 root；分支如何收敛或显式合并由 `D1` 决策。
 
 内容地址不只在网络接收时校验。磁盘 block store 读取 `<cid>.cbor` 后也会重新计算 Merkle node CID，只有实际内容等于请求 CID 才返回；`has(cid)` 也表示“已验证存在”，而不是只检查路径。大文件不会被塞进一个超大 blob；snapshot 会把超过 4 MiB 的文件拆成普通 blob chunks，再用 `chunked_blob` 文件节点记录有序 chunk CID 和总大小。这样同步递归遇到损坏或错误内容时不会误判为本地已有 block，后续 `put` 同一个正确 node 会重写修复该 block，本地缓存损坏不会悄悄污染 workspace restore 或后续同步。
 
 ### 6.2 CRDT 文件系统
+
+> **实现状态**：规划中。当前同步以快照 root 和 Merkle blocks 为单位，没有传播或合并 CRDT Op。这里的 RGA/Op 结构是目标设计，落地路径见 `D1`。
 
 基于操作型 CRDT（非状态型），每个文件操作被记录为一个签名事件：
 
@@ -431,12 +445,12 @@ impl SyncProtocol {
     /// 发现新 head 后，拉取缺失的块
     pub fn fetch_missing(&self, remote_head: Cid) -> Vec<Cid>;
 
-    /// Bitswap 风格：向多个 peer 请求缺失块
+    /// Bitswap 风格的目标接口；当前实现用 request/response 拉取 Merkle blocks。
     pub fn bitswap_request(&self, wantlist: Vec<Cid>) -> HashMap<Cid, PeerId>;
 }
 ```
 
-同步流程：
+目标态同步流程：
 
 ```
 1. Alice 修改了文件 → 产生新 Op → 更新本地 head
@@ -447,9 +461,13 @@ impl SyncProtocol {
 6. Bob 应用 Op → CRDT 合并 → 更新自己的 head
 ```
 
+当前实现的 live 路径是 `StateRequest` 取得 workspace root，再用 `BlockRequest` 递归拉取 Merkle blocks，最后物化本地文件树；不会自动应用 CRDT Op。
+
 ---
 
 ## 7. Layer 4: Workspace 运行时
+
+> **实现状态**：部分实现。已实现自由原生命令执行、stdout/stderr 证据 CID、资源计量、失败运行记录、快照和 workspace 成员持久化。可选隔离档位、默认外来代码隔离、cwd/env 边界和 secret 隔离仍在规划中，见 `S1`、`S2`；机密/选择性披露见 `S3`。
 
 ### 7.1 Workspace 结构
 
@@ -461,7 +479,7 @@ pub struct Workspace {
     pub owner: PeerId,
     /// 当前加入的 Agent。成员身份是社会存在记录，不是本地权限闸门。
     pub members: HashMap<PeerId, MemberProfile>,
-    /// 文件系统（CRDT + DAG 存储）
+    /// 文件系统（当前为 snapshot + DAG 存储；CRDT 见 D1）
     pub fs: CrdtFilesystem,
     /// 原生进程运行时：像一台真实电脑一样运行程序
     pub runtime: NativeRuntime,
@@ -552,6 +570,8 @@ pub struct Collective {
 ---
 
 ## 8. Layer 5: Agent SDK
+
+> **实现状态**：部分实现。已实现 manifest、intent、task、accept/cancel/complete/dispute、collective governance、capability grant/revocation/delegation、workspace presence/snapshot/run、社会日志、推荐视图和 CLI 事件写入。仍待完成的是更清晰的真值层级、真实协议版本演进、签名序列化统一和社会日志 checkpoint，见 `I4`、`N7`、`A2`、`N5`。
 
 ### 8.1 Agent Manifest
 
@@ -974,8 +994,8 @@ pub struct ExecutionReceipt {
    → B 接受或拒绝
 
 4. 执行
-   B 在 workspace 中加载相关 WASM 模块
-   → 执行任务（gas 计量）
+   B 在 workspace 中运行原生命令
+   → 记录 wall time、CPU、内存、IO 等可用资源证据
    → 产出 ExecutionReceipt
 
 5. 结算
@@ -994,6 +1014,8 @@ pub struct ExecutionReceipt {
 
 ## 9. 经济子系统
 
+> **实现状态**：部分实现。当前实现把经济事实作为可验证社会记录：settlement proof、counterparty 签名校验、执行回执、N-of-M 重执行证据、自报/可验证计量区分和信誉加权已经存在。完整双边信用账本作为本地拒绝闸门、多跳支付路由和高强度真值锚仍不是默认行为；信用账本语义见 ADR-0003，后续真值层和可验证执行深化见 `I4`、`E3`。
+
 ### 9.1 模型选择：双边信用 + 信誉
 
 选择 **Mutual Credit（双边信用）** 作为主要结算机制，不做链上代币。
@@ -1005,6 +1027,8 @@ pub struct ExecutionReceipt {
 - 退化兼容（单节点运行时零开销）
 
 ### 9.2 双边信用账本
+
+> **实现状态**：规划/库能力。结算事件可以记录 mutual-credit proof 并验真对手方签名；这里展示的额度闸门和多跳 `route_payment` 是目标模型，不是当前 live 路径的默认拒绝机制。
 
 ```rust
 /// 每个节点维护的信用账本
@@ -1113,7 +1137,7 @@ impl ReputationScore {
 /// 每个节点对自己的资源定价（向外报价）
 #[derive(Serialize, Deserialize)]
 pub struct ResourcePricing {
-    /// 每百万 gas 的价格（信用单位）
+    /// 历史 gas-oriented 价格模型；当前 live 计量以 wall time/资源证据为准。
     pub compute_per_mega_gas: f64,
     /// 存储每 MB/小时
     pub storage_per_mb_hour: f64,
@@ -1129,6 +1153,8 @@ pub struct ResourcePricing {
 ---
 
 ## 10. 社会治理与风险模型
+
+> **实现状态**：部分实现。已实现 append-only 社会日志、每作者哈希链、equivocation proof、对抗性测试、治理裁决、争议和 reputation 降权。尚未完成的风险控制包括被见证真值层、执行隔离、secret 边界、私有社会事件、网络 spam/eclipsing 加固和日志 checkpoint，见 `I4`、`S1`、`S2`、`S3`、`N2`、`N3`、`N5`。
 
 ### 10.1 风险模型
 
@@ -1171,6 +1197,8 @@ Agent 发布 Manifest（能力、目标、价值、偏好）
 ---
 
 ## 11. 数据流与协议
+
+> **实现状态**：混合。workspace clone/sync、社会事件同步、任务市场事件、执行回执和 settlement 记录已经有 CLI 与本地 replay 路径。图中的 TaskRequest/TaskResponse 直连 RPC、Join Credential 点对点协商、Bitswap 命名协议、CRDT 并发合并和多跳支付确认是目标态表达，当前分别由签名社会事件、request/response Merkle block 拉取和社会记录式结算替代。
 
 ### 11.1 场景：Agent 协作执行任务
 
@@ -1225,6 +1253,8 @@ Bob 编辑:       "Hello!"          (Op: Insert(pos=5, "!"))
 ---
 
 ## 12. 实现路线图
+
+> **实现状态**：历史愿景。下面路线图保留为架构方向和分层目标，不是当前进度表。当前可执行的真实计划以 [`IMPROVEMENT-PLAN.md`](./IMPROVEMENT-PLAN.md) 为准；本节中 CRDT、WASM/gas、支付路由、WebRTC/NAT 和生产加固相关条目需要按 `D1`、`E3`、`N1`、`N2`、`N7` 等任务逐步收口。
 
 ```
 Phase 1: 单机原型 (6 周)
@@ -1416,11 +1446,13 @@ criterion = "0.5"      # 性能基准测试
 
 ## 13. 术语表
 
+> **实现状态**：术语混合。术语表包含当前实现术语和目标架构术语；`CRDT`、`RGA`、`Gas`、`Bitswap` 在当前实现中不是完整 live 协议能力。
+
 | 术语 | 英文 | 定义 |
 |---|---|---|
 | 节点 | Node | 一个运行 Aether 的进程实例，拥有独立身份 |
 | 工作空间 | Workspace | 隔离的执行环境（文件系统 + 运行时 + 成员） |
-| 智能体 | Agent | 在 workspace 中运行的 WASM 模块实例 |
+| 智能体 | Agent | 在 workspace 中运行的原生程序、脚本、服务或未来模块实例 |
 | 权能令牌 | Capability | 签名的权限凭证，授权对 workspace 的操作 |
 | 内容标识符 | CID | 通过哈希内容得到的全局唯一标识 |
 | 对等节点标识符 | PeerId | 节点的网络身份，由公钥哈希派生 |
@@ -1428,7 +1460,7 @@ criterion = "0.5"      # 性能基准测试
 | 默克尔有向无环图 | Merkle-DAG | 内容寻址的有向无环图存储结构 |
 | 无冲突复制数据类型 | CRDT | 多节点并发修改自动合并的数据结构 |
 | 可复制增长数组 | RGA | CRDT 的一种，用于文本协同编辑 |
-| Gas | Gas | 计算资源的计量单位，1 gas ≈ 1 WASM 指令 |
+| Gas | Gas | 历史目标态的计算资源单位；当前实现不以 WASM 指令计费 |
 | 双边信用 | Mutual Credit | 两节点间直接记录的双边债务关系 |
 | 信任图 | Trust Graph | 节点间信任关系和额度的有向图 |
 | 女巫攻击 | Sybil Attack | 通过创建大量假身份来操纵信誉系统 |
