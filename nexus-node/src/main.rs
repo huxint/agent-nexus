@@ -38,7 +38,7 @@ use nexus_agent::{
     IdentityRevocation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
     IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
     SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -67,6 +67,29 @@ use state::write_file_atomic;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE: usize = 256;
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn strict_social_event_validator(data: &[u8]) -> libp2p::gossipsub::MessageAcceptance {
+    if data.len() > MAX_SOCIAL_EVENT_JSON_BYTES {
+        return libp2p::gossipsub::MessageAcceptance::Reject;
+    }
+
+    match SocialEvent::from_json(data) {
+        Ok(event) if event.validate().is_ok() => libp2p::gossipsub::MessageAcceptance::Accept,
+        _ => libp2p::gossipsub::MessageAcceptance::Reject,
+    }
+}
+
+fn network_config(
+    listen_addr: libp2p::Multiaddr,
+    bootstrap_peers: Vec<libp2p::Multiaddr>,
+) -> NetworkConfig {
+    NetworkConfig {
+        listen_addr,
+        bootstrap_peers,
+        social_event_validator: Arc::new(strict_social_event_validator),
+        ..Default::default()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -325,11 +348,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if peer.is_none() && online {
         let online_network = Network::new(
             &identity,
-            NetworkConfig {
-                listen_addr: listen.parse()?,
-                bootstrap_peers: bootstrap.clone(),
-                ..Default::default()
-            },
+            network_config(listen.parse()?, bootstrap.clone()),
         )
         .await?;
         refresh_online_discovery(
@@ -360,17 +379,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let network = match network {
         Some(network) => network,
-        None => {
-            Network::new(
-                &identity,
-                NetworkConfig {
-                    listen_addr: listen.parse()?,
-                    bootstrap_peers: bootstrap,
-                    ..Default::default()
-                },
-            )
-            .await?
-        }
+        None => Network::new(&identity, network_config(listen.parse()?, bootstrap)).await?,
     };
 
     if !peer_ready {
@@ -739,15 +748,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let memory_path = base.join(".nexus-social-memory.json");
     let mut social_memory = load_social_memory(&memory_path)?;
 
-    let network = Network::new(
-        &id,
-        NetworkConfig {
-            listen_addr: listen.parse()?,
-            bootstrap_peers: bootstrap,
-            ..Default::default()
-        },
-    )
-    .await?;
+    let network = Network::new(&id, network_config(listen.parse()?, bootstrap)).await?;
 
     let network_arc = Arc::new(network.clone());
     let mut server = WorkspaceServer::new(network_arc);
@@ -1154,15 +1155,7 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if online {
         let identity = load_or_create_identity(&base)?;
-        let network = Network::new(
-            &identity,
-            NetworkConfig {
-                listen_addr: listen.parse()?,
-                bootstrap_peers: bootstrap,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let network = Network::new(&identity, network_config(listen.parse()?, bootstrap)).await?;
         let workspace_filter = filter
             .workspace
             .as_deref()
@@ -4199,6 +4192,35 @@ mod tests {
         let addr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{peer}");
         let parsed = addr.parse().unwrap();
         (addr, parsed)
+    }
+
+    #[test]
+    fn social_event_validator_accepts_valid_and_rejects_invalid_messages() {
+        let identity = NodeIdentity::generate();
+        let event = signed_workspace_event(&identity, 7, 1);
+        let data = event.to_json().unwrap();
+        assert!(matches!(
+            strict_social_event_validator(&data),
+            libp2p::gossipsub::MessageAcceptance::Accept
+        ));
+
+        let mut tampered = event.clone();
+        tampered.timestamp += 1;
+        assert!(matches!(
+            strict_social_event_validator(&tampered.to_json().unwrap()),
+            libp2p::gossipsub::MessageAcceptance::Reject
+        ));
+
+        assert!(matches!(
+            strict_social_event_validator(b"not json"),
+            libp2p::gossipsub::MessageAcceptance::Reject
+        ));
+
+        let oversized = vec![b' '; nexus_agent::MAX_SOCIAL_EVENT_JSON_BYTES + 1];
+        assert!(matches!(
+            strict_social_event_validator(&oversized),
+            libp2p::gossipsub::MessageAcceptance::Reject
+        ));
     }
 
     #[tokio::test]

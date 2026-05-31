@@ -17,7 +17,7 @@ pub mod task;
 pub use event_log::SocialEventLog;
 pub use manifest::{AgentManifest, CapabilityDecl};
 pub use market::TaskMarket;
-pub use memory::SocialMemory;
+pub use memory::{SocialMemory, MAX_SOCIAL_EVENT_JSON_BYTES};
 pub use nexus_economy::ReputationScore;
 pub use protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
 pub use registry::AgentRegistry;
