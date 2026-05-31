@@ -11,6 +11,9 @@ use crate::protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::Society;
 use nexus_crypto::NodeIdentity;
 
+/// Maximum accepted JSON size for one social event.
+pub const MAX_SOCIAL_EVENT_JSON_BYTES: usize = 256 * 1024;
+
 /// A node's verified social event log plus its replayed society view.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SocialMemory {
@@ -135,6 +138,7 @@ impl SocialMemory {
         let results = events_json
             .into_iter()
             .map(|data| {
+                reject_oversized_event_json(data)?;
                 let event =
                     SocialEvent::from_json(data).map_err(SocialProtocolError::EventDecode)?;
                 let inserted = self.log.append(event)?;
@@ -150,9 +154,20 @@ impl SocialMemory {
 
     /// Decode a social event from JSON bytes and ingest it.
     pub fn ingest_json(&mut self, data: &[u8]) -> Result<bool, SocialProtocolError> {
+        reject_oversized_event_json(data)?;
         let event = SocialEvent::from_json(data).map_err(SocialProtocolError::EventDecode)?;
         self.ingest_event(event)
     }
+}
+
+fn reject_oversized_event_json(data: &[u8]) -> Result<(), SocialProtocolError> {
+    if data.len() > MAX_SOCIAL_EVENT_JSON_BYTES {
+        return Err(SocialProtocolError::EventTooLarge {
+            actual: data.len(),
+            max: MAX_SOCIAL_EVENT_JSON_BYTES,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -210,6 +225,30 @@ mod tests {
 
         let err = memory.ingest_json(b"not-json").unwrap_err();
         assert!(matches!(err, SocialProtocolError::EventDecode(_)));
+    }
+
+    #[test]
+    fn memory_rejects_oversized_event_bytes_before_decode() {
+        let mut memory = SocialMemory::new();
+        let oversized = vec![b' '; MAX_SOCIAL_EVENT_JSON_BYTES + 1];
+
+        let err = memory.ingest_json(&oversized).unwrap_err();
+        assert!(matches!(
+            err,
+            SocialProtocolError::EventTooLarge {
+                actual,
+                max: MAX_SOCIAL_EVENT_JSON_BYTES
+            } if actual == MAX_SOCIAL_EVENT_JSON_BYTES + 1
+        ));
+        assert_eq!(memory.event_count(), 0);
+
+        let results = memory.ingest_json_batch([oversized.as_slice()]);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0].as_ref().unwrap_err(),
+            SocialProtocolError::EventTooLarge { .. }
+        ));
+        assert_eq!(memory.event_count(), 0);
     }
 
     #[test]
