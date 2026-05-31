@@ -1,14 +1,25 @@
 //! Process executor — spawns native processes in a workspace directory.
 //!
-//! No sandboxing, no restrictions.  The executor tracks resource usage
-//! for billing but does not enforce limits.
+//! No sandboxing, no restrictions.  The executor records OS-observed resource
+//! usage for billing and auditability but does not enforce limits.
 
+#[cfg(unix)]
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::ExitStatus;
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(unix))]
 use tokio::process::Command;
+#[cfg(unix)]
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 use crate::resources::ResourceUsage;
@@ -128,9 +139,147 @@ impl Executor {
 
     /// Run a command and capture all output.
     ///
-    /// Uses `tokio::process::Command` and drains output pipes concurrently.
+    /// Spawns a native command and drains output pipes concurrently.
     /// For complex commands (pipes, redirects), pass `["sh", "-c", "<cmd>"]`.
     pub async fn exec(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &ExecOptions,
+    ) -> Result<ProcessOutput, ExecError> {
+        #[cfg(unix)]
+        {
+            return self.exec_unix(program, args, options).await;
+        }
+
+        #[cfg(not(unix))]
+        {
+            return self.exec_fallback(program, args, options).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn exec_unix(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &ExecOptions,
+    ) -> Result<ProcessOutput, ExecError> {
+        let working_dir = self.resolve_working_dir(options.working_dir.as_deref());
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        cmd.current_dir(&working_dir);
+        configure_child_process_group(&mut cmd);
+
+        for (key, value) in &options.env {
+            cmd.env(key, value);
+        }
+
+        if options.stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+
+        cmd.stdout(if options.capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
+        cmd.stderr(if options.capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
+
+        let wall_start = Instant::now();
+
+        let mut child = cmd.spawn().map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => ExecError::CommandNotFound(program.to_string()),
+            _ => ExecError::Io(err),
+        })?;
+
+        let mut process = UnixProcess::new(child.id(), wall_start);
+        let mut child_stdin = match child.stdin.take().map(ChildStdin::from_std).transpose() {
+            Ok(stdin) => stdin,
+            Err(err) => {
+                process.terminate_and_finish().await;
+                return Err(ExecError::Io(err));
+            }
+        };
+        let stdout_reader = if options.capture_stdout {
+            match child.stdout.take().map(ChildStdout::from_std).transpose() {
+                Ok(stdout) => {
+                    stdout.map(|reader| spawn_output_reader(reader, options.max_stdout_bytes))
+                }
+                Err(err) => {
+                    process.terminate_and_finish().await;
+                    return Err(ExecError::Io(err));
+                }
+            }
+        } else {
+            None
+        };
+        let stderr_reader = if options.capture_stderr {
+            match child.stderr.take().map(ChildStderr::from_std).transpose() {
+                Ok(stderr) => {
+                    stderr.map(|reader| spawn_output_reader(reader, options.max_stderr_bytes))
+                }
+                Err(err) => {
+                    process.terminate_and_finish().await;
+                    return Err(ExecError::Io(err));
+                }
+            }
+        } else {
+            None
+        };
+        drop(child);
+
+        if let Some(ref stdin_data) = options.stdin {
+            if let Some(mut stdin) = child_stdin.take() {
+                if let Err(err) = stdin.write_all(stdin_data).await {
+                    process.terminate_and_finish().await;
+                    return Err(ExecError::Io(err));
+                }
+                if let Err(err) = stdin.shutdown().await {
+                    process.terminate_and_finish().await;
+                    return Err(ExecError::Io(err));
+                }
+            }
+        }
+
+        let exit = if let Some(timeout) = options.timeout {
+            match tokio::time::timeout(timeout, process.wait_exit()).await {
+                Ok(exit) => exit?,
+                Err(_) => {
+                    let exit = process.terminate().await?;
+                    let resources = process.finish_metering(exit).await.resources;
+                    return Err(ExecError::Timeout {
+                        duration: timeout,
+                        stdout: collect_partial_output(stdout_reader).await?,
+                        stderr: collect_partial_output(stderr_reader).await?,
+                        resources,
+                    });
+                }
+            }
+        } else {
+            process.wait_exit().await?
+        };
+
+        let exit = process.finish_metering(exit).await;
+        let exit_code = exit.status.code().unwrap_or(-1);
+
+        Ok(ProcessOutput {
+            exit_code,
+            stdout: collect_output(stdout_reader).await?,
+            stderr: collect_output(stderr_reader).await?,
+            resources: exit.resources,
+        })
+    }
+
+    #[cfg(not(unix))]
+    async fn exec_fallback(
         &self,
         program: &str,
         args: &[&str],
@@ -223,8 +372,6 @@ impl Executor {
 
         let exit_code = status.code().unwrap_or(-1);
 
-        // Approximate resource usage from /proc if available (Linux-only)
-        // For now, we just track wall time.
         let resources = ResourceUsage {
             wall_time,
             process_count: 1,
@@ -282,8 +429,306 @@ where
     OutputReader { buffer, task }
 }
 
-fn configure_child_process_group(cmd: &mut Command) {
-    #[cfg(unix)]
+#[cfg(unix)]
+struct MeteredExit {
+    status: ExitStatus,
+    resources: ResourceUsage,
+}
+
+#[cfg(unix)]
+struct UnixProcess {
+    pid: u32,
+    wait_task: tokio::task::JoinHandle<std::io::Result<MeteredExit>>,
+    sampler: ProcessGroupSampler,
+}
+
+#[cfg(unix)]
+impl UnixProcess {
+    fn new(pid: u32, wall_start: Instant) -> Self {
+        let wait_task = tokio::task::spawn_blocking(move || wait4_child(pid, wall_start));
+        Self {
+            pid,
+            wait_task,
+            sampler: ProcessGroupSampler::start(pid),
+        }
+    }
+
+    async fn wait_exit(&mut self) -> Result<MeteredExit, ExecError> {
+        (&mut self.wait_task)
+            .await
+            .map_err(|err| ExecError::Other(format!("process wait task failed: {err}")))?
+            .map_err(ExecError::Io)
+    }
+
+    async fn terminate(&mut self) -> Result<MeteredExit, ExecError> {
+        if !self.wait_task.is_finished() {
+            unsafe {
+                libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        self.wait_exit().await
+    }
+
+    async fn terminate_and_finish(&mut self) {
+        match self.terminate().await {
+            Ok(exit) => {
+                let _ = self.finish_metering(exit).await;
+            }
+            Err(_) => {
+                self.sampler.finish().await;
+            }
+        }
+    }
+
+    async fn finish_metering(&mut self, mut exit: MeteredExit) -> MeteredExit {
+        let observed = self.sampler.finish().await;
+        exit.resources.process_count = observed.process_count;
+        exit.resources.fs_read_bytes = observed.fs_read_bytes;
+        exit.resources.fs_write_bytes = observed.fs_write_bytes;
+        exit
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcess {
+    fn drop(&mut self) {
+        if !self.wait_task.is_finished() {
+            unsafe {
+                libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait4_child(pid: u32, wall_start: Instant) -> std::io::Result<MeteredExit> {
+    loop {
+        let mut status = 0;
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let waited = unsafe { libc::wait4(pid as libc::pid_t, &mut status, 0, usage.as_mut_ptr()) };
+        if waited == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+
+        let usage = unsafe { usage.assume_init() };
+        return Ok(MeteredExit {
+            status: ExitStatus::from_raw(status),
+            resources: resource_usage_from_rusage(wall_start.elapsed(), &usage),
+        });
+    }
+}
+
+#[cfg(unix)]
+fn resource_usage_from_rusage(wall_time: Duration, usage: &libc::rusage) -> ResourceUsage {
+    ResourceUsage {
+        wall_time,
+        cpu_user: timeval_to_duration(usage.ru_utime),
+        cpu_kernel: timeval_to_duration(usage.ru_stime),
+        peak_memory: peak_memory_bytes(usage.ru_maxrss),
+        fs_read_bytes: 0,
+        fs_write_bytes: 0,
+        process_count: 1,
+    }
+}
+
+#[cfg(unix)]
+fn timeval_to_duration(value: libc::timeval) -> Duration {
+    let secs = value.tv_sec.max(0) as u64;
+    let micros = value.tv_usec.max(0) as u32;
+    Duration::new(secs, micros.saturating_mul(1_000))
+}
+
+#[cfg(unix)]
+#[cfg(all(unix, target_os = "linux"))]
+fn peak_memory_bytes(kib: libc::c_long) -> Option<u64> {
+    (kib > 0).then_some((kib as u64).saturating_mul(1024))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peak_memory_bytes(bytes: libc::c_long) -> Option<u64> {
+    (bytes > 0).then_some(bytes as u64)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct ProcessGroupObservation {
+    process_count: u64,
+    fs_read_bytes: u64,
+    fs_write_bytes: u64,
+}
+
+#[cfg(unix)]
+impl Default for ProcessGroupObservation {
+    fn default() -> Self {
+        Self {
+            process_count: 1,
+            fs_read_bytes: 0,
+            fs_write_bytes: 0,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ProcessGroupObservation {
+    fn add_io(&mut self, io: ProcessIoSample) {
+        self.fs_read_bytes = self.fs_read_bytes.saturating_add(io.read_bytes);
+        self.fs_write_bytes = self.fs_write_bytes.saturating_add(io.write_bytes);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessIoSample {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct ProcessGroupSampler {
+    stop: Arc<AtomicBool>,
+    seen: Arc<StdMutex<std::collections::HashMap<u32, ProcessIoSample>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessGroupSampler {
+    fn start(pgid: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(StdMutex::new(std::collections::HashMap::from([(
+            pgid,
+            ProcessIoSample::default(),
+        )])));
+        let task_stop = Arc::clone(&stop);
+        let task_seen = Arc::clone(&seen);
+        let task = tokio::task::spawn_blocking(move || {
+            while !task_stop.load(Ordering::Relaxed) {
+                record_process_group_members(pgid, &task_seen);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            record_process_group_members(pgid, &task_seen);
+        });
+        Self { stop, seen, task }
+    }
+
+    async fn finish(&mut self) -> ProcessGroupObservation {
+        self.stop.store(true, Ordering::Relaxed);
+        let task = std::mem::replace(&mut self.task, tokio::task::spawn_blocking(|| {}));
+        let _ = task.await;
+        match self.seen.lock() {
+            Ok(seen) => {
+                let mut observation = ProcessGroupObservation {
+                    process_count: seen.len().max(1) as u64,
+                    ..Default::default()
+                };
+                for io in seen.values().copied() {
+                    observation.add_io(io);
+                }
+                observation
+            }
+            Err(_) => ProcessGroupObservation::default(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProcessGroupSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_process_group_members(
+    pgid: u32,
+    seen: &StdMutex<std::collections::HashMap<u32, ProcessIoSample>>,
+) {
+    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in proc_entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if process_stat_group(&stat) == Some(pgid) {
+            if let Ok(mut seen) = seen.lock() {
+                let io = process_io_sample(&entry.path().join("io")).unwrap_or_default();
+                seen.entry(pid)
+                    .and_modify(|sample| sample.merge(io))
+                    .or_insert(io);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessIoSample {
+    fn merge(&mut self, other: Self) {
+        self.read_bytes = self.read_bytes.max(other.read_bytes);
+        self.write_bytes = self.write_bytes.max(other.write_bytes);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_io_sample(path: &Path) -> Option<ProcessIoSample> {
+    process_io_sample_from_str(&std::fs::read_to_string(path).ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn process_io_sample_from_str(io: &str) -> Option<ProcessIoSample> {
+    let mut sample = ProcessIoSample::default();
+    let mut saw_field = false;
+    for line in io.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().parse::<u64>().ok()?;
+        match key {
+            "read_bytes" => {
+                sample.read_bytes = value;
+                saw_field = true;
+            }
+            "write_bytes" => {
+                sample.write_bytes = value;
+                saw_field = true;
+            }
+            _ => {}
+        }
+    }
+    saw_field.then_some(sample)
+}
+
+#[cfg(target_os = "linux")]
+fn process_stat_group(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut fields = after_comm.split_whitespace();
+    fields.next()?;
+    fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+struct ProcessGroupSampler;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl ProcessGroupSampler {
+    fn start(_pgid: u32) -> Self {
+        Self
+    }
+
+    async fn finish(&mut self) -> ProcessGroupObservation {
+        ProcessGroupObservation::default()
+    }
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut std::process::Command) {
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -294,16 +739,13 @@ fn configure_child_process_group(cmd: &mut Command) {
     }
 }
 
-async fn terminate_child_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-        let _ = child.wait().await;
-        return;
-    }
+#[cfg(not(unix))]
+fn configure_child_process_group(cmd: &mut Command) {
+    let _ = cmd;
+}
 
+#[cfg(not(unix))]
+async fn terminate_child_tree(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
@@ -568,5 +1010,64 @@ mod tests {
 
         assert!(result.resources.wall_time.as_millis() >= 50);
         assert_eq!(result.resources.process_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resources_include_os_observed_usage() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions::default();
+
+        let result = executor
+            .exec(
+                "sh",
+                &[
+                    "-c",
+                    "dd if=/dev/zero of=usage.bin bs=1024 count=32 >/dev/null 2>&1",
+                ],
+                &opts,
+            )
+            .await
+            .expect("dd must succeed");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.resources.cpu_user + result.resources.cpu_kernel > Duration::ZERO,
+            "expected wait4 to report non-zero cpu time"
+        );
+        assert!(
+            result.resources.peak_memory.is_some(),
+            "expected wait4 to report peak resident set size"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_count_includes_observed_descendants() {
+        let executor = Executor::new("/tmp");
+        let opts = ExecOptions::default();
+
+        let result = executor
+            .exec("sh", &["-c", "(sleep 0.05) & wait"], &opts)
+            .await
+            .expect("shell command must succeed");
+
+        assert!(
+            result.resources.process_count >= 2,
+            "expected process group sampler to observe the shell and its child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_process_io_sample() {
+        let sample = process_io_sample_from_str(
+            "rchar: 123\nwchar: 456\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n",
+        )
+        .expect("io sample");
+
+        assert_eq!(sample.read_bytes, 4096);
+        assert_eq!(sample.write_bytes, 8192);
     }
 }
