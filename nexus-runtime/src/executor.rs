@@ -1,7 +1,8 @@
 //! Process executor — spawns native processes in a workspace directory.
 //!
-//! No sandboxing, no restrictions.  The executor records OS-observed resource
-//! usage for billing and auditability but does not enforce limits.
+//! No sandboxing or resource limits. The executor records OS-observed resource
+//! usage for billing and auditability, while keeping cwd and ambient env inside
+//! the workspace boundary.
 
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -45,6 +46,12 @@ pub enum ExecError {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         resources: ResourceUsage,
+    },
+
+    #[error("working directory {requested} escapes workspace root {workspace}")]
+    WorkingDirectoryOutsideWorkspace {
+        requested: String,
+        workspace: String,
     },
 
     #[error("{0}")]
@@ -165,16 +172,16 @@ impl Executor {
         args: &[&str],
         options: &ExecOptions,
     ) -> Result<ProcessOutput, ExecError> {
-        let working_dir = self.resolve_working_dir(options.working_dir.as_deref());
+        let working_dir = self
+            .resolve_working_dir(options.working_dir.as_deref())
+            .map_err(|error| *error)?;
 
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
         cmd.current_dir(&working_dir);
         configure_child_process_group(&mut cmd);
 
-        for (key, value) in &options.env {
-            cmd.env(key, value);
-        }
+        configure_child_environment(&mut cmd, &self.workspace_dir, &working_dir, options);
 
         if options.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -285,7 +292,9 @@ impl Executor {
         args: &[&str],
         options: &ExecOptions,
     ) -> Result<ProcessOutput, ExecError> {
-        let working_dir = self.resolve_working_dir(options.working_dir.as_deref());
+        let working_dir = self
+            .resolve_working_dir(options.working_dir.as_deref())
+            .map_err(|error| *error)?;
 
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -293,9 +302,7 @@ impl Executor {
         cmd.kill_on_drop(true);
         configure_child_process_group(&mut cmd);
 
-        for (key, value) in &options.env {
-            cmd.env(key, value);
-        }
+        configure_child_environment(&mut cmd, &self.workspace_dir, &working_dir, options);
 
         if options.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -386,12 +393,78 @@ impl Executor {
         })
     }
 
-    fn resolve_working_dir(&self, working_dir: Option<&Path>) -> PathBuf {
-        match working_dir {
+    fn resolve_working_dir(&self, working_dir: Option<&Path>) -> Result<PathBuf, Box<ExecError>> {
+        let workspace = self
+            .workspace_dir
+            .canonicalize()
+            .map_err(|error| Box::new(ExecError::Io(error)))?;
+        let requested = match working_dir {
             Some(path) if path.is_absolute() => path.to_path_buf(),
-            Some(path) => self.workspace_dir.join(path),
-            None => self.workspace_dir.clone(),
+            Some(path) => workspace.join(path),
+            None => workspace.clone(),
+        };
+        let resolved = requested
+            .canonicalize()
+            .map_err(|error| Box::new(ExecError::Io(error)))?;
+        if !resolved.starts_with(&workspace) {
+            return Err(Box::new(ExecError::WorkingDirectoryOutsideWorkspace {
+                requested: requested.display().to_string(),
+                workspace: workspace.display().to_string(),
+            }));
         }
+        Ok(resolved)
+    }
+}
+
+const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const SAFE_INHERITED_ENV_KEYS: &[&str] = &["LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"];
+
+trait ChildEnvironment {
+    fn clear_env(&mut self);
+    fn set_env(&mut self, key: &str, value: &str);
+}
+
+impl ChildEnvironment for std::process::Command {
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
+
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+}
+
+#[cfg(not(unix))]
+impl ChildEnvironment for Command {
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
+
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+}
+
+fn configure_child_environment<C: ChildEnvironment>(
+    cmd: &mut C,
+    workspace_dir: &Path,
+    working_dir: &Path,
+    options: &ExecOptions,
+) {
+    cmd.clear_env();
+    cmd.set_env("PATH", DEFAULT_EXEC_PATH);
+    cmd.set_env("HOME", &workspace_dir.display().to_string());
+    cmd.set_env("PWD", &working_dir.display().to_string());
+    cmd.set_env("NEXUS_WORKSPACE_ROOT", &workspace_dir.display().to_string());
+
+    for key in SAFE_INHERITED_ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            cmd.set_env(key, &value);
+        }
+    }
+
+    for (key, value) in &options.env {
+        cmd.set_env(key, value);
     }
 }
 
@@ -996,6 +1069,81 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout), "relative cwd");
+    }
+
+    #[tokio::test]
+    async fn working_dir_cannot_escape_workspace_with_parent_component() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            working_dir: Some(PathBuf::from("..")),
+            ..Default::default()
+        };
+
+        let err = executor
+            .exec("true", &[], &opts)
+            .await
+            .expect_err("parent cwd should be rejected");
+
+        assert!(matches!(
+            err,
+            ExecError::WorkingDirectoryOutsideWorkspace { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn working_dir_cannot_escape_workspace_through_symlink() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        std::os::unix::fs::symlink(outside.path(), temp.path().join("outside-link"))
+            .expect("symlink");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            working_dir: Some(PathBuf::from("outside-link")),
+            ..Default::default()
+        };
+
+        let err = executor
+            .exec("true", &[], &opts)
+            .await
+            .expect_err("symlinked cwd should be rejected");
+
+        assert!(matches!(
+            err,
+            ExecError::WorkingDirectoryOutsideWorkspace { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_environment_is_whitelisted_and_explicit() {
+        std::env::set_var("NEXUS_SECRET_TEST", "should-not-leak");
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            env: vec![("NEXUS_ALLOWED".into(), "visible".into())],
+            ..Default::default()
+        };
+
+        let result = executor
+            .exec(
+                "sh",
+                &[
+                    "-c",
+                    "printf '%s|%s|%s' \"$NEXUS_ALLOWED\" \"${NEXUS_SECRET_TEST-unset}\" \"$HOME\"",
+                ],
+                &opts,
+            )
+            .await
+            .expect("env command should succeed");
+
+        std::env::remove_var("NEXUS_SECRET_TEST");
+        let output = String::from_utf8_lossy(&result.stdout);
+        let parts = output.split('|').collect::<Vec<_>>();
+        assert_eq!(
+            parts,
+            vec!["visible", "unset", temp.path().to_str().unwrap()]
+        );
     }
 
     #[tokio::test]
