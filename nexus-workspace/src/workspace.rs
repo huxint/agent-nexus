@@ -12,7 +12,7 @@ use nexus_crypto::NodeIdentity;
 use nexus_runtime::{ExecOptions, Executor, ProcessOutput, ResourceUsage};
 use nexus_storage::cid::Cid;
 use nexus_storage::node::{MerkleNode, NodeKind, TreeEntry};
-use nexus_storage::store::{BlockStore, DiskBlockStore};
+use nexus_storage::store::{BlockStore, DiskBlockStore, GcReport};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::filesystem;
 
 const FILE_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_RETENTION_LIMIT: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Guest
@@ -58,6 +59,10 @@ struct WorkspaceMetadata {
     owner: Option<Did>,
     #[serde(default)]
     guests: Vec<Guest>,
+    #[serde(default)]
+    snapshot_history: Vec<String>,
+    #[serde(default = "default_snapshot_retention_limit")]
+    snapshot_retention_limit: usize,
 }
 
 struct LoadedWorkspaceMetadata {
@@ -66,7 +71,20 @@ struct LoadedWorkspaceMetadata {
     description: String,
     owner: Option<Did>,
     guests: Vec<Guest>,
+    snapshot_history: Vec<Cid>,
+    snapshot_retention_limit: usize,
     needs_persist: bool,
+}
+
+struct WorkspaceMetadataWrite<'a> {
+    root_dir: &'a Path,
+    name: &'a str,
+    description: &'a str,
+    id: &'a WorkspaceId,
+    owner: &'a Did,
+    guests: &'a [Guest],
+    snapshot_history: &'a [Cid],
+    snapshot_retention_limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +138,7 @@ pub struct Workspace {
     root_dir: PathBuf,
 
     /// Content-addressed block store backing the Merkle-DAG.
-    store: Arc<dyn BlockStore>,
+    store: Arc<DiskBlockStore>,
 
     /// Native process executor.
     executor: Executor,
@@ -130,6 +148,12 @@ pub struct Workspace {
 
     /// Current Merkle root CID (updated on snapshot).
     root_cid: Option<Cid>,
+
+    /// Snapshot roots kept for GC pinning, oldest first.
+    snapshot_history: Vec<Cid>,
+
+    /// Maximum number of roots kept for GC pinning.
+    snapshot_retention_limit: usize,
 
     /// File-level snapshot cache keyed by path relative to `root_dir`.
     file_cache: HashMap<PathBuf, FileSnapshotCacheEntry>,
@@ -169,20 +193,22 @@ impl Workspace {
         let id = WorkspaceId::from_bytes(id_bytes);
 
         // Create a disk-backed block store at .nexus/blocks/
-        let store: Arc<dyn BlockStore> =
-            Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
+        let store = Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
         let empty_tree = MerkleNode::tree(Vec::new());
         let root_cid = store.put(empty_tree).await?;
+        let snapshot_history = vec![root_cid];
 
         // Persist metadata to .nexus/config.json
-        Self::write_metadata(
-            &root_dir,
-            &config.name,
-            &config.description,
-            &id,
-            owner.did(),
-            &[],
-        )?;
+        Self::write_metadata(WorkspaceMetadataWrite {
+            root_dir: &root_dir,
+            name: &config.name,
+            description: &config.description,
+            id: &id,
+            owner: owner.did(),
+            guests: &[],
+            snapshot_history: &snapshot_history,
+            snapshot_retention_limit: DEFAULT_SNAPSHOT_RETENTION_LIMIT,
+        })?;
 
         Ok(Self {
             id,
@@ -194,6 +220,8 @@ impl Workspace {
             store,
             guests: Vec::new(),
             root_cid: Some(root_cid),
+            snapshot_history,
+            snapshot_retention_limit: DEFAULT_SNAPSHOT_RETENTION_LIMIT,
             file_cache: HashMap::new(),
             total_resources: ResourceUsage::default(),
         })
@@ -211,8 +239,7 @@ impl Workspace {
         }
 
         // Open existing disk-backed block store
-        let store: Arc<dyn BlockStore> =
-            Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
+        let store = Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
         let metadata = Self::read_metadata(&root_dir)?;
 
         // Index the filesystem
@@ -236,6 +263,12 @@ impl Workspace {
             executor: Executor::new(root_dir),
             guests: metadata.guests,
             root_cid: Some(root_cid),
+            snapshot_history: if metadata.snapshot_history.is_empty() {
+                vec![root_cid]
+            } else {
+                metadata.snapshot_history
+            },
+            snapshot_retention_limit: metadata.snapshot_retention_limit,
             file_cache,
             total_resources: ResourceUsage::default(),
         };
@@ -266,8 +299,7 @@ impl Workspace {
         }
 
         filesystem::ensure_dir(&root_dir)?;
-        let store: Arc<dyn BlockStore> =
-            Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
+        let store = Arc::new(DiskBlockStore::new(root_dir.join(".nexus").join("blocks")));
         Self::restore_tree(
             source_store,
             store.as_ref(),
@@ -276,14 +308,16 @@ impl Workspace {
             &root_dir,
         )
         .await?;
-        Self::write_metadata(
-            &root_dir,
-            &config.name,
-            &config.description,
-            &id,
+        Self::write_metadata(WorkspaceMetadataWrite {
+            root_dir: &root_dir,
+            name: &config.name,
+            description: &config.description,
+            id: &id,
             owner,
-            &[],
-        )?;
+            guests: &[],
+            snapshot_history: &[root_cid],
+            snapshot_retention_limit: DEFAULT_SNAPSHOT_RETENTION_LIMIT,
+        })?;
 
         Ok(Self {
             id,
@@ -295,6 +329,8 @@ impl Workspace {
             store,
             guests: Vec::new(),
             root_cid: Some(root_cid),
+            snapshot_history: vec![root_cid],
+            snapshot_retention_limit: DEFAULT_SNAPSHOT_RETENTION_LIMIT,
             file_cache: HashMap::new(),
             total_resources: ResourceUsage::default(),
         })
@@ -332,6 +368,11 @@ impl Workspace {
     /// Current Merkle root CID.
     pub fn root_cid(&self) -> Option<Cid> {
         self.root_cid
+    }
+
+    /// Roots retained for block-store GC pinning.
+    pub fn retained_roots(&self) -> Vec<Cid> {
+        self.snapshot_roots_for_gc()
     }
 
     /// Accumulated resource usage.
@@ -414,8 +455,26 @@ impl Workspace {
         )
         .await?;
         self.root_cid = Some(root_cid);
+        self.snapshot_history.push(root_cid);
+        self.trim_snapshot_history();
         self.file_cache = next_cache;
+        self.persist_metadata()?;
         Ok(root_cid)
+    }
+
+    /// Garbage collect unreachable block-store entries.
+    pub async fn gc_block_store(&self) -> WorkspaceResult<GcReport> {
+        let roots = self.snapshot_roots_for_gc();
+        self.store.gc_unreachable(&roots).await.map_err(Into::into)
+    }
+
+    /// Garbage collect unreachable block-store entries and enforce a quota.
+    pub async fn gc_block_store_with_quota(&self, max_bytes: u64) -> WorkspaceResult<GcReport> {
+        let roots = self.snapshot_roots_for_gc();
+        self.store
+            .gc_unreachable_with_quota(&roots, max_bytes)
+            .await
+            .map_err(Into::into)
     }
 
     // -----------------------------------------------------------------------
@@ -701,34 +760,35 @@ impl Workspace {
     }
 
     fn persist_metadata(&self) -> WorkspaceResult<()> {
-        Self::write_metadata(
-            &self.root_dir,
-            &self.name,
-            &self.description,
-            &self.id,
-            &self.owner,
-            &self.guests,
-        )
+        Self::write_metadata(WorkspaceMetadataWrite {
+            root_dir: &self.root_dir,
+            name: &self.name,
+            description: &self.description,
+            id: &self.id,
+            owner: &self.owner,
+            guests: &self.guests,
+            snapshot_history: &self.snapshot_history,
+            snapshot_retention_limit: self.snapshot_retention_limit,
+        })
     }
 
     /// Write workspace metadata to `.nexus/config.json`.
-    fn write_metadata(
-        root_dir: &Path,
-        name: &str,
-        description: &str,
-        id: &WorkspaceId,
-        owner: &Did,
-        guests: &[Guest],
-    ) -> WorkspaceResult<()> {
-        let nexus_dir = root_dir.join(".nexus");
+    fn write_metadata(metadata: WorkspaceMetadataWrite<'_>) -> WorkspaceResult<()> {
+        let nexus_dir = metadata.root_dir.join(".nexus");
         filesystem::ensure_dir(&nexus_dir)?;
 
         let config = WorkspaceMetadata {
-            name: name.to_string(),
-            description: description.to_string(),
-            id: hex::encode(id.as_bytes()),
-            owner: Some(owner.clone()),
-            guests: guests.to_vec(),
+            name: metadata.name.to_string(),
+            description: metadata.description.to_string(),
+            id: hex::encode(metadata.id.as_bytes()),
+            owner: Some(metadata.owner.clone()),
+            guests: metadata.guests.to_vec(),
+            snapshot_history: metadata
+                .snapshot_history
+                .iter()
+                .map(|cid| hex::encode(cid.as_bytes()))
+                .collect(),
+            snapshot_retention_limit: metadata.snapshot_retention_limit,
         };
 
         let config_path = nexus_dir.join("config.json");
@@ -782,6 +842,40 @@ impl Workspace {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
+        let snapshot_history_json = json.get("snapshot_history");
+        let snapshot_history = snapshot_history_json
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            WorkspaceError::Other("invalid snapshot history entry".into())
+                        })
+                    })
+                    .map(|result| {
+                        result.and_then(|hex_str| {
+                            let bytes = hex::decode(hex_str).map_err(|e| {
+                                WorkspaceError::Other(format!(
+                                    "invalid snapshot history cid hex: {e}"
+                                ))
+                            })?;
+                            let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                                WorkspaceError::Other("invalid snapshot history cid length".into())
+                            })?;
+                            Ok(Cid::from_bytes(arr))
+                        })
+                    })
+                    .collect::<WorkspaceResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let snapshot_retention_limit = json
+            .get("snapshot_retention_limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_SNAPSHOT_RETENTION_LIMIT)
+            .max(1);
 
         Ok(LoadedWorkspaceMetadata {
             id,
@@ -789,7 +883,11 @@ impl Workspace {
             description,
             owner,
             guests,
-            needs_persist: generated_id,
+            snapshot_history,
+            snapshot_retention_limit,
+            needs_persist: generated_id
+                || snapshot_history_json.is_none()
+                || json.get("snapshot_retention_limit").is_none(),
         })
     }
 
@@ -809,9 +907,41 @@ impl Workspace {
             description: String::new(),
             owner: None,
             guests: Vec::new(),
+            snapshot_history: Vec::new(),
+            snapshot_retention_limit: DEFAULT_SNAPSHOT_RETENTION_LIMIT,
             needs_persist,
         }
     }
+
+    fn snapshot_roots_for_gc(&self) -> Vec<Cid> {
+        let mut roots = self.snapshot_history.clone();
+        if roots.is_empty() {
+            if let Some(root) = self.root_cid {
+                roots.push(root);
+            }
+        } else if let Some(root) = self.root_cid {
+            if roots.last().copied() != Some(root) {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
+    fn trim_snapshot_history(&mut self) {
+        if self.snapshot_history.len() > self.snapshot_retention_limit {
+            let excess = self.snapshot_history.len() - self.snapshot_retention_limit;
+            self.snapshot_history.drain(0..excess);
+        }
+        if self.snapshot_history.is_empty() {
+            if let Some(root) = self.root_cid {
+                self.snapshot_history.push(root);
+            }
+        }
+    }
+}
+
+fn default_snapshot_retention_limit() -> usize {
+    DEFAULT_SNAPSHOT_RETENTION_LIMIT
 }
 
 fn checked_child_path(base: &Path, root_dir: &Path, name: &str) -> WorkspaceResult<PathBuf> {
@@ -963,6 +1093,40 @@ mod tests {
         let data_node = ws.store.get(&data.cid).await.unwrap();
 
         assert_eq!(data_node.as_blob().unwrap(), b"keep me");
+    }
+
+    #[tokio::test]
+    async fn block_store_gc_keeps_retained_roots_and_removes_expired_snapshots() {
+        let (mut ws, _base) = setup_workspace().await;
+
+        ws.write_file("data.txt", b"version-one").unwrap();
+        let root_v1 = ws.snapshot().await.unwrap();
+        let blob_v1 = MerkleNode::blob(b"version-one".to_vec()).cid();
+        assert!(ws.store.has(&root_v1).await.unwrap());
+        assert!(ws.store.has(&blob_v1).await.unwrap());
+
+        ws.write_file("data.txt", b"version-two-longer").unwrap();
+        let root_v2 = ws.snapshot().await.unwrap();
+        ws.write_file("data.txt", b"version-three-longest").unwrap();
+        let root_v3 = ws.snapshot().await.unwrap();
+        let blob_v3 = MerkleNode::blob(b"version-three-longest".to_vec()).cid();
+
+        assert_eq!(ws.retained_roots(), vec![root_v2, root_v3]);
+
+        let report = ws.gc_block_store().await.unwrap();
+
+        assert!(report.deleted_blocks > 0);
+        assert!(!ws.store.has(&root_v1).await.unwrap());
+        assert!(!ws.store.has(&blob_v1).await.unwrap());
+        assert!(ws.store.has(&root_v2).await.unwrap());
+        assert!(ws.store.has(&root_v3).await.unwrap());
+        assert!(ws.store.has(&blob_v3).await.unwrap());
+
+        let err = ws.gc_block_store_with_quota(1).await.unwrap_err();
+        assert!(matches!(
+            err,
+            WorkspaceError::Storage(nexus_storage::store::StoreError::QuotaExceeded { .. })
+        ));
     }
 
     #[tokio::test]
