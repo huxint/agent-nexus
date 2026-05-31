@@ -16,6 +16,9 @@ use nexus_core::{Capability, Did, NexusError, NexusResult, PermissionSet, Worksp
 
 use crate::did::parse_did;
 use crate::identity::NodeIdentity;
+use crate::signing::domain_separated_cbor;
+
+const CAPABILITY_SIGNING_DOMAIN_V2: &str = "nexus:capability:v2";
 
 /// Errors specific to capability operations.
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +100,7 @@ pub fn sign_capability_with_depth(
         delegation_depth,
     };
 
-    let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
+    let payload = signing_payload(&unsigned).map_err(SigningError::Serialisation)?;
 
     let sig = issuer.sign(&payload);
 
@@ -159,7 +162,7 @@ pub fn delegate_capability(
         parent: Some(parent.clone()),
         delegation_depth,
     };
-    let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
+    let payload = signing_payload(&unsigned).map_err(SigningError::Serialisation)?;
     let sig = issuer.sign(&payload);
 
     Ok(Capability {
@@ -201,7 +204,9 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), SigningError>
         delegation_depth: cap.delegation_depth,
     };
 
-    let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
+    let payload = signing_payload(&unsigned).map_err(SigningError::Serialisation)?;
+    let legacy_current_payload =
+        canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
     let legacy_payload = if cap.parent.is_none() && cap.delegation_depth.is_none() {
         let legacy_unsigned = LegacyCapabilityFields {
             issuer: cap.issuer.clone(),
@@ -224,6 +229,7 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), SigningError>
 
     // 5. Verify
     if vk.verify(&payload, &sig).is_err()
+        && vk.verify(&legacy_current_payload, &sig).is_err()
         && legacy_payload
             .as_deref()
             .is_none_or(|legacy_payload| vk.verify(legacy_payload, &sig).is_err())
@@ -317,6 +323,10 @@ fn canonical_encode(fields: &CapabilityFields) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+fn signing_payload(fields: &CapabilityFields) -> Result<Vec<u8>, String> {
+    domain_separated_cbor(CAPABILITY_SIGNING_DOMAIN_V2, fields)
+}
+
 fn canonical_encode_legacy(fields: &LegacyCapabilityFields) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     ciborium::into_writer(fields, &mut buf).map_err(|e| format!("CBOR encode: {e}"))?;
@@ -387,6 +397,63 @@ mod tests {
 
         let cap = sign_capability(&issuer, &subject, ws, perms.clone(), expires)
             .expect("signing must succeed");
+
+        assert!(verify_capability(&cap, ts_now()).is_ok());
+    }
+
+    #[test]
+    fn new_capability_signature_uses_domain_separated_payload() {
+        let issuer = NodeIdentity::generate();
+        let subject = NodeIdentity::generate().did().clone();
+        let ws = WorkspaceId::from_bytes([0xacu8; 32]);
+        let expires = ts_now() + 3600;
+        let cap = sign_capability(&issuer, &subject, ws, PermissionSet::READ_ONLY, expires)
+            .expect("signing must succeed");
+        let unsigned = CapabilityFields {
+            issuer: cap.issuer.clone(),
+            subject: cap.subject.clone(),
+            workspace: cap.workspace,
+            permissions: cap.permissions.clone(),
+            expires_at: cap.expires_at,
+            parent: None,
+            delegation_depth: None,
+        };
+        let old_payload = canonical_encode(&unsigned).unwrap();
+        let new_payload = signing_payload(&unsigned).unwrap();
+        let signature = Signature::from_slice(&cap.signature).unwrap();
+        let verifying_key = issuer.verifying_key();
+
+        assert!(verifying_key.verify(&new_payload, &signature).is_ok());
+        assert!(verifying_key.verify(&old_payload, &signature).is_err());
+    }
+
+    #[test]
+    fn legacy_capability_signature_still_verifies() {
+        let issuer = NodeIdentity::generate();
+        let subject = NodeIdentity::generate().did().clone();
+        let ws = WorkspaceId::from_bytes([0xadu8; 32]);
+        let expires = ts_now() + 3600;
+        let unsigned = CapabilityFields {
+            issuer: issuer.did().clone(),
+            subject: subject.clone(),
+            workspace: ws,
+            permissions: PermissionSet::READ_ONLY,
+            expires_at: expires,
+            parent: None,
+            delegation_depth: None,
+        };
+        let legacy_payload = canonical_encode(&unsigned).unwrap();
+        let signature = issuer.sign(&legacy_payload).to_bytes().to_vec();
+        let cap = Capability {
+            issuer: unsigned.issuer,
+            subject,
+            workspace: ws,
+            permissions: PermissionSet::READ_ONLY,
+            expires_at: expires,
+            parent: None,
+            delegation_depth: None,
+            signature,
+        };
 
         assert!(verify_capability(&cap, ts_now()).is_ok());
     }

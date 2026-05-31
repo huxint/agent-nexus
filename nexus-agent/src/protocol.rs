@@ -8,6 +8,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use nexus_core::{Did, WorkspaceId};
 use nexus_crypto::capability::{verify_capability, SigningError};
+use nexus_crypto::domain_separated_cbor;
 use nexus_crypto::{parse_did, DidError, NodeIdentity};
 use nexus_economy::SettlementError;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ use crate::task::{
 
 /// Current social event wire version.
 pub const SOCIAL_EVENT_PROTOCOL_VERSION: u16 = 1;
+const SOCIAL_EVENT_SIGNING_DOMAIN_V2: &str = "nexus:social-event:v2";
 
 fn default_social_event_protocol_version() -> u16 {
     SOCIAL_EVENT_PROTOCOL_VERSION
@@ -112,8 +114,11 @@ pub enum SocialProtocolError {
     #[error("equivocation proof events are identical: {event_id}")]
     EquivocationEventsIdentical { event_id: String },
 
-    #[error("failed to serialize social event signing payload: {0}")]
-    PayloadSerialization(#[from] serde_json::Error),
+    #[error("failed to serialize social event JSON payload: {0}")]
+    JsonPayloadSerialization(#[from] serde_json::Error),
+
+    #[error("failed to serialize social event CBOR payload: {0}")]
+    CborPayloadSerialization(String),
 
     #[error("failed to decode social event JSON: {0}")]
     EventDecode(serde_json::Error),
@@ -245,7 +250,7 @@ impl SocialEvent {
     ///
     /// The event id and signature are excluded so the id can be the hash of
     /// the payload being signed instead of an independent mutable field.
-    pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+    pub fn signing_payload(&self) -> Result<Vec<u8>, SocialProtocolError> {
         Self::signing_payload_for(
             self.version,
             &self.author,
@@ -256,7 +261,7 @@ impl SocialEvent {
         )
     }
 
-    pub fn content_id(&self) -> Result<String, serde_json::Error> {
+    pub fn content_id(&self) -> Result<String, SocialProtocolError> {
         Self::content_id_for(
             self.version,
             &self.author,
@@ -274,7 +279,7 @@ impl SocialEvent {
         prev: Option<&str>,
         timestamp: u64,
         kind: &SocialEventKind,
-    ) -> Result<Vec<u8>, serde_json::Error> {
+    ) -> Result<Vec<u8>, SocialProtocolError> {
         #[derive(Serialize)]
         struct Payload<'a> {
             version: u16,
@@ -285,14 +290,18 @@ impl SocialEvent {
             kind: &'a SocialEventKind,
         }
 
-        serde_json::to_vec(&Payload {
-            version,
-            author,
-            seq,
-            prev,
-            timestamp,
-            kind,
-        })
+        domain_separated_cbor(
+            SOCIAL_EVENT_SIGNING_DOMAIN_V2,
+            &Payload {
+                version,
+                author,
+                seq,
+                prev,
+                timestamp,
+                kind,
+            },
+        )
+        .map_err(SocialProtocolError::CborPayloadSerialization)
     }
 
     fn legacy_signing_payload_for(
@@ -320,6 +329,34 @@ impl SocialEvent {
         })
     }
 
+    fn legacy_versioned_signing_payload_for(
+        version: u16,
+        author: &Did,
+        seq: u64,
+        prev: Option<&str>,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            version: u16,
+            author: &'a Did,
+            seq: u64,
+            prev: Option<&'a str>,
+            timestamp: u64,
+            kind: &'a SocialEventKind,
+        }
+
+        serde_json::to_vec(&Payload {
+            version,
+            author,
+            seq,
+            prev,
+            timestamp,
+            kind,
+        })
+    }
+
     fn content_id_for(
         version: u16,
         author: &Did,
@@ -327,8 +364,22 @@ impl SocialEvent {
         prev: Option<&str>,
         timestamp: u64,
         kind: &SocialEventKind,
-    ) -> Result<String, serde_json::Error> {
+    ) -> Result<String, SocialProtocolError> {
         let payload = Self::signing_payload_for(version, author, seq, prev, timestamp, kind)?;
+        Ok(hex::encode(Sha256::digest(payload)))
+    }
+
+    fn legacy_versioned_content_id_for(
+        version: u16,
+        author: &Did,
+        seq: u64,
+        prev: Option<&str>,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<String, serde_json::Error> {
+        let payload = Self::legacy_versioned_signing_payload_for(
+            version, author, seq, prev, timestamp, kind,
+        )?;
         Ok(hex::encode(Sha256::digest(payload)))
     }
 
@@ -384,13 +435,34 @@ impl SocialEvent {
         self.verify_protocol_version()?;
         let expected = self.content_id()?;
         if self.id == expected {
-            return Ok(self.signing_payload()?);
+            return self.signing_payload();
         }
 
-        // Backward compatibility for pre-N7 event JSON that did not carry a
-        // version field in the signed payload. These events are treated as v1
-        // but keep their original content id and signature valid.
         if self.version == SOCIAL_EVENT_PROTOCOL_VERSION {
+            // Backward compatibility for events signed before A2. These used
+            // JSON with an explicit version field, but no domain separation.
+            let legacy_versioned_expected = Self::legacy_versioned_content_id_for(
+                self.version,
+                &self.author,
+                self.seq,
+                self.prev.as_deref(),
+                self.timestamp,
+                &self.kind,
+            )?;
+            if self.id == legacy_versioned_expected {
+                return Ok(Self::legacy_versioned_signing_payload_for(
+                    self.version,
+                    &self.author,
+                    self.seq,
+                    self.prev.as_deref(),
+                    self.timestamp,
+                    &self.kind,
+                )?);
+            }
+
+            // Backward compatibility for pre-N7 event JSON that did not carry a
+            // version field in the signed payload. These events are treated as v1
+            // but keep their original content id and signature valid.
             let legacy_expected = Self::legacy_content_id_for(
                 &self.author,
                 self.seq,
@@ -643,9 +715,10 @@ mod tests {
         assert_eq!(decoded.signature, Some(vec![1, 2, 3]));
 
         let signed_payload = decoded.signing_payload().unwrap();
-        let payload_text = String::from_utf8(signed_payload).unwrap();
-        assert!(!payload_text.contains("signature"));
-        assert!(payload_text.contains("version"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&signed_payload).is_err(),
+            "new social event signing payload should use domain-separated CBOR"
+        );
     }
 
     #[test]
@@ -709,6 +782,41 @@ mod tests {
             .validate()
             .expect("legacy v1 event without version should remain valid");
         assert_eq!(decoded.version, SOCIAL_EVENT_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn social_event_accepts_legacy_v1_json_with_version_field() {
+        let alice = NodeIdentity::generate();
+        let mut event = SocialEvent::new(
+            alice.did().clone(),
+            2,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([22; 32]),
+            },
+        );
+        event.id = SocialEvent::legacy_versioned_content_id_for(
+            event.version,
+            &event.author,
+            event.seq,
+            event.prev.as_deref(),
+            event.timestamp,
+            &event.kind,
+        )
+        .unwrap();
+        let legacy_payload = SocialEvent::legacy_versioned_signing_payload_for(
+            event.version,
+            &event.author,
+            event.seq,
+            event.prev.as_deref(),
+            event.timestamp,
+            &event.kind,
+        )
+        .unwrap();
+        event.signature = Some(alice.sign(&legacy_payload).to_bytes().to_vec());
+
+        event
+            .validate()
+            .expect("legacy versioned JSON payload should remain valid");
     }
 
     #[test]
