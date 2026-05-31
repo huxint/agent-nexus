@@ -1132,10 +1132,12 @@ fn announcement_peer_id(
 }
 
 fn multiaddr_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
-    addr.iter().find_map(|protocol| match protocol {
-        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
-        _ => None,
-    })
+    addr.iter()
+        .filter_map(|protocol| match protocol {
+            libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+            _ => None,
+        })
+        .last()
 }
 
 fn normalized_announcement_bootstrap_addrs(
@@ -6806,6 +6808,21 @@ mod tests {
         wrong_addr_peer.signature = None;
         let wrong_addr_peer = sign_workspace_announcement(wrong_addr_peer, &identity).unwrap();
         assert!(verify_workspace_announcement(&wrong_addr_peer).is_err());
+
+        let target_peer = announcement_peer_id(&announcement).unwrap();
+        let relay_peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let relayed_addr = format!(
+            "/ip4/127.0.0.1/udp/5556/quic-v1/p2p/{relay_peer}/p2p-circuit/p2p/{target_peer}"
+        );
+        let mut relayed = announcement.clone();
+        relayed.addrs = vec![relayed_addr.clone()];
+        relayed.signature = None;
+        let relayed = sign_workspace_announcement(relayed, &identity).unwrap();
+        verify_workspace_announcement(&relayed).unwrap();
+        assert_eq!(
+            normalized_announcement_bootstrap_addrs(&relayed).unwrap(),
+            vec![relayed_addr.parse::<libp2p::Multiaddr>().unwrap()]
+        );
 
         let mut unsigned = announcement;
         unsigned.signature = None;
