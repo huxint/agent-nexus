@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nexus_core::Did;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::protocol::{EquivocationProof, SocialEvent, SocialProtocolError};
+use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::Society;
 
 /// Accepted clock skew for signed social events.
@@ -48,6 +48,8 @@ pub struct SocialEventLog {
     seq_index: HashMap<(Did, u64), usize>,
     #[serde(skip)]
     heads: HashMap<Did, (u64, String)>,
+    #[serde(skip)]
+    rotations: HashMap<Did, Did>,
     #[serde(skip)]
     equivocation_index: HashSet<String>,
 }
@@ -203,6 +205,8 @@ impl SocialEventLog {
             return self.record_equivocation(proof);
         }
 
+        self.validate_identity_rotation_authority(&event)?;
+
         if self.can_accept(&event)? {
             let author = event.author.clone();
             self.accept_event(event, observed_at)?;
@@ -285,6 +289,7 @@ impl SocialEventLog {
             .insert((event.author.clone(), event.seq), index);
         self.heads
             .insert(event.author.clone(), (event.seq, event.id.clone()));
+        self.record_identity_rotation(&event);
         self.record_pending_equivocations(&event)?;
         self.observed_at.push(observed_at);
         self.events.push(event);
@@ -396,6 +401,7 @@ impl SocialEventLog {
         self.pending_index.clear();
         self.seq_index.clear();
         self.heads.clear();
+        self.rotations.clear();
         self.equivocation_index.clear();
 
         let events = std::mem::take(&mut self.events)
@@ -409,6 +415,26 @@ impl SocialEventLog {
         let proofs = std::mem::take(&mut self.equivocation_proofs);
         *self = Self::from_parts(events, pending, proofs)?;
         Ok(())
+    }
+
+    fn validate_identity_rotation_authority(
+        &self,
+        event: &SocialEvent,
+    ) -> Result<(), SocialProtocolError> {
+        if let Some(successor) = self.rotations.get(&event.author) {
+            return Err(SocialProtocolError::IdentityRotated {
+                author: event.author.clone(),
+                successor: successor.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn record_identity_rotation(&mut self, event: &SocialEvent) {
+        if let SocialEventKind::IdentityRotated { rotation } = &event.kind {
+            self.rotations
+                .insert(rotation.previous.clone(), rotation.next.clone());
+        }
     }
 }
 
@@ -428,7 +454,7 @@ mod tests {
     use nexus_crypto::NodeIdentity;
 
     use crate::protocol::{SocialEventKind, SocialProtocolError};
-    use crate::society::RelationKind;
+    use crate::society::{IdentityRotation, RelationKind};
 
     fn signed_relation(
         identity: &NodeIdentity,
@@ -546,6 +572,68 @@ mod tests {
             society.edge(alice.did(), bob.did()).unwrap().kind,
             RelationKind::Collaborator
         );
+    }
+
+    #[test]
+    fn identity_rotation_requires_successor_for_future_events() {
+        let previous = NodeIdentity::generate();
+        let next = NodeIdentity::generate();
+        let peer = NodeIdentity::generate();
+        let rotation = SocialEvent::new_chained(
+            previous.did().clone(),
+            0,
+            None,
+            1,
+            SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: previous.did().clone(),
+                    next: next.did().clone(),
+                    reason: Some("routine rotation".into()),
+                    rotated_at: 1,
+                },
+            },
+        )
+        .sign(&previous)
+        .unwrap();
+        let old_key_event = SocialEvent::new_chained(
+            previous.did().clone(),
+            1,
+            Some(rotation.id.clone()),
+            2,
+            SocialEventKind::RelationDeclared {
+                peer: peer.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("old key should no longer act".into()),
+            },
+        )
+        .sign(&previous)
+        .unwrap();
+        let successor_event = SocialEvent::new(
+            next.did().clone(),
+            2,
+            SocialEventKind::RelationDeclared {
+                peer: peer.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("successor key now acts".into()),
+            },
+        )
+        .sign(&next)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append(rotation.clone()).unwrap());
+        assert_eq!(
+            log.to_society().active_identity(previous.did()),
+            next.did().clone()
+        );
+        let err = log.append(old_key_event).unwrap_err();
+        assert!(matches!(
+            err,
+            SocialProtocolError::IdentityRotated { author, successor }
+                if author == *previous.did() && successor == *next.did()
+        ));
+        assert!(log.append(successor_event).unwrap());
+        assert!(!log.append(rotation).unwrap());
     }
 
     #[test]

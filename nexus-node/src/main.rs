@@ -9,6 +9,7 @@
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
+//!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -109,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "serve" => cmd_serve(&args).await?,
         "discover" => cmd_discover(&args).await?,
         "bootstrap" => cmd_bootstrap(&args)?,
+        "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
         "act" => cmd_act(&args)?,
         "event" => cmd_event(&args)?,
@@ -129,6 +131,7 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} bootstrap status --base <DIR> [--json] [--invite <ADDR>] [--no-public-bootstrap]"
     );
+    eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -1623,6 +1626,74 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
 // ---------------------------------------------------------------------------
 // event
 // ---------------------------------------------------------------------------
+
+fn cmd_identity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() < 3 {
+        return Err("identity subcommand required: rotate".into());
+    }
+
+    match args[2].as_str() {
+        "rotate" | "key-rotate" | "rotate-key" => cmd_identity_rotate(args),
+        other => Err(format!("unknown identity subcommand: {other}").into()),
+    }
+}
+
+fn cmd_identity_rotate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut reason = None;
+    let mut rotated_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            "--rotated-at" => {
+                i += 1;
+                rotated_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--rotated-at")?,
+                    "--rotated-at",
+                )?);
+            }
+            other => return Err(format!("unknown identity rotate option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let previous = load_or_create_identity(&base)?;
+    let next = NodeIdentity::generate();
+    let memory_path = base.join(".nexus-social-memory.json");
+    let mut memory = load_social_memory(&memory_path)?;
+    let now = unix_now();
+    let event = memory.sign_event(
+        &previous,
+        now,
+        SocialEventKind::IdentityRotated {
+            rotation: IdentityRotation {
+                previous: previous.did().clone(),
+                next: next.did().clone(),
+                reason,
+                rotated_at: rotated_at.unwrap_or(now),
+            },
+        },
+    )?;
+    if memory.ingest_event(event.clone())? {
+        save_social_memory(&memory_path, &memory)?;
+    }
+    save_identity(&base, &next)?;
+    println!(
+        "Rotated identity {} -> {}; recorded social event {}",
+        previous.did(),
+        next.did(),
+        event.id
+    );
+    Ok(())
+}
 
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
@@ -7866,6 +7937,76 @@ mod tests {
         for event in memory.events() {
             event.verify_signature().unwrap();
         }
+    }
+
+    #[test]
+    fn identity_rotate_command_switches_local_signing_identity() {
+        let temp = TempDir::new().unwrap();
+        let previous = load_or_create_identity(temp.path()).unwrap();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "manifest".into(),
+            "--base".into(),
+            base.clone(),
+            "--name".into(),
+            "before-rotation".into(),
+        ])
+        .unwrap();
+
+        cmd_identity(&[
+            "nexus-node".into(),
+            "identity".into(),
+            "rotate".into(),
+            "--base".into(),
+            base.clone(),
+            "--reason".into(),
+            "scheduled key rotation".into(),
+            "--rotated-at".into(),
+            "900".into(),
+        ])
+        .unwrap();
+
+        let active = load_or_create_identity(temp.path()).unwrap();
+        assert_ne!(active.did(), previous.did());
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "manifest".into(),
+            "--base".into(),
+            base,
+            "--name".into(),
+            "after-rotation".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 3);
+        assert_eq!(
+            memory.society().active_identity(previous.did()),
+            active.did().clone()
+        );
+        assert_eq!(memory.events()[0].author, *previous.did());
+        assert_eq!(memory.events()[1].author, *previous.did());
+        assert_eq!(memory.events()[2].author, *active.did());
+        for event in memory.events() {
+            event.verify_signature().unwrap();
+        }
+        assert_eq!(
+            memory.society().agent_manifest(active.did()).unwrap().name,
+            "after-rotation"
+        );
+        assert_eq!(
+            memory
+                .society()
+                .identity_rotation(previous.did())
+                .unwrap()
+                .rotated_at,
+            900
+        );
     }
 
     #[test]

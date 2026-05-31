@@ -109,9 +109,27 @@ pub fn load_or_create_identity(base: &Path) -> Result<NodeIdentity, Box<dyn std:
         )?)
     } else {
         let id = NodeIdentity::generate();
-        id.save_to_file_with_passphrase(&id_path, &passphrase)?;
+        save_identity_with_passphrase(base, &id, &passphrase)?;
         Ok(id)
     }
+}
+
+pub fn save_identity(
+    base: &Path,
+    identity: &NodeIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let passphrase = identity_passphrase()?;
+    save_identity_with_passphrase(base, identity, &passphrase)
+}
+
+fn save_identity_with_passphrase(
+    base: &Path,
+    identity: &NodeIdentity,
+    passphrase: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id_path = identity_path(base);
+    identity.save_to_file_with_passphrase(&id_path, passphrase)?;
+    Ok(())
 }
 
 fn identity_passphrase() -> Result<String, Box<dyn std::error::Error>> {
