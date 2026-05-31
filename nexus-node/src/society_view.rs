@@ -1404,6 +1404,7 @@ fn task_result_resource_evidence_json(
                 && receipt.stderr_cid == Cid::hash_of(result.stderr.as_bytes());
             let matching_attestations = society.task_result_attestations(result).len();
             let has_independent_reexecution = matching_attestations > 0;
+            let deterministic_replay_profile = receipt.replay_profile.is_some();
 
             serde_json::json!({
                 "measurement_status": if has_independent_reexecution {
@@ -1417,8 +1418,13 @@ fn task_result_resource_evidence_json(
                 "receipt_signature_valid": receipt_signature_valid,
                 "output_cids_match_result": output_cids_match_result,
                 "matching_attestations": matching_attestations,
+                "deterministic_replay_profile": deterministic_replay_profile,
                 "independent_verification": if has_independent_reexecution {
-                    "attested_reexecution"
+                    if deterministic_replay_profile {
+                        "deterministic_attested_reexecution"
+                    } else {
+                        "attested_reexecution"
+                    }
                 } else {
                     "not_performed"
                 },
@@ -1514,6 +1520,7 @@ fn execution_receipt_json(receipt: &ExecutionReceipt) -> serde_json::Value {
         "stdout_cid": hex::encode(receipt.stdout_cid.as_bytes()),
         "stderr_cid": hex::encode(receipt.stderr_cid.as_bytes()),
         "output_root": receipt.output_root.map(|root| hex::encode(root.as_bytes())),
+        "replay_profile": receipt.replay_profile.as_ref().map(deterministic_replay_profile_json),
         "resources": receipt.resources,
         "resource_evidence": execution_receipt_resource_evidence_json(receipt),
         "started_at": receipt.started_at,
@@ -1529,6 +1536,7 @@ fn execution_receipt_resource_evidence_json(receipt: &ExecutionReceipt) -> serde
         "signed_by": receipt.executor.to_string(),
         "signature_scope": "execution_receipt",
         "receipt_signature_valid": receipt.verify_signature().is_ok(),
+        "deterministic_replay_profile": receipt.replay_profile.is_some(),
         "independent_verification": "not_performed",
         "verified_measurement": false,
     })
@@ -1543,6 +1551,7 @@ fn execution_attestation_json(attestation: &ExecutionAttestation) -> serde_json:
         "stdout_cid": hex::encode(attestation.stdout_cid.as_bytes()),
         "stderr_cid": hex::encode(attestation.stderr_cid.as_bytes()),
         "output_root": attestation.output_root.map(|root| hex::encode(root.as_bytes())),
+        "replay_profile": attestation.replay_profile.as_ref().map(deterministic_replay_profile_json),
         "resources": attestation.resources,
         "resource_evidence": execution_attestation_resource_evidence_json(attestation),
         "observed_at": attestation.observed_at,
@@ -1559,7 +1568,24 @@ fn execution_attestation_resource_evidence_json(
         "signed_by": attestation.attestor.to_string(),
         "signature_scope": "execution_attestation",
         "attestation_signature_valid": attestation.verify_signature().is_ok(),
-        "independent_verification": "attested_reexecution",
+        "deterministic_replay_profile": attestation.replay_profile.is_some(),
+        "independent_verification": if attestation.replay_profile.is_some() {
+            "deterministic_attested_reexecution"
+        } else {
+            "attested_reexecution"
+        },
         "verified_measurement": false,
+    })
+}
+
+fn deterministic_replay_profile_json(
+    profile: &nexus_agent::DeterministicReplayProfile,
+) -> serde_json::Value {
+    serde_json::json!({
+        "profile": profile.profile,
+        "image": profile.image,
+        "command_digest": profile.command_digest,
+        "network_disabled": profile.network_disabled,
+        "workspace_root": profile.workspace_root.map(|root| hex::encode(root.as_bytes())),
     })
 }

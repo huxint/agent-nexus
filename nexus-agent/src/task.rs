@@ -153,6 +153,8 @@ pub struct ExecutionReceipt {
     pub stdout_cid: Cid,
     pub stderr_cid: Cid,
     pub output_root: Option<Cid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_profile: Option<DeterministicReplayProfile>,
     pub resources: ResourceUsage,
     pub started_at: u64,
     pub finished_at: u64,
@@ -170,9 +172,21 @@ pub struct ExecutionAttestation {
     pub stdout_cid: Cid,
     pub stderr_cid: Cid,
     pub output_root: Option<Cid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_profile: Option<DeterministicReplayProfile>,
     pub resources: ResourceUsage,
     pub observed_at: u64,
     pub signature: Option<Vec<u8>>,
+}
+
+/// Description of the deterministic environment used for receipt replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicReplayProfile {
+    pub profile: String,
+    pub image: Option<String>,
+    pub command_digest: String,
+    pub network_disabled: bool,
+    pub workspace_root: Option<Cid>,
 }
 
 /// Input for creating a task without a long argument list.
@@ -262,6 +276,7 @@ impl ExecutionAttestation {
             stdout_cid: Cid::hash_of(&output.stdout),
             stderr_cid: Cid::hash_of(&output.stderr),
             output_root,
+            replay_profile: receipt.replay_profile.clone(),
             resources: output.resources.clone(),
             observed_at,
             signature: None,
@@ -278,6 +293,7 @@ impl ExecutionAttestation {
             stdout_cid: Cid,
             stderr_cid: Cid,
             output_root: Option<Cid>,
+            replay_profile: &'a Option<DeterministicReplayProfile>,
             resources: &'a ResourceUsage,
             observed_at: u64,
         }
@@ -290,6 +306,7 @@ impl ExecutionAttestation {
             stdout_cid: self.stdout_cid,
             stderr_cid: self.stderr_cid,
             output_root: self.output_root,
+            replay_profile: &self.replay_profile,
             resources: &self.resources,
             observed_at: self.observed_at,
         })
@@ -346,6 +363,7 @@ impl ExecutionAttestation {
             || self.receipt_signature_hex != receipt_signature_hex(receipt)?
             || self.stdout_cid != receipt.stdout_cid
             || self.stderr_cid != receipt.stderr_cid
+            || self.replay_profile != receipt.replay_profile
             || self
                 .output_root
                 .is_some_and(|output_root| Some(output_root) != receipt.output_root)
@@ -379,11 +397,17 @@ impl ExecutionReceipt {
             stdout_cid: Cid::hash_of(&output.stdout),
             stderr_cid: Cid::hash_of(&output.stderr),
             output_root,
+            replay_profile: None,
             resources: output.resources.clone(),
             started_at,
             finished_at,
             signature: None,
         }
+    }
+
+    pub fn with_replay_profile(mut self, replay_profile: DeterministicReplayProfile) -> Self {
+        self.replay_profile = Some(replay_profile);
+        self
     }
 
     pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
@@ -398,6 +422,7 @@ impl ExecutionReceipt {
             stdout_cid: Cid,
             stderr_cid: Cid,
             output_root: Option<Cid>,
+            replay_profile: &'a Option<DeterministicReplayProfile>,
             resources: &'a ResourceUsage,
             started_at: u64,
             finished_at: u64,
@@ -413,6 +438,7 @@ impl ExecutionReceipt {
             stdout_cid: self.stdout_cid,
             stderr_cid: self.stderr_cid,
             output_root: self.output_root,
+            replay_profile: &self.replay_profile,
             resources: &self.resources,
             started_at: self.started_at,
             finished_at: self.finished_at,
@@ -446,6 +472,25 @@ impl ExecutionReceipt {
 
         NodeIdentity::verify(&verifying_key, &payload, &signature)
             .map_err(|_| ExecutionReceiptError::SignatureVerificationFailed)
+    }
+}
+
+impl DeterministicReplayProfile {
+    pub fn new(
+        profile: impl Into<String>,
+        image: Option<String>,
+        command: &str,
+        args: &[String],
+        network_disabled: bool,
+        workspace_root: Option<Cid>,
+    ) -> Self {
+        Self {
+            profile: profile.into(),
+            image,
+            command_digest: command_digest(command, args),
+            network_disabled,
+            workspace_root,
+        }
     }
 }
 
@@ -495,6 +540,17 @@ fn receipt_signature_hex(receipt: &ExecutionReceipt) -> Result<String, Execution
         .as_deref()
         .map(hex::encode)
         .ok_or(ExecutionReceiptError::MissingSignature)
+}
+
+fn command_digest(command: &str, args: &[String]) -> String {
+    #[derive(Serialize)]
+    struct CommandPayload<'a> {
+        command: &'a str,
+        args: &'a [String],
+    }
+    let payload = serde_json::to_vec(&CommandPayload { command, args })
+        .expect("command digest serialization should not fail");
+    hex::encode(Sha256::digest(payload))
 }
 
 impl TaskSpec {
@@ -811,6 +867,14 @@ mod tests {
         let attestor = NodeIdentity::generate();
         let output = successful_output(b"hello", b"");
         let output_root = Cid::hash_of(b"workspace-root");
+        let replay_profile = DeterministicReplayProfile::new(
+            "bubblewrap",
+            Some("nexus-runtime:v1".into()),
+            "echo",
+            &["hello".into()],
+            true,
+            Some(output_root),
+        );
         let receipt = ExecutionReceipt::from_process_output(
             "task-1",
             executor.did().clone(),
@@ -822,6 +886,7 @@ mod tests {
             10,
             11,
         )
+        .with_replay_profile(replay_profile.clone())
         .sign(&executor)
         .unwrap();
         let attestation = ExecutionAttestation::from_process_output(
@@ -835,6 +900,7 @@ mod tests {
         .unwrap();
 
         attestation.verify_signature().unwrap();
+        assert_eq!(attestation.replay_profile, Some(replay_profile));
         let result = TaskResult {
             task_id: "task-1".into(),
             executor: executor.did().clone(),
@@ -849,6 +915,55 @@ mod tests {
         };
 
         result.validate_receipt().unwrap();
+    }
+
+    #[test]
+    fn execution_attestation_rejects_replay_profile_mismatch() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let output = successful_output(b"hello", b"");
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["hello".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .with_replay_profile(DeterministicReplayProfile::new(
+            "bubblewrap",
+            Some("nexus-runtime:v1".into()),
+            "echo",
+            &["hello".into()],
+            true,
+            None,
+        ))
+        .sign(&executor)
+        .unwrap();
+        let mut attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            12,
+        );
+        attestation.replay_profile = Some(DeterministicReplayProfile::new(
+            "native",
+            None,
+            "echo",
+            &["hello".into()],
+            false,
+            None,
+        ));
+        let attestation = attestation.sign(&attestor).unwrap();
+
+        assert!(matches!(
+            attestation.validate_against_receipt(&receipt).unwrap_err(),
+            ExecutionReceiptError::AttestationReceiptMismatch
+        ));
     }
 
     #[test]

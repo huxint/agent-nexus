@@ -35,12 +35,13 @@ use local_state::*;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
-    CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt,
-    IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation, IdentityRotation,
-    IntentActionKind, IntentActionPlan, IntentKind, IntentResponse, IntentResponseKind,
-    Interaction, InteractionOutcome, RelationKind, SettlementRecord, SocialEvent, SocialEventKind,
-    SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
+    CollectiveVote, CollectiveVoteChoice, DeterministicReplayProfile, ExecutionAttestation,
+    ExecutionReceipt, IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation,
+    IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
+    IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
+    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -164,8 +165,8 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event task-offer --base <DIR> --task <ID> --price <N> [--eta <SECS>] [--rationale <TEXT>]");
     eprintln!("  {prog} event task-accept --base <DIR> --task <ID> --bidder <DID> --price <N>");
     eprintln!("  {prog} event task-cancel --base <DIR> --task <ID> --reason <TEXT>");
-    eprintln!("  {prog} event task-complete --base <DIR> --task <ID> (--success|--failure) [--exit-code <N>] [--stdout <TEXT>] [--stderr <TEXT>] [--actual-cost <N>] [--error <TEXT>] [--receipt --command <CMD> [--arg <ARG>...] [--workspace <HEX>] [--output-root <CID_HEX>] [--started-at <TS>] [--finished-at <TS>]]");
-    eprintln!("  {prog} event task-attest --base <DIR> --task <ID> --executor <DID> --receipt-signature <HEX> [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--observed-at <TS>]");
+    eprintln!("  {prog} event task-complete --base <DIR> --task <ID> (--success|--failure) [--exit-code <N>] [--stdout <TEXT>] [--stderr <TEXT>] [--actual-cost <N>] [--error <TEXT>] [--receipt --command <CMD> [--arg <ARG>...] [--workspace <HEX>] [--output-root <CID_HEX>] [--replay-profile <NAME>] [--replay-image <IMAGE>] [--replay-network-disabled] [--started-at <TS>] [--finished-at <TS>]]");
+    eprintln!("  {prog} event task-attest --base <DIR> --task <ID> --executor <DID> --receipt-signature <HEX> [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--replay-profile <NAME>] [--replay-image <IMAGE>] [--replay-command <CMD>] [--replay-arg <ARG>...] [--replay-network-disabled] [--observed-at <TS>]");
     eprintln!("  {prog} event task-dispute --base <DIR> --task <ID> --target <DID> --reason <TEXT> [--claim <CLAIM_ID>] [--evidence <TEXT>]");
     eprintln!("  {prog} event settlement --base <DIR> --payee <DID> --amount <N> [--task <ID>] [--claim <CLAIM_ID>] [--id <ID>] [--proof sovereign]");
     eprintln!("  {prog} demo");
@@ -3508,6 +3509,9 @@ fn cmd_event_task_complete(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let mut receipt_args = Vec::new();
     let mut workspace = None;
     let mut output_root = None;
+    let mut replay_profile = None;
+    let mut replay_image = None;
+    let mut replay_network_disabled = false;
     let mut started_at = None;
     let mut finished_at = None;
     let mut i = 3;
@@ -3572,6 +3576,17 @@ fn cmd_event_task_complete(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 i += 1;
                 output_root = Some(parse_cid(required_arg(args, i, "--output-root")?)?);
             }
+            "--replay-profile" => {
+                i += 1;
+                replay_profile = Some(required_arg(args, i, "--replay-profile")?.to_string());
+            }
+            "--replay-image" => {
+                i += 1;
+                replay_image = Some(required_arg(args, i, "--replay-image")?.to_string());
+            }
+            "--replay-network-disabled" => {
+                replay_network_disabled = true;
+            }
             "--started-at" => {
                 i += 1;
                 started_at = Some(parse_u64_arg(
@@ -3599,26 +3614,38 @@ fn cmd_event_task_complete(args: &[String]) -> Result<(), Box<dyn std::error::Er
             let task_id = task_id.ok_or("--task required")?;
             let exit_code = exit_code.unwrap_or(if success { 0 } else { 1 });
             let receipt = if with_receipt {
+                let command = command.ok_or("--command required when --receipt is set")?;
+                let replay_profile = replay_profile.as_ref().map(|profile| {
+                    DeterministicReplayProfile::new(
+                        profile.clone(),
+                        replay_image.clone(),
+                        &command,
+                        &receipt_args,
+                        replay_network_disabled,
+                        output_root,
+                    )
+                });
                 let output = ProcessOutput {
                     exit_code,
                     stdout: stdout.as_bytes().to_vec(),
                     stderr: stderr.as_bytes().to_vec(),
                     resources: ResourceUsage::default(),
                 };
-                Some(Box::new(
-                    ExecutionReceipt::from_process_output(
-                        task_id.clone(),
-                        identity.did().clone(),
-                        workspace,
-                        command.ok_or("--command required when --receipt is set")?,
-                        receipt_args,
-                        &output,
-                        output_root,
-                        started_at.unwrap_or(now),
-                        finished_at.unwrap_or(now),
-                    )
-                    .sign(identity)?,
-                ))
+                let mut receipt = ExecutionReceipt::from_process_output(
+                    task_id.clone(),
+                    identity.did().clone(),
+                    workspace,
+                    command,
+                    receipt_args,
+                    &output,
+                    output_root,
+                    started_at.unwrap_or(now),
+                    finished_at.unwrap_or(now),
+                );
+                if let Some(replay_profile) = replay_profile {
+                    receipt = receipt.with_replay_profile(replay_profile);
+                }
+                Some(Box::new(receipt.sign(identity)?))
             } else {
                 None
             };
@@ -3652,6 +3679,11 @@ fn cmd_event_task_attest(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let mut stderr_cid = None;
     let mut output_root = None;
     let mut observed_at = None;
+    let mut replay_profile = None;
+    let mut replay_image = None;
+    let mut replay_command = String::new();
+    let mut replay_args = Vec::new();
+    let mut replay_network_disabled = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -3692,6 +3724,25 @@ fn cmd_event_task_attest(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                 i += 1;
                 output_root = Some(parse_cid(required_arg(args, i, "--output-root")?)?);
             }
+            "--replay-profile" => {
+                i += 1;
+                replay_profile = Some(required_arg(args, i, "--replay-profile")?.to_string());
+            }
+            "--replay-image" => {
+                i += 1;
+                replay_image = Some(required_arg(args, i, "--replay-image")?.to_string());
+            }
+            "--replay-command" => {
+                i += 1;
+                replay_command = required_arg(args, i, "--replay-command")?.to_string();
+            }
+            "--replay-arg" => {
+                i += 1;
+                replay_args.push(required_arg(args, i, "--replay-arg")?.to_string());
+            }
+            "--replay-network-disabled" => {
+                replay_network_disabled = true;
+            }
             "--observed-at" => {
                 i += 1;
                 observed_at = Some(parse_u64_arg(
@@ -3717,6 +3768,16 @@ fn cmd_event_task_attest(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                 stdout_cid: stdout_cid.unwrap_or_else(|| Cid::hash_of(b"")),
                 stderr_cid: stderr_cid.unwrap_or_else(|| Cid::hash_of(b"")),
                 output_root,
+                replay_profile: replay_profile.as_ref().map(|profile| {
+                    DeterministicReplayProfile::new(
+                        profile.clone(),
+                        replay_image.clone(),
+                        &replay_command,
+                        &replay_args,
+                        replay_network_disabled,
+                        output_root,
+                    )
+                }),
                 resources: ResourceUsage::default(),
                 observed_at: observed_at.unwrap_or(now),
                 signature: None,
@@ -9048,6 +9109,11 @@ mod tests {
             workspace.to_string(),
             "--output-root".into(),
             hex::encode(output_root.as_bytes()),
+            "--replay-profile".into(),
+            "bubblewrap".into(),
+            "--replay-image".into(),
+            "nexus-runtime:v1".into(),
+            "--replay-network-disabled".into(),
         ])
         .unwrap();
 
@@ -9082,6 +9148,15 @@ mod tests {
             String::new(),
             "--output-root".into(),
             hex::encode(output_root.as_bytes()),
+            "--replay-profile".into(),
+            "bubblewrap".into(),
+            "--replay-image".into(),
+            "nexus-runtime:v1".into(),
+            "--replay-command".into(),
+            "python".into(),
+            "--replay-arg".into(),
+            "analysis.py".into(),
+            "--replay-network-disabled".into(),
         ])
         .unwrap();
         let attestor_event =
@@ -9119,6 +9194,18 @@ mod tests {
             hex::encode(output_root.as_bytes())
         );
         assert_eq!(
+            view["tasks"][0]["result"]["receipt"]["replay_profile"]["profile"],
+            "bubblewrap"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["receipt"]["replay_profile"]["image"],
+            "nexus-runtime:v1"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["receipt"]["replay_profile"]["network_disabled"],
+            true
+        );
+        assert_eq!(
             view["tasks"][0]["result"]["receipt"]["stdout_cid"],
             hex::encode(Cid::hash_of(b"ok").as_bytes())
         );
@@ -9152,7 +9239,11 @@ mod tests {
         );
         assert_eq!(
             view["tasks"][0]["result"]["resource_evidence"]["independent_verification"],
-            "attested_reexecution"
+            "deterministic_attested_reexecution"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["deterministic_replay_profile"],
+            true
         );
         assert_eq!(
             view["tasks"][0]["result"]["resource_evidence"]["verified_output"],
