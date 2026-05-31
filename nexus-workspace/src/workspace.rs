@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_working_dir_is_unrestricted() {
+    async fn exec_working_dir_stays_inside_workspace() {
         let (mut ws, _base) = setup_workspace().await;
 
         let opts = ExecOptions {
@@ -1008,8 +1008,11 @@ mod tests {
             ..Default::default()
         };
 
-        let output = ws.exec("true", &[], &opts).await.unwrap();
-        assert_eq!(output.exit_code, 0);
+        let err = ws.exec("true", &[], &opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escapes workspace root"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

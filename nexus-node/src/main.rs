@@ -952,6 +952,7 @@ fn workspace_run_failure_from_exec_error(error: &ExecError) -> WorkspaceRunFailu
         ExecError::Signalled => "signalled",
         ExecError::Io(_) => "io",
         ExecError::Timeout { .. } => "timeout",
+        ExecError::WorkingDirectoryOutsideWorkspace { .. } => "cwd_outside_workspace",
         ExecError::Other(_) => "exec_error",
     };
     WorkspaceRunFailure {
