@@ -1725,6 +1725,7 @@ dependencies = [
 name = "nexus-agent"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "ed25519-dalek",
  "hex",
  "nexus-core",

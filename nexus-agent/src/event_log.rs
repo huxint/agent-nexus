@@ -348,20 +348,39 @@ impl SocialEventLog {
     /// ties use the content hash id and DID so independently merged logs
     /// converge without trusting one author's clock.
     pub fn replay_into(&self, society: &mut Society) {
-        let mut events: Vec<&SocialEvent> = self.events.iter().collect();
-        events.sort_by(|a, b| {
-            a.seq
-                .cmp(&b.seq)
-                .then_with(|| a.id.cmp(&b.id))
-                .then_with(|| a.author.to_string().cmp(&b.author.to_string()))
-        });
+        self.replay_from(society, 0, 0);
+    }
+
+    /// Replay a suffix of accepted events and equivocation proofs.
+    ///
+    /// Callers must only use a suffix when all newly appended events sort
+    /// after the checkpointed replay prefix; otherwise use [`Self::replay_into`]
+    /// for a full deterministic replay.
+    pub fn replay_from(&self, society: &mut Society, event_start: usize, proof_start: usize) {
+        let mut events: Vec<&SocialEvent> = self.events.iter().skip(event_start).collect();
+        events.sort_by(|a, b| event_replay_key(a).cmp(&event_replay_key(b)));
 
         for event in events {
             society.apply_event(event);
         }
-        for proof in &self.equivocation_proofs {
+        for proof in self.equivocation_proofs.iter().skip(proof_start) {
             society.record_equivocation_proof(proof.clone());
         }
+    }
+
+    pub fn suffix_replay_is_ordered(&self, event_start: usize) -> bool {
+        if event_start == 0 || event_start >= self.events.len() {
+            return true;
+        }
+        let max_prefix_key = self.events[..event_start]
+            .iter()
+            .map(event_replay_key)
+            .max()
+            .expect("non-empty prefix");
+        self.events[event_start..]
+            .iter()
+            .map(event_replay_key)
+            .all(|key| key >= max_prefix_key)
     }
 
     /// Build a fresh society graph from this log.
@@ -396,6 +415,10 @@ impl SocialEventLog {
 fn fill_observed_times(observed_at: Vec<u64>) -> impl Iterator<Item = u64> {
     let fallback = unix_now();
     observed_at.into_iter().chain(std::iter::repeat(fallback))
+}
+
+fn event_replay_key(event: &SocialEvent) -> (u64, &str, String) {
+    (event.seq, event.id.as_str(), event.author.to_string())
 }
 
 #[cfg(test)]
