@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bootstrap;
+mod cli_args;
 mod discovery;
 mod ids;
 mod local_state;
@@ -26,6 +27,7 @@ mod society_view;
 mod state;
 
 use bootstrap::*;
+use cli_args::*;
 use discovery::*;
 use ids::{parse_cid, parse_workspace_id};
 use local_state::*;
@@ -3175,28 +3177,6 @@ where
     Ok(event)
 }
 
-fn required_arg<'a>(
-    args: &'a [String],
-    index: usize,
-    flag: &str,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
-    args.get(index)
-        .map(String::as_str)
-        .ok_or_else(|| format!("{flag} requires a value").into())
-}
-
-fn parse_u64_arg(value: &str, flag: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    value
-        .parse::<u64>()
-        .map_err(|err| format!("invalid {flag}: {err}").into())
-}
-
-fn parse_usize_arg(value: &str, flag: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    value
-        .parse::<usize>()
-        .map_err(|err| format!("invalid {flag}: {err}").into())
-}
-
 fn parse_discovery_sort(value: &str) -> Result<DiscoverySort, Box<dyn std::error::Error>> {
     match value {
         "relevance" | "relevant" => Ok(DiscoverySort::Relevance),
@@ -3209,22 +3189,6 @@ fn parse_discovery_sort(value: &str) -> Result<DiscoverySort, Box<dyn std::error
         )
         .into()),
     }
-}
-
-fn parse_i32_arg(value: &str, flag: &str) -> Result<i32, Box<dyn std::error::Error>> {
-    value
-        .parse::<i32>()
-        .map_err(|err| format!("invalid {flag}: {err}").into())
-}
-
-fn parse_env_assignment(value: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let (key, value) = value
-        .split_once('=')
-        .ok_or_else(|| "invalid --env, expected KEY=VALUE".to_string())?;
-    if key.is_empty() {
-        return Err("invalid --env, key cannot be empty".into());
-    }
-    Ok((key.to_string(), value.to_string()))
 }
 
 fn capability_from_name(name: &str) -> CapabilityDecl {
@@ -3351,10 +3315,6 @@ fn apply_permission(
         _ => return Err(format!("unknown permission: {value}").into()),
     }
     Ok(())
-}
-
-fn normalize_symbol(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
 }
 
 fn event_summary(event: &SocialEvent) -> String {
