@@ -5,6 +5,7 @@
 //! event log, and rebuilds the subjective society view.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::event_log::SocialEventLog;
 use crate::protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
@@ -18,8 +19,19 @@ pub const MAX_SOCIAL_EVENT_JSON_BYTES: usize = 256 * 1024;
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SocialMemory {
     log: SocialEventLog,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<SocialMemoryCheckpoint>,
     #[serde(skip)]
     society: Society,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SocialMemoryCheckpoint {
+    version: u16,
+    replayed_events: usize,
+    replayed_equivocation_proofs: usize,
+    log_digest: String,
+    society_cbor_hex: String,
 }
 
 impl<'de> Deserialize<'de> for SocialMemory {
@@ -30,10 +42,15 @@ impl<'de> Deserialize<'de> for SocialMemory {
         #[derive(Deserialize)]
         struct StoredMemory {
             log: SocialEventLog,
+            #[serde(default)]
+            checkpoint: Option<SocialMemoryCheckpoint>,
         }
 
         let stored = StoredMemory::deserialize(deserializer)?;
-        Ok(Self::from_log(stored.log))
+        Ok(Self::from_log_with_checkpoint(
+            stored.log,
+            stored.checkpoint,
+        ))
     }
 }
 
@@ -43,8 +60,30 @@ impl SocialMemory {
     }
 
     pub fn from_log(log: SocialEventLog) -> Self {
+        Self::from_log_with_checkpoint(log, None)
+    }
+
+    fn from_log_with_checkpoint(
+        log: SocialEventLog,
+        checkpoint: Option<SocialMemoryCheckpoint>,
+    ) -> Self {
+        if let Some(checkpoint) = checkpoint {
+            if let Some(society) = society_from_valid_checkpoint(&log, &checkpoint) {
+                return Self {
+                    log,
+                    checkpoint: Some(checkpoint),
+                    society,
+                };
+            }
+        }
+
         let society = log.to_society();
-        Self { log, society }
+        let checkpoint = Some(checkpoint_for(&log, &society));
+        Self {
+            log,
+            checkpoint,
+            society,
+        }
     }
 
     pub fn log(&self) -> &SocialEventLog {
@@ -107,6 +146,7 @@ impl SocialMemory {
         let inserted = self.log.append(event)?;
         if inserted {
             self.society = self.log.to_society();
+            self.checkpoint = Some(checkpoint_for(&self.log, &self.society));
         }
         Ok(inserted)
     }
@@ -124,6 +164,7 @@ impl SocialMemory {
         }
         if inserted > 0 {
             self.society = self.log.to_society();
+            self.checkpoint = Some(checkpoint_for(&self.log, &self.society));
         }
         Ok(inserted)
     }
@@ -148,6 +189,7 @@ impl SocialMemory {
             .collect::<Vec<_>>();
         if inserted_any {
             self.society = self.log.to_society();
+            self.checkpoint = Some(checkpoint_for(&self.log, &self.society));
         }
         results
     }
@@ -168,6 +210,66 @@ fn reject_oversized_event_json(data: &[u8]) -> Result<(), SocialProtocolError> {
         });
     }
     Ok(())
+}
+
+fn society_from_valid_checkpoint(
+    log: &SocialEventLog,
+    checkpoint: &SocialMemoryCheckpoint,
+) -> Option<Society> {
+    if checkpoint.version != 1 {
+        return None;
+    }
+    let replayed_events = checkpoint.replayed_events;
+    let replayed_proofs = checkpoint.replayed_equivocation_proofs;
+    if replayed_events > log.events().len() || replayed_proofs > log.equivocation_proofs().len() {
+        return None;
+    }
+    if log_digest(log, replayed_events, replayed_proofs) != checkpoint.log_digest {
+        return None;
+    }
+    if !log.suffix_replay_is_ordered(replayed_events) {
+        return None;
+    }
+
+    let society_bytes = hex::decode(&checkpoint.society_cbor_hex).ok()?;
+    let mut society = ciborium::from_reader::<Society, _>(society_bytes.as_slice()).ok()?;
+    log.replay_from(&mut society, replayed_events, replayed_proofs);
+    Some(society)
+}
+
+fn checkpoint_for(log: &SocialEventLog, society: &Society) -> SocialMemoryCheckpoint {
+    SocialMemoryCheckpoint {
+        version: 1,
+        replayed_events: log.events().len(),
+        replayed_equivocation_proofs: log.equivocation_proofs().len(),
+        log_digest: log_digest(log, log.events().len(), log.equivocation_proofs().len()),
+        society_cbor_hex: society_cbor_hex(society),
+    }
+}
+
+fn society_cbor_hex(society: &Society) -> String {
+    let mut bytes = Vec::new();
+    if ciborium::into_writer(society, &mut bytes).is_err() {
+        return String::new();
+    }
+    hex::encode(bytes)
+}
+
+fn log_digest(log: &SocialEventLog, event_count: usize, proof_count: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus:social-memory-checkpoint:v1");
+    hasher.update((event_count as u64).to_le_bytes());
+    for event in log.events().iter().take(event_count) {
+        hasher.update((event.id.len() as u64).to_le_bytes());
+        hasher.update(event.id.as_bytes());
+    }
+    hasher.update((proof_count as u64).to_le_bytes());
+    for proof in log.equivocation_proofs().iter().take(proof_count) {
+        let key = proof.evidence_key();
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -272,6 +374,108 @@ mod tests {
         assert_eq!(decoded.event_count(), 1);
         assert!(decoded.society().has_agent(alice.did()));
         assert_eq!(decoded.events().len(), 1);
+        assert!(serde_json::from_slice::<serde_json::Value>(&json)
+            .unwrap()
+            .get("checkpoint")
+            .is_some());
+    }
+
+    #[test]
+    fn deserialized_memory_uses_valid_checkpoint_for_log_tail() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([15; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let second = SocialEvent::new(
+            bob.did().clone(),
+            2,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([16; 32]),
+            },
+        )
+        .sign(&bob)
+        .unwrap();
+
+        let mut checkpointed = SocialMemory::new();
+        assert!(checkpointed.ingest_event(first).unwrap());
+        let mut json = serde_json::from_slice::<serde_json::Value>(
+            &serde_json::to_vec(&checkpointed).unwrap(),
+        )
+        .unwrap();
+        json["log"]["events"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(second).unwrap());
+
+        let decoded: SocialMemory = serde_json::from_value(json).unwrap();
+
+        assert_eq!(decoded.event_count(), 2);
+        assert!(decoded.society().has_agent(alice.did()));
+        assert!(decoded.society().has_agent(bob.did()));
+    }
+
+    #[test]
+    fn invalid_checkpoint_falls_back_to_full_replay() {
+        let alice = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([17; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let mut memory = SocialMemory::new();
+        assert!(memory.ingest_event(event).unwrap());
+        let mut json =
+            serde_json::from_slice::<serde_json::Value>(&serde_json::to_vec(&memory).unwrap())
+                .unwrap();
+        json["checkpoint"]["log_digest"] = serde_json::Value::String("tampered".into());
+
+        let decoded: SocialMemory = serde_json::from_value(json).unwrap();
+
+        assert_eq!(decoded.event_count(), 1);
+        assert!(decoded.society().has_agent(alice.did()));
+    }
+
+    #[test]
+    fn checkpoint_serializes_society_with_pair_key_indexes() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let relation = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("checkpoint edge".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let mut memory = SocialMemory::new();
+        assert!(memory.ingest_event(relation).unwrap());
+
+        let json = serde_json::to_vec(&memory).unwrap();
+        let decoded: SocialMemory = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(
+            decoded.society().edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Collaborator
+        );
+        let checkpoint = serde_json::from_slice::<serde_json::Value>(&json).unwrap();
+        let cbor_hex = checkpoint["checkpoint"]["society_cbor_hex"]
+            .as_str()
+            .unwrap();
+        assert!(!cbor_hex.is_empty());
     }
 
     #[test]
