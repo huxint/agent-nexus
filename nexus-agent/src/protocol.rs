@@ -55,6 +55,11 @@ pub enum SocialProtocolError {
     #[error("invalid identity rotation target DID {target}: {source}")]
     InvalidIdentityRotationTarget { target: Did, source: DidError },
 
+    #[error(
+        "identity {author} rotated to {successor}; new events must be signed by the successor"
+    )]
+    IdentityRotated { author: Did, successor: Did },
+
     #[error("social event is missing an author signature")]
     MissingSignature,
 
