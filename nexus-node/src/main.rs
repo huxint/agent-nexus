@@ -3803,6 +3803,7 @@ async fn handle_node_event(
             return;
         }
         NetworkEvent::SyncRequest {
+            request_id,
             request: SyncRequest::StateRequest { workspace_id },
             ..
         } => match server.refresh_workspace(workspace_id).await {
@@ -3816,9 +3817,36 @@ async fn handle_node_event(
                     unix_now(),
                 )
                 .await;
+                network.respond_to_sync(
+                    *request_id,
+                    SyncResponse::StateResponse {
+                        workspace_id: state.workspace_id,
+                        root_cid_hex: hex::encode(state.root.as_bytes()),
+                        name: state.name,
+                        owner_did: state.owner.to_string(),
+                    },
+                );
+                return;
             }
-            Ok(None) => {}
-            Err(err) => tracing::warn!("failed to refresh workspace {workspace_id}: {err}"),
+            Ok(None) => {
+                network.respond_to_sync(
+                    *request_id,
+                    SyncResponse::WorkspaceNotFound {
+                        workspace_id: *workspace_id,
+                    },
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!("failed to refresh workspace {workspace_id}: {err}");
+                network.respond_to_sync(
+                    *request_id,
+                    SyncResponse::Error {
+                        message: format!("refresh workspace state: {err}"),
+                    },
+                );
+                return;
+            }
         },
         _ => {}
     }
@@ -5948,20 +5976,19 @@ mod tests {
     }
 
     #[test]
-    fn social_events_response_errors_when_single_event_exceeds_frame_limit() {
+    fn social_events_response_skips_single_event_that_exceeds_frame_limit() {
         let identity = NodeIdentity::generate();
         let event = signed_workspace_event(&identity, 47, 1);
-        let event_id = event.id.clone();
         let mut memory = SocialMemory::new();
         assert!(memory.ingest_event(event).unwrap());
 
         let response = social_events_response_with_caps(&memory, &[], 10, 10, 0);
 
-        assert!(matches!(
-            response,
-            SyncResponse::Error { message }
-                if message.contains(&event_id) && message.contains("exceeds sync frame limit")
-        ));
+        let events_json = match response {
+            SyncResponse::SocialEventsResponse { events_json } => events_json,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(events_json.is_empty());
     }
 
     #[test]

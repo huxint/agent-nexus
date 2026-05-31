@@ -35,13 +35,7 @@ pub fn record_social_events(
     memory: &mut SocialMemory,
     events: impl IntoIterator<Item = SocialEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut inserted = false;
-    for event in events {
-        if memory.ingest_event(event)? {
-            inserted = true;
-        }
-    }
-    if inserted {
+    if memory.ingest_events(events)? > 0 {
         save_social_memory(path, memory)?;
     }
     Ok(())
@@ -143,11 +137,10 @@ pub fn social_events_response_with_caps(
                 let oversized_event_id = event.id.clone();
                 events_json.pop();
                 if events_json.is_empty() {
-                    return SyncResponse::Error {
-                        message: format!(
-                            "social event {oversized_event_id} exceeds sync frame limit"
-                        ),
-                    };
+                    tracing::warn!(
+                        "skipping social event {oversized_event_id}: exceeds sync frame limit"
+                    );
+                    continue;
                 }
                 break;
             }
@@ -187,21 +180,28 @@ pub async fn request_social_events_from_peer(
 
     match client.get_social_events(peer, known_event_ids, 512).await {
         Ok(events_json) => {
-            for data in events_json {
-                match ingest_social_event_bytes(&data, social_memory, memory_path) {
-                    Ok(SocialIngestOutcome::Inserted) => {
-                        inserted += 1;
-                        tracing::info!(
-                            "synced social event from {}; events={}, agents={}",
-                            peer,
-                            social_memory.event_count(),
-                            social_memory.agent_count()
-                        );
-                    }
-                    Ok(SocialIngestOutcome::Duplicate) => {}
-                    Err(err) => {
-                        tracing::warn!("rejected synced social event from {}: {err}", peer);
-                    }
+            let event_slices = events_json.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let results = social_memory.ingest_json_batch(event_slices);
+            inserted = results
+                .iter()
+                .filter(|result| matches!(result, Ok(true)))
+                .count();
+            if inserted > 0 {
+                if let Err(err) = save_social_memory(memory_path, social_memory) {
+                    tracing::warn!("failed to save synced social events from {}: {err}", peer);
+                } else {
+                    tracing::info!(
+                        "synced {} social events from {}; events={}, agents={}",
+                        inserted,
+                        peer,
+                        social_memory.event_count(),
+                        social_memory.agent_count()
+                    );
+                }
+            }
+            for result in results {
+                if let Err(err) = result {
+                    tracing::warn!("rejected synced social event from {}: {err}", peer);
                 }
             }
         }

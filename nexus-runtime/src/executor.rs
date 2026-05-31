@@ -76,7 +76,16 @@ pub struct ExecOptions {
 
     /// Capture stderr (true by default).
     pub capture_stderr: bool,
+
+    /// Maximum captured stdout bytes. The process still runs freely; excess
+    /// bytes are drained and discarded so pipes cannot grow memory without bound.
+    pub max_stdout_bytes: Option<usize>,
+
+    /// Maximum captured stderr bytes.
+    pub max_stderr_bytes: Option<usize>,
 }
+
+pub const DEFAULT_CAPTURE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for ExecOptions {
     fn default() -> Self {
@@ -87,6 +96,8 @@ impl Default for ExecOptions {
             timeout: None,
             capture_stdout: true,
             capture_stderr: true,
+            max_stdout_bytes: Some(DEFAULT_CAPTURE_LIMIT_BYTES),
+            max_stderr_bytes: Some(DEFAULT_CAPTURE_LIMIT_BYTES),
         }
     }
 }
@@ -131,6 +142,7 @@ impl Executor {
         cmd.args(args);
         cmd.current_dir(&working_dir);
         cmd.kill_on_drop(true);
+        configure_child_process_group(&mut cmd);
 
         for (key, value) in &options.env {
             cmd.env(key, value);
@@ -161,12 +173,18 @@ impl Executor {
         })?;
 
         let stdout_reader = if options.capture_stdout {
-            child.stdout.take().map(spawn_output_reader)
+            child
+                .stdout
+                .take()
+                .map(|reader| spawn_output_reader(reader, options.max_stdout_bytes))
         } else {
             None
         };
         let stderr_reader = if options.capture_stderr {
-            child.stderr.take().map(spawn_output_reader)
+            child
+                .stderr
+                .take()
+                .map(|reader| spawn_output_reader(reader, options.max_stderr_bytes))
         } else {
             None
         };
@@ -182,7 +200,7 @@ impl Executor {
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(status) => status.map_err(ExecError::Io)?,
                 Err(_) => {
-                    let _ = child.kill().await;
+                    terminate_child_tree(&mut child).await;
                     let wall_time = wall_start.elapsed();
                     let resources = ResourceUsage {
                         wall_time,
@@ -238,7 +256,7 @@ struct OutputReader {
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
-fn spawn_output_reader<R>(mut reader: R) -> OutputReader
+fn spawn_output_reader<R>(mut reader: R, limit: Option<usize>) -> OutputReader
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -251,14 +269,42 @@ where
             if bytes_read == 0 {
                 break;
             }
-            task_buffer
-                .lock()
-                .await
-                .extend_from_slice(&chunk[..bytes_read]);
+            let mut buffer = task_buffer.lock().await;
+            let keep = limit
+                .map(|limit| limit.saturating_sub(buffer.len()).min(bytes_read))
+                .unwrap_or(bytes_read);
+            if keep > 0 {
+                buffer.extend_from_slice(&chunk[..keep]);
+            }
         }
         Ok(())
     });
     OutputReader { buffer, task }
+}
+
+fn configure_child_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+async fn terminate_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        let _ = child.wait().await;
+        return;
+    }
+
+    let _ = child.kill().await;
 }
 
 async fn collect_output(reader: Option<OutputReader>) -> Result<Vec<u8>, ExecError> {
@@ -449,6 +495,45 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout), "hello from stdin");
+    }
+
+    #[tokio::test]
+    async fn captured_output_is_bounded_while_pipe_is_drained() {
+        let executor = Executor::new("/tmp");
+        let opts = ExecOptions {
+            max_stdout_bytes: Some(8),
+            ..Default::default()
+        };
+
+        let result = executor
+            .exec("sh", &["-c", "printf 1234567890"], &opts)
+            .await
+            .expect("command should complete");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"12345678");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendant_process_group() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let marker = temp.path().join("leaked.txt");
+        let executor = Executor::new(temp.path());
+        let opts = ExecOptions {
+            timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let command = format!("(sleep 0.4; echo leaked > '{}') & wait", marker.display());
+
+        let err = executor
+            .exec("sh", &["-c", &command], &opts)
+            .await
+            .expect_err("command should time out");
+        assert!(matches!(err, ExecError::Timeout { .. }));
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!marker.exists(), "descendant process survived timeout");
     }
 
     #[tokio::test]
