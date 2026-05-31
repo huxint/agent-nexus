@@ -24,9 +24,19 @@ use crate::task::{
     TaskResult, TaskSpec,
 };
 
+/// Current social event wire version.
+pub const SOCIAL_EVENT_PROTOCOL_VERSION: u16 = 1;
+
+fn default_social_event_protocol_version() -> u16 {
+    SOCIAL_EVENT_PROTOCOL_VERSION
+}
+
 /// Errors produced while signing or verifying social events.
 #[derive(Debug, thiserror::Error)]
 pub enum SocialProtocolError {
+    #[error("unsupported social event version {version}; supported version is {supported}")]
+    UnsupportedSocialEventVersion { version: u16, supported: u16 },
+
     #[error("event author {author} does not match signer {signer}")]
     AuthorSignerMismatch { author: Did, signer: Did },
 
@@ -112,6 +122,8 @@ pub enum SocialProtocolError {
 /// A signed or unsigned social protocol event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SocialEvent {
+    #[serde(default = "default_social_event_protocol_version")]
+    pub version: u16,
     pub id: String,
     pub author: Did,
     pub seq: u64,
@@ -214,9 +226,11 @@ impl SocialEvent {
         timestamp: u64,
         kind: SocialEventKind,
     ) -> Self {
-        let id = Self::content_id_for(&author, seq, prev.as_deref(), timestamp, &kind)
+        let version = SOCIAL_EVENT_PROTOCOL_VERSION;
+        let id = Self::content_id_for(version, &author, seq, prev.as_deref(), timestamp, &kind)
             .expect("social event content should serialize");
         Self {
+            version,
             id,
             author,
             seq,
@@ -233,6 +247,7 @@ impl SocialEvent {
     /// the payload being signed instead of an independent mutable field.
     pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
         Self::signing_payload_for(
+            self.version,
             &self.author,
             self.seq,
             self.prev.as_deref(),
@@ -243,6 +258,7 @@ impl SocialEvent {
 
     pub fn content_id(&self) -> Result<String, serde_json::Error> {
         Self::content_id_for(
+            self.version,
             &self.author,
             self.seq,
             self.prev.as_deref(),
@@ -252,6 +268,34 @@ impl SocialEvent {
     }
 
     fn signing_payload_for(
+        version: u16,
+        author: &Did,
+        seq: u64,
+        prev: Option<&str>,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            version: u16,
+            author: &'a Did,
+            seq: u64,
+            prev: Option<&'a str>,
+            timestamp: u64,
+            kind: &'a SocialEventKind,
+        }
+
+        serde_json::to_vec(&Payload {
+            version,
+            author,
+            seq,
+            prev,
+            timestamp,
+            kind,
+        })
+    }
+
+    fn legacy_signing_payload_for(
         author: &Did,
         seq: u64,
         prev: Option<&str>,
@@ -277,13 +321,25 @@ impl SocialEvent {
     }
 
     fn content_id_for(
+        version: u16,
         author: &Did,
         seq: u64,
         prev: Option<&str>,
         timestamp: u64,
         kind: &SocialEventKind,
     ) -> Result<String, serde_json::Error> {
-        let payload = Self::signing_payload_for(author, seq, prev, timestamp, kind)?;
+        let payload = Self::signing_payload_for(version, author, seq, prev, timestamp, kind)?;
+        Ok(hex::encode(Sha256::digest(payload)))
+    }
+
+    fn legacy_content_id_for(
+        author: &Did,
+        seq: u64,
+        prev: Option<&str>,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<String, serde_json::Error> {
+        let payload = Self::legacy_signing_payload_for(author, seq, prev, timestamp, kind)?;
         Ok(hex::encode(Sha256::digest(payload)))
     }
 
@@ -302,27 +358,65 @@ impl SocialEvent {
             });
         }
 
+        self.verify_protocol_version()?;
         self.id = self.content_id()?;
         let payload = self.signing_payload()?;
         self.signature = Some(identity.sign(&payload).to_bytes().to_vec());
         Ok(self)
     }
 
-    pub fn verify_content_id(&self) -> Result<(), SocialProtocolError> {
-        let expected = self.content_id()?;
-        if self.id == expected {
+    pub fn verify_protocol_version(&self) -> Result<(), SocialProtocolError> {
+        if self.version == SOCIAL_EVENT_PROTOCOL_VERSION {
             Ok(())
         } else {
-            Err(SocialProtocolError::EventIdMismatch {
-                actual: self.id.clone(),
-                expected,
+            Err(SocialProtocolError::UnsupportedSocialEventVersion {
+                version: self.version,
+                supported: SOCIAL_EVENT_PROTOCOL_VERSION,
             })
         }
     }
 
+    pub fn verify_content_id(&self) -> Result<(), SocialProtocolError> {
+        self.signing_payload_matching_content_id().map(|_| ())
+    }
+
+    fn signing_payload_matching_content_id(&self) -> Result<Vec<u8>, SocialProtocolError> {
+        self.verify_protocol_version()?;
+        let expected = self.content_id()?;
+        if self.id == expected {
+            return Ok(self.signing_payload()?);
+        }
+
+        // Backward compatibility for pre-N7 event JSON that did not carry a
+        // version field in the signed payload. These events are treated as v1
+        // but keep their original content id and signature valid.
+        if self.version == SOCIAL_EVENT_PROTOCOL_VERSION {
+            let legacy_expected = Self::legacy_content_id_for(
+                &self.author,
+                self.seq,
+                self.prev.as_deref(),
+                self.timestamp,
+                &self.kind,
+            )?;
+            if self.id == legacy_expected {
+                return Ok(Self::legacy_signing_payload_for(
+                    &self.author,
+                    self.seq,
+                    self.prev.as_deref(),
+                    self.timestamp,
+                    &self.kind,
+                )?);
+            }
+        }
+
+        Err(SocialProtocolError::EventIdMismatch {
+            actual: self.id.clone(),
+            expected,
+        })
+    }
+
     /// Verify that the event signature was produced by `author`.
     pub fn verify_signature(&self) -> Result<(), SocialProtocolError> {
-        self.verify_content_id()?;
         let signature = self
             .signature
             .as_deref()
@@ -331,7 +425,7 @@ impl SocialEvent {
             .map_err(|_| SocialProtocolError::InvalidSignatureBytes)?;
         let key_bytes = parse_did(self.author.as_str())?;
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)?;
-        let payload = self.signing_payload()?;
+        let payload = self.signing_payload_matching_content_id()?;
 
         NodeIdentity::verify(&verifying_key, &payload, &signature)
             .map_err(|_| SocialProtocolError::SignatureVerificationFailed)
@@ -545,11 +639,76 @@ mod tests {
 
         let json = event.to_json().unwrap();
         let decoded = SocialEvent::from_json(&json).unwrap();
+        assert_eq!(decoded.version, SOCIAL_EVENT_PROTOCOL_VERSION);
         assert_eq!(decoded.signature, Some(vec![1, 2, 3]));
 
         let signed_payload = decoded.signing_payload().unwrap();
         let payload_text = String::from_utf8(signed_payload).unwrap();
         assert!(!payload_text.contains("signature"));
+        assert!(payload_text.contains("version"));
+    }
+
+    #[test]
+    fn social_event_rejects_unknown_protocol_version() {
+        let alice = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([1; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["version"] = serde_json::json!(SOCIAL_EVENT_PROTOCOL_VERSION + 1);
+        let decoded = SocialEvent::from_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let err = decoded
+            .validate()
+            .expect_err("unknown social event version should be rejected");
+
+        assert!(matches!(
+            err,
+            SocialProtocolError::UnsupportedSocialEventVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn social_event_accepts_legacy_v1_json_without_version_field() {
+        let alice = NodeIdentity::generate();
+        let mut event = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([2; 32]),
+            },
+        );
+        event.id = SocialEvent::legacy_content_id_for(
+            &event.author,
+            event.seq,
+            event.prev.as_deref(),
+            event.timestamp,
+            &event.kind,
+        )
+        .unwrap();
+        let legacy_payload = SocialEvent::legacy_signing_payload_for(
+            &event.author,
+            event.seq,
+            event.prev.as_deref(),
+            event.timestamp,
+            &event.kind,
+        )
+        .unwrap();
+        event.signature = Some(alice.sign(&legacy_payload).to_bytes().to_vec());
+        let mut json = serde_json::to_value(&event).unwrap();
+        json.as_object_mut().unwrap().remove("version");
+        let decoded = SocialEvent::from_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+
+        decoded
+            .validate()
+            .expect("legacy v1 event without version should remain valid");
+        assert_eq!(decoded.version, SOCIAL_EVENT_PROTOCOL_VERSION);
     }
 
     #[test]
