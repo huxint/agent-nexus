@@ -278,6 +278,8 @@ pub(crate) fn society_json_for_base(
                                 "task_id": decision.task_id,
                                 "claim_id": decision.claim_id,
                                 "target": decision.target.as_ref().map(ToString::to_string),
+                                "truth_status": society.collective_decision_truth_status(decision),
+                                "anchor": decision.anchor,
                                 "reason": decision.reason,
                                 "timestamp": decision.timestamp,
                             })
@@ -915,6 +917,7 @@ fn governance_signal_json(signal: GovernanceSignal) -> serde_json::Value {
         "outcome": signal.outcome,
         "task_id": signal.task_id,
         "claim_id": signal.claim_id,
+        "truth_status": signal.truth_status,
         "reason": signal.reason,
         "timestamp": signal.timestamp,
     })
@@ -1173,6 +1176,8 @@ fn settlement_json(settlement: &SettlementRecord) -> serde_json::Value {
         "payer": settlement.payer.to_string(),
         "payee": settlement.payee.to_string(),
         "amount": settlement.amount,
+        "truth_status": settlement.truth_status(),
+        "anchor": settlement.authority_anchor(),
         "proof": settlement.proof,
         "settled_at": settlement.settled_at,
     })
@@ -1212,6 +1217,7 @@ fn task_claim_judgment_json(judgment: TaskClaimJudgment) -> serde_json::Value {
         "task_id": judgment.task_id,
         "claim_id": judgment.claim_id,
         "target": judgment.target.as_ref().map(ToString::to_string),
+        "truth_status": judgment.truth_status,
         "reason": judgment.reason,
         "timestamp": judgment.timestamp,
     })

@@ -2528,6 +2528,7 @@ fn cmd_event_collective_decision(args: &[String]) -> Result<(), Box<dyn std::err
                     task_id,
                     claim_id,
                     target,
+                    anchor: None,
                     reason: reason.unwrap_or_default(),
                     timestamp: now,
                 },
@@ -7132,6 +7133,8 @@ mod tests {
         assert!(proposal["decision"]["task_id"].is_null());
         assert!(proposal["decision"]["claim_id"].is_null());
         assert!(proposal["decision"]["target"].is_null());
+        assert_eq!(proposal["decision"]["truth_status"], "claimed");
+        assert!(proposal["decision"]["anchor"].is_null());
         for event in memory.events() {
             event.verify_signature().unwrap();
         }
@@ -7795,6 +7798,8 @@ mod tests {
 
         let view = society_json(&memory);
         assert_eq!(view["settlements"][0]["id"], "settlement-1");
+        assert_eq!(view["settlements"][0]["truth_status"], "claimed");
+        assert!(view["settlements"][0]["anchor"].is_null());
         assert_eq!(view["settlements"][0]["proof"]["kind"], "Sovereign");
     }
 
