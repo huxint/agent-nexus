@@ -90,6 +90,9 @@ pub enum SocialProtocolError {
         max_future_skew_secs: u64,
     },
 
+    #[error("social event JSON is {actual} bytes, exceeding max {max}")]
+    EventTooLarge { actual: usize, max: usize },
+
     #[error("equivocation proof authors differ: {left} != {right}")]
     EquivocationAuthorMismatch { left: Did, right: Did },
 
