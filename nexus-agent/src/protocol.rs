@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::manifest::AgentManifest;
 use crate::society::{
     AgentIntent, CapabilityGrant, CapabilityRevocation, CollectiveDecision, CollectiveProposal,
-    CollectiveVote, IntentResponse, Interaction, RelationKind, SettlementRecord, TaskDispute,
-    WorkspaceRun, WorkspaceSnapshot,
+    CollectiveVote, IdentityRevocation, IntentResponse, Interaction, RelationKind,
+    SettlementRecord, TaskDispute, WorkspaceRun, WorkspaceSnapshot,
 };
 use crate::task::{
     ExecutionAttestation, ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer,
@@ -137,6 +137,8 @@ pub enum SocialEventKind {
     EquivocationObserved { proof: Box<EquivocationProof> },
     /// Publish or refresh an agent's public profile.
     ManifestPublished { manifest: AgentManifest },
+    /// Revoke the author's identity in the social layer.
+    IdentityRevoked { revocation: IdentityRevocation },
     /// Join a workspace as a social presence event.
     WorkspaceJoined { workspace: WorkspaceId },
     /// Declare or update a subjective relation to another agent.
@@ -343,6 +345,9 @@ impl SocialEvent {
         match &self.kind {
             SocialEventKind::ManifestPublished { manifest } => {
                 self.ensure_subject("manifest", &manifest.did)
+            }
+            SocialEventKind::IdentityRevoked { revocation } => {
+                self.ensure_subject("identity revocation", &revocation.did)
             }
             SocialEventKind::InteractionRecorded { interaction } => {
                 self.ensure_subject("interaction", &interaction.from)
@@ -864,6 +869,30 @@ mod tests {
                     issuer: issuer.did().clone(),
                     capability_signature_id: "capability-id".into(),
                     reason: Some("rotated access".into()),
+                    revoked_at: 1,
+                },
+            },
+        )
+        .sign(&author)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_identity_revocation_for_another_identity() {
+        let author = NodeIdentity::generate();
+        let target = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            author.did().clone(),
+            1,
+            SocialEventKind::IdentityRevoked {
+                revocation: IdentityRevocation {
+                    did: target.did().clone(),
+                    reason: Some("compromised".into()),
                     revoked_at: 1,
                 },
             },

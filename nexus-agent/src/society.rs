@@ -568,6 +568,14 @@ pub struct CapabilityRevocation {
     pub revoked_at: u64,
 }
 
+/// A signed social fact that marks an identity as revoked.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityRevocation {
+    pub did: Did,
+    pub reason: Option<String>,
+    pub revoked_at: u64,
+}
+
 /// A signed claim that an agent observed or created a workspace snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -766,6 +774,8 @@ impl IntentResponse {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Society {
     agents: HashSet<Did>,
+    #[serde(default)]
+    identity_revocations: HashMap<Did, IdentityRevocation>,
     manifests: HashMap<Did, AgentManifest>,
     edges: HashMap<(Did, Did), SocialEdge>,
     #[serde(default)]
@@ -934,6 +944,32 @@ impl Society {
         let mut agents: Vec<&Did> = self.agents.iter().collect();
         agents.sort_by_key(|did| did.to_string());
         agents
+    }
+
+    pub fn record_identity_revocation(&mut self, revocation: IdentityRevocation) {
+        self.register_agent(revocation.did.clone());
+        self.identity_revocations
+            .entry(revocation.did.clone())
+            .or_insert(revocation);
+    }
+
+    pub fn identity_revocation(&self, did: &Did) -> Option<&IdentityRevocation> {
+        self.identity_revocations.get(did)
+    }
+
+    pub fn identity_revocations(&self) -> Vec<&IdentityRevocation> {
+        let mut revocations: Vec<&IdentityRevocation> =
+            self.identity_revocations.values().collect();
+        revocations.sort_by(|a, b| {
+            a.revoked_at
+                .cmp(&b.revoked_at)
+                .then_with(|| a.did.to_string().cmp(&b.did.to_string()))
+        });
+        revocations
+    }
+
+    pub fn is_identity_revoked(&self, did: &Did) -> bool {
+        self.identity_revocations.contains_key(did)
     }
 
     pub fn agent_manifest(&self, did: &Did) -> Option<&AgentManifest> {
@@ -1823,6 +1859,9 @@ impl Society {
                 self.register_agent(manifest.did.clone());
                 self.manifests
                     .insert(manifest.did.clone(), manifest.clone());
+            }
+            SocialEventKind::IdentityRevoked { revocation } => {
+                self.record_identity_revocation(revocation.clone());
             }
             SocialEventKind::WorkspaceJoined { workspace } => {
                 self.join_workspace(event.author.clone(), *workspace);
@@ -3585,6 +3624,31 @@ mod tests {
             society.capability_grants()[0].capability.subject,
             subject.did().clone()
         );
+    }
+
+    #[test]
+    fn identity_revocation_marks_agent_revoked() {
+        let identity = NodeIdentity::generate();
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            identity.did().clone(),
+            1,
+            SocialEventKind::IdentityRevoked {
+                revocation: IdentityRevocation {
+                    did: identity.did().clone(),
+                    reason: Some("key compromised".into()),
+                    revoked_at: 1,
+                },
+            },
+        ));
+
+        assert!(society.has_agent(identity.did()));
+        assert!(society.is_identity_revoked(identity.did()));
+        let revocation = society.identity_revocation(identity.did()).unwrap();
+        assert_eq!(revocation.did, *identity.did());
+        assert_eq!(revocation.reason.as_deref(), Some("key compromised"));
+        assert_eq!(society.identity_revocations().len(), 1);
     }
 
     #[test]

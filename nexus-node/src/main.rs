@@ -34,11 +34,11 @@ use local_state::*;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
-    CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt, IntentActionKind,
-    IntentActionPlan, IntentKind, IntentResponse, IntentResponseKind, Interaction,
-    InteractionOutcome, RelationKind, SettlementRecord, SocialEvent, SocialEventKind, SocialMemory,
-    TaskDispute, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
-    WorkspaceSnapshot,
+    CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt,
+    IdentityRevocation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
+    IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
+    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceRun, WorkspaceRunContext,
+    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -110,6 +110,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event manifest --base <DIR> [--name <NAME>] [--description <TEXT>] [--provide <NAME>] [--goal <TEXT>] [--value <TEXT>] [--preference <TEXT>] [--role <TEXT>]");
     eprintln!("  {prog} event intent --base <DIR> --kind <goal|need|offer|proposal|status> --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>]");
     eprintln!("  {prog} event intent-response --base <DIR> --intent <ID> --kind <interested|accept|decline|counter|fulfilled> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--evidence <TEXT>]");
+    eprintln!("  {prog} event identity-revoke --base <DIR> [--reason <TEXT>] [--revoked-at <TS>]");
     eprintln!("  {prog} event workspace-join --base <DIR> --workspace <HEX>");
     eprintln!("  {prog} event workspace-snapshot --base <DIR> --workspace <HEX> --root <CID_HEX> [--label <TEXT>] [--note <TEXT>]");
     eprintln!("  {prog} event workspace-run --base <DIR> --workspace <HEX> --command <CMD> [--arg <ARG>...] [--exit-code <N>] [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--cwd <DIR>] [--env-key <KEY>] [--stdin <TEXT>|--stdin-cid <CID_HEX> --stdin-bytes <N>] [--timeout-ms <N>] [--failure-kind <KIND> --failure-message <TEXT>] [--started-at <TS>] [--finished-at <TS>] [--note <TEXT>]");
@@ -1557,7 +1558,7 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
+            "event subcommand required: manifest, intent, identity-revoke, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -1568,6 +1569,9 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             cmd_event_intent(args)
         }
         "intent-response" | "respond" | "response" => cmd_event_intent_response(args),
+        "identity-revoke" | "identity-revoked" | "revoke-identity" => {
+            cmd_event_identity_revoke(args)
+        }
         "workspace-join" | "workspace" | "join" => cmd_event_workspace_join(args),
         "workspace-snapshot" | "snapshot" => cmd_event_workspace_snapshot(args),
         "workspace-run" | "run" => cmd_event_workspace_run(args),
@@ -1853,6 +1857,51 @@ fn cmd_event_intent_response(args: &[String]) -> Result<(), Box<dyn std::error::
                 response.id = random_social_id();
             }
             Ok(SocialEventKind::IntentResponded { response })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_identity_revoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut reason = None;
+    let mut revoked_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            "--revoked-at" => {
+                i += 1;
+                revoked_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--revoked-at")?,
+                    "--revoked-at",
+                )?);
+            }
+            other => return Err(format!("unknown identity-revoke option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::IdentityRevoked {
+                revocation: IdentityRevocation {
+                    did: identity.did().clone(),
+                    reason,
+                    revoked_at: revoked_at.unwrap_or(now),
+                },
+            })
         },
         now,
     )?;
@@ -7170,6 +7219,52 @@ mod tests {
             view["workspaces"][0]["members"][0],
             identity.did().to_string()
         );
+        for event in memory.events() {
+            event.verify_signature().unwrap();
+        }
+    }
+
+    #[test]
+    fn event_commands_record_identity_revocation() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "manifest".into(),
+            "--base".into(),
+            base.clone(),
+            "--name".into(),
+            "retiring-agent".into(),
+        ])
+        .unwrap();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "identity-revoke".into(),
+            "--base".into(),
+            base,
+            "--reason".into(),
+            "key compromised".into(),
+            "--revoked-at".into(),
+            "456".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 2);
+        let view = society_json(&memory);
+        assert_eq!(view["agents"][0]["did"], identity.did().to_string());
+        assert_eq!(view["agents"][0]["revoked"], true);
+        assert_eq!(
+            view["agents"][0]["revocation"]["did"],
+            identity.did().to_string()
+        );
+        assert_eq!(view["agents"][0]["revocation"]["reason"], "key compromised");
+        assert_eq!(view["agents"][0]["revocation"]["revoked_at"], 456);
         for event in memory.events() {
             event.verify_signature().unwrap();
         }
