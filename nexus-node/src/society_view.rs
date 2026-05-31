@@ -1199,6 +1199,7 @@ fn workspace_ownership_fact_json(fact: WorkspaceOwnershipFact) -> serde_json::Va
     serde_json::json!({
         "workspace": fact.claim.workspace.to_string(),
         "owner": fact.claim.owner.to_string(),
+        "previous_owner": fact.claim.previous_owner.map(|owner| owner.to_string()),
         "root": fact.claim.root.map(|root| hex::encode(root.as_bytes())),
         "truth_status": fact.truth_status,
         "anchored": fact.truth_status == nexus_agent::FactTruthStatus::Anchored,
