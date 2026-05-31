@@ -7594,8 +7594,8 @@ mod tests {
             hex::encode(output_root.as_bytes())
         );
         assert_eq!(task_workspace["latest_snapshot"]["label"], "task-result");
-        assert_eq!(view["relations"][0]["successes"], 1);
-        assert!(view["reputations"][0]["composite"].as_f64().unwrap() > 0.5);
+        assert!(view["relations"].as_array().unwrap().is_empty());
+        assert!(view["reputations"].as_array().unwrap().is_empty());
         let agent = view["agents"]
             .as_array()
             .unwrap()
@@ -7607,8 +7607,14 @@ mod tests {
             agent["activity"]["task_result_claims"][0]["task_id"],
             task_id
         );
-        assert_eq!(agent["activity"]["interactions"][0]["outcome"], "Success");
-        assert_eq!(agent["activity"]["reputations"][0]["successes"], 1);
+        assert!(agent["activity"]["interactions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(agent["activity"]["reputations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         for event in memory.events() {
             event.verify_signature().unwrap();
         }

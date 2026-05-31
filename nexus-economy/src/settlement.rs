@@ -5,10 +5,12 @@
 //! zero-knowledge proofs are optional evidence sources, not prerequisites.
 
 use nexus_core::Did;
+use nexus_crypto::verify_did_signature;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const HASH_HEX_LEN: usize = 64;
+const MUTUAL_CREDIT_SIGNATURE_DOMAIN: &str = "nexus:mutual-credit-settlement:v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityKind {
@@ -113,6 +115,18 @@ pub enum SettlementError {
     #[error("collective quorum has {attestors} attestors, requires {threshold}")]
     InsufficientQuorum { attestors: usize, threshold: usize },
 
+    #[error("mutual-credit proof amount {proof_amount} does not match settlement amount {settlement_amount}")]
+    MutualCreditAmountMismatch {
+        proof_amount: u64,
+        settlement_amount: u64,
+    },
+
+    #[error("mutual-credit counterparty {counterparty} does not match settlement payee {payee}")]
+    MutualCreditCounterpartyMismatch { counterparty: Did, payee: Did },
+
+    #[error("mutual-credit counterparty signature verification failed")]
+    InvalidCounterpartySignature,
+
     #[error("failed to encode settlement payload: {0}")]
     Serialization(String),
 }
@@ -170,6 +184,19 @@ impl SettlementProof {
             Self::AnchoredCheckpoint(proof) => proof.validate(),
         }
     }
+
+    pub fn validate_for_settlement(
+        &self,
+        payer: &Did,
+        payee: &Did,
+        amount: u64,
+    ) -> Result<(), SettlementError> {
+        self.validate()?;
+        if let Self::MutualCredit(proof) = self {
+            proof.verify_counterparty_signature(payer, payee, amount)?;
+        }
+        Ok(())
+    }
 }
 
 impl MutualCreditSettlement {
@@ -182,6 +209,57 @@ impl MutualCreditSettlement {
             });
         }
         Ok(())
+    }
+
+    pub fn counterparty_signing_payload(
+        ledger_tx_id: &str,
+        amount: u64,
+        payer: &Did,
+        payee: &Did,
+    ) -> Result<Vec<u8>, SettlementError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            domain: &'static str,
+            ledger_tx_id: &'a str,
+            amount: u64,
+            payer: &'a Did,
+            payee: &'a Did,
+        }
+
+        serde_json::to_vec(&Payload {
+            domain: MUTUAL_CREDIT_SIGNATURE_DOMAIN,
+            ledger_tx_id,
+            amount,
+            payer,
+            payee,
+        })
+        .map_err(|err| SettlementError::Serialization(err.to_string()))
+    }
+
+    pub fn verify_counterparty_signature(
+        &self,
+        payer: &Did,
+        payee: &Did,
+        settlement_amount: u64,
+    ) -> Result<(), SettlementError> {
+        self.validate()?;
+        if self.amount != settlement_amount {
+            return Err(SettlementError::MutualCreditAmountMismatch {
+                proof_amount: self.amount,
+                settlement_amount,
+            });
+        }
+        if &self.counterparty != payee {
+            return Err(SettlementError::MutualCreditCounterpartyMismatch {
+                counterparty: self.counterparty.clone(),
+                payee: payee.clone(),
+            });
+        }
+
+        let payload =
+            Self::counterparty_signing_payload(&self.ledger_tx_id, self.amount, payer, payee)?;
+        verify_did_signature(payee, &payload, &self.counterparty_signature)
+            .map_err(|_| SettlementError::InvalidCounterpartySignature)
     }
 }
 
@@ -271,6 +349,7 @@ fn decode_hash_hex(field: &'static str, value: &str) -> Result<Vec<u8>, Settleme
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_crypto::NodeIdentity;
 
     fn hash_hex(byte: u8) -> String {
         hex::encode([byte; 32])
@@ -380,6 +459,60 @@ mod tests {
             SettlementError::InsufficientConfirmations {
                 confirmations: 2,
                 required: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn mutual_credit_requires_valid_payee_signature() {
+        let payer = NodeIdentity::generate();
+        let payee = NodeIdentity::generate();
+        let payload = MutualCreditSettlement::counterparty_signing_payload(
+            "ledger-tx-1",
+            42,
+            payer.did(),
+            payee.did(),
+        )
+        .unwrap();
+        let proof = MutualCreditSettlement {
+            counterparty: payee.did().clone(),
+            amount: 42,
+            ledger_tx_id: "ledger-tx-1".into(),
+            counterparty_signature: payee.sign(&payload).to_bytes().to_vec(),
+        };
+
+        SettlementProof::MutualCredit(proof.clone())
+            .validate_for_settlement(payer.did(), payee.did(), 42)
+            .unwrap();
+
+        let forged_payload = MutualCreditSettlement::counterparty_signing_payload(
+            "ledger-tx-1",
+            43,
+            payer.did(),
+            payee.did(),
+        )
+        .unwrap();
+        let forged = MutualCreditSettlement {
+            counterparty: payee.did().clone(),
+            amount: 42,
+            ledger_tx_id: "ledger-tx-1".into(),
+            counterparty_signature: payee.sign(&forged_payload).to_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            SettlementProof::MutualCredit(forged)
+                .validate_for_settlement(payer.did(), payee.did(), 42)
+                .unwrap_err(),
+            SettlementError::InvalidCounterpartySignature
+        );
+
+        assert_eq!(
+            SettlementProof::MutualCredit(proof)
+                .validate_for_settlement(payer.did(), payee.did(), 41)
+                .unwrap_err(),
+            SettlementError::MutualCreditAmountMismatch {
+                proof_amount: 42,
+                settlement_amount: 41,
             }
         );
     }

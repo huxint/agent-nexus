@@ -11,6 +11,7 @@ use nexus_crypto::capability::{verify_capability, SigningError};
 use nexus_crypto::{parse_did, DidError, NodeIdentity};
 use nexus_economy::SettlementError;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::manifest::AgentManifest;
 use crate::society::{
@@ -64,6 +65,9 @@ pub enum SocialProtocolError {
 
     #[error("duplicate social event id with divergent payload: {event_id}")]
     DuplicateEventConflict { event_id: String },
+
+    #[error("social event id {actual} does not match content hash {expected}")]
+    EventIdMismatch { actual: String, expected: String },
 
     #[error("failed to serialize social event signing payload: {0}")]
     PayloadSerialization(#[from] serde_json::Error),
@@ -147,10 +151,10 @@ pub enum SocialEventKind {
 
 impl SocialEvent {
     pub fn new(author: Did, timestamp: u64, kind: SocialEventKind) -> Self {
-        let mut id_bytes = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id_bytes);
+        let id = Self::content_id_for(&author, timestamp, &kind)
+            .expect("social event content should serialize");
         Self {
-            id: hex::encode(id_bytes),
+            id,
             author,
             timestamp,
             kind,
@@ -158,22 +162,44 @@ impl SocialEvent {
         }
     }
 
-    /// Deterministic bytes for signing. The signature field is excluded.
+    /// Deterministic bytes for signing and content addressing.
+    ///
+    /// The event id and signature are excluded so the id can be the hash of
+    /// the payload being signed instead of an independent mutable field.
     pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        Self::signing_payload_for(&self.author, self.timestamp, &self.kind)
+    }
+
+    pub fn content_id(&self) -> Result<String, serde_json::Error> {
+        Self::content_id_for(&self.author, self.timestamp, &self.kind)
+    }
+
+    fn signing_payload_for(
+        author: &Did,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<Vec<u8>, serde_json::Error> {
         #[derive(Serialize)]
         struct Payload<'a> {
-            id: &'a str,
             author: &'a Did,
             timestamp: u64,
             kind: &'a SocialEventKind,
         }
 
         serde_json::to_vec(&Payload {
-            id: &self.id,
-            author: &self.author,
-            timestamp: self.timestamp,
-            kind: &self.kind,
+            author,
+            timestamp,
+            kind,
         })
+    }
+
+    fn content_id_for(
+        author: &Did,
+        timestamp: u64,
+        kind: &SocialEventKind,
+    ) -> Result<String, serde_json::Error> {
+        let payload = Self::signing_payload_for(author, timestamp, kind)?;
+        Ok(hex::encode(Sha256::digest(payload)))
     }
 
     pub fn with_signature(mut self, signature: Vec<u8>) -> Self {
@@ -191,13 +217,27 @@ impl SocialEvent {
             });
         }
 
+        self.id = self.content_id()?;
         let payload = self.signing_payload()?;
         self.signature = Some(identity.sign(&payload).to_bytes().to_vec());
         Ok(self)
     }
 
+    pub fn verify_content_id(&self) -> Result<(), SocialProtocolError> {
+        let expected = self.content_id()?;
+        if self.id == expected {
+            Ok(())
+        } else {
+            Err(SocialProtocolError::EventIdMismatch {
+                actual: self.id.clone(),
+                expected,
+            })
+        }
+    }
+
     /// Verify that the event signature was produced by `author`.
     pub fn verify_signature(&self) -> Result<(), SocialProtocolError> {
+        self.verify_content_id()?;
         let signature = self
             .signature
             .as_deref()
@@ -266,7 +306,7 @@ impl SocialEvent {
             }
             SocialEventKind::SettlementRecorded { settlement } => {
                 self.ensure_subject("settlement", &settlement.payer)?;
-                settlement.proof.validate()?;
+                settlement.validate()?;
                 Ok(())
             }
             SocialEventKind::CollectiveDeclared { members, .. } => {
@@ -448,10 +488,7 @@ mod tests {
         event.timestamp = 43;
 
         let err = event.verify_signature().unwrap_err();
-        assert!(matches!(
-            err,
-            SocialProtocolError::SignatureVerificationFailed
-        ));
+        assert!(matches!(err, SocialProtocolError::EventIdMismatch { .. }));
     }
 
     #[test]

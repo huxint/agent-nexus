@@ -1760,6 +1760,7 @@ dependencies = [
  "hex",
  "nexus-core",
  "rand 0.8.6",
+ "ring 0.17.14",
  "serde",
  "serde_json",
  "sha2",
@@ -1772,6 +1773,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "nexus-core",
+ "nexus-crypto",
  "serde",
  "serde_json",
  "sha2",

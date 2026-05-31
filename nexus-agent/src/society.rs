@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nexus_core::{Capability, Did, WorkspaceId};
-use nexus_economy::{ReputationScore, SettlementProof};
+use nexus_economy::{ReputationScore, SettlementError, SettlementProof};
 use nexus_runtime::ResourceUsage;
 use nexus_storage::Cid;
 use serde::{Deserialize, Serialize};
@@ -340,6 +340,13 @@ pub struct SettlementRecord {
     pub amount: u64,
     pub proof: SettlementProof,
     pub settled_at: u64,
+}
+
+impl SettlementRecord {
+    pub fn validate(&self) -> Result<(), SettlementError> {
+        self.proof
+            .validate_for_settlement(&self.payer, &self.payee, self.amount)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1917,7 +1924,7 @@ impl Society {
     }
 
     fn record_settlement(&mut self, settlement: SettlementRecord) {
-        if settlement.proof.validate().is_err() {
+        if settlement.validate().is_err() {
             return;
         }
         self.register_agent(settlement.payer.clone());
@@ -1956,6 +1963,7 @@ impl Society {
 
         let publisher = task.publisher.clone();
         let description = task.description.clone();
+        let self_transaction = publisher == result.executor;
         self.applied_task_results.insert(task_id.to_string());
         {
             let Some(task) = self.tasks.get_mut(task_id) else {
@@ -1970,6 +1978,10 @@ impl Society {
         self.record_task_result_workspace_snapshot(&result);
         self.task_results
             .insert(task_id.to_string(), result.clone());
+
+        if self_transaction {
+            return;
+        }
 
         let interaction = Interaction {
             id: format!("task-result:{task_id}"),
@@ -2691,7 +2703,7 @@ mod tests {
     use nexus_core::PermissionSet;
     use nexus_crypto::capability::sign_capability;
     use nexus_crypto::NodeIdentity;
-    use nexus_economy::{LightningSettlement, SettlementProof};
+    use nexus_economy::{LightningSettlement, MutualCreditSettlement, SettlementProof};
     use nexus_runtime::{ProcessOutput, ResourceUsage};
     use sha2::{Digest, Sha256};
 
@@ -2756,6 +2768,44 @@ mod tests {
         assert!(society.interactions().is_empty());
         assert!(society.has_agent(&payer));
         assert!(society.has_agent(&payee));
+    }
+
+    #[test]
+    fn mutual_credit_settlement_with_forged_counterparty_signature_is_ignored() {
+        let payer = NodeIdentity::generate();
+        let payee = NodeIdentity::generate();
+        let forged_payload = MutualCreditSettlement::counterparty_signing_payload(
+            "ledger-tx-1",
+            43,
+            payer.did(),
+            payee.did(),
+        )
+        .unwrap();
+        let settlement = SettlementRecord {
+            id: "settlement-forged".into(),
+            task_id: Some("task-1".into()),
+            claim_id: None,
+            payer: payer.did().clone(),
+            payee: payee.did().clone(),
+            amount: 42,
+            proof: SettlementProof::MutualCredit(MutualCreditSettlement {
+                counterparty: payee.did().clone(),
+                amount: 42,
+                ledger_tx_id: "ledger-tx-1".into(),
+                counterparty_signature: payee.sign(&forged_payload).to_bytes().to_vec(),
+            }),
+            settled_at: 10,
+        };
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            payer.did().clone(),
+            11,
+            SocialEventKind::SettlementRecorded { settlement },
+        ));
+
+        assert!(society.settlement("settlement-forged").is_none());
+        assert!(society.settlements().is_empty());
     }
 
     #[test]
@@ -3755,6 +3805,100 @@ mod tests {
         assert_eq!(reputation.successes, 1);
         assert_eq!(reputation.failures, 0);
         assert!(reputation.composite() > 0.5);
+    }
+
+    #[test]
+    fn self_transaction_task_result_does_not_grant_reputation() {
+        let identity = NodeIdentity::generate();
+        let actor = identity.did().clone();
+        let mut society = Society::new();
+        let task = TaskSpec::new(
+            actor.clone(),
+            "self assigned task",
+            "python-exec",
+            "python",
+            vec!["self.py".into()],
+            100,
+            999,
+            1,
+        );
+        let task_id = task.id.clone();
+
+        society.apply_event(&SocialEvent::new(
+            actor.clone(),
+            1,
+            SocialEventKind::TaskPublished { task },
+        ));
+        society.apply_event(&SocialEvent::new(
+            actor.clone(),
+            2,
+            SocialEventKind::TaskOffered {
+                offer: TaskOffer {
+                    task_id: task_id.clone(),
+                    bidder: actor.clone(),
+                    price: 10,
+                    estimated_time_secs: 1,
+                    rationale: "self run for audit".into(),
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            actor.clone(),
+            3,
+            SocialEventKind::TaskAccepted {
+                acceptance: TaskAcceptance {
+                    task_id: task_id.clone(),
+                    publisher: actor.clone(),
+                    bidder: actor.clone(),
+                    price: 10,
+                    accepted_at: 3,
+                },
+            },
+        ));
+
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+            resources: ResourceUsage::default(),
+        };
+        let receipt = ExecutionReceipt::from_process_output(
+            task_id.clone(),
+            actor.clone(),
+            None,
+            "python",
+            vec!["self.py".into()],
+            &output,
+            None,
+            4,
+            5,
+        )
+        .sign(&identity)
+        .unwrap();
+
+        society.apply_event(&SocialEvent::new(
+            actor.clone(),
+            6,
+            SocialEventKind::TaskCompleted {
+                result: TaskResult {
+                    task_id: task_id.clone(),
+                    executor: actor.clone(),
+                    success: true,
+                    exit_code: 0,
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                    actual_cost: 10,
+                    error: None,
+                    receipt: Some(Box::new(receipt)),
+                },
+            },
+        ));
+
+        assert_eq!(society.task(&task_id).unwrap().state, TaskState::Completed);
+        assert!(society.task_result(&task_id).is_some());
+        assert!(society.edge(&actor, &actor).is_none());
+        assert!(society.reputation(&actor, &actor).is_none());
+        assert!(society.interactions().is_empty());
     }
 
     #[test]
