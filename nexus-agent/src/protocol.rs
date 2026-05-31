@@ -165,6 +165,10 @@ pub enum SocialEventKind {
     WorkspaceOwnershipClaimed {
         claim: crate::society::WorkspaceOwnershipClaim,
     },
+    /// Transfer workspace ownership from the current owner to a new owner.
+    WorkspaceOwnershipTransferred {
+        claim: crate::society::WorkspaceOwnershipClaim,
+    },
     /// Declare or update a subjective relation to another agent.
     RelationDeclared {
         peer: Did,
@@ -541,6 +545,16 @@ impl SocialEvent {
             }
             SocialEventKind::WorkspaceOwnershipClaimed { claim } => {
                 self.ensure_subject("workspace ownership claim", &claim.owner)
+            }
+            SocialEventKind::WorkspaceOwnershipTransferred { claim } => {
+                let Some(previous_owner) = &claim.previous_owner else {
+                    return Err(SocialProtocolError::AuthorSubjectMismatch {
+                        event: "workspace ownership transfer",
+                        author: self.author.clone(),
+                        subject: claim.owner.clone(),
+                    });
+                };
+                self.ensure_subject("workspace ownership transfer", previous_owner)
             }
             SocialEventKind::WorkspaceRunRecorded { run } => {
                 self.ensure_subject("workspace run", &run.actor)
@@ -1244,6 +1258,57 @@ mod tests {
         assert!(matches!(
             event.validate().unwrap_err(),
             SocialProtocolError::AuthorSubjectMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_requires_previous_owner_to_sign_workspace_transfer() {
+        let previous_owner = NodeIdentity::generate();
+        let next_owner = NodeIdentity::generate();
+        let attacker = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([14; 32]);
+
+        let valid = SocialEvent::new(
+            previous_owner.did().clone(),
+            1,
+            SocialEventKind::WorkspaceOwnershipTransferred {
+                claim: crate::society::WorkspaceOwnershipClaim {
+                    workspace,
+                    owner: next_owner.did().clone(),
+                    previous_owner: Some(previous_owner.did().clone()),
+                    root: None,
+                    anchor: None,
+                    claimed_at: 1,
+                },
+            },
+        )
+        .sign(&previous_owner)
+        .unwrap();
+        valid.validate().unwrap();
+
+        let forged = SocialEvent::new(
+            attacker.did().clone(),
+            1,
+            SocialEventKind::WorkspaceOwnershipTransferred {
+                claim: crate::society::WorkspaceOwnershipClaim {
+                    workspace,
+                    owner: next_owner.did().clone(),
+                    previous_owner: Some(previous_owner.did().clone()),
+                    root: None,
+                    anchor: None,
+                    claimed_at: 1,
+                },
+            },
+        )
+        .sign(&attacker)
+        .unwrap();
+
+        assert!(matches!(
+            forged.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch {
+                event: "workspace ownership transfer",
+                ..
+            }
         ));
     }
 

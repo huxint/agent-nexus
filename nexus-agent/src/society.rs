@@ -140,9 +140,14 @@ fn workspace_snapshot_key(snapshot: &WorkspaceSnapshot) -> String {
 
 fn workspace_ownership_claim_key(claim: &WorkspaceOwnershipClaim) -> String {
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         claim.workspace,
         claim.owner,
+        claim
+            .previous_owner
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
         claim
             .root
             .map(|root| hex::encode(root.as_bytes()))
@@ -354,6 +359,8 @@ pub enum FactTruthStatus {
 pub struct WorkspaceOwnershipClaim {
     pub workspace: WorkspaceId,
     pub owner: Did,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_owner: Option<Did>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<Cid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -846,6 +853,8 @@ pub struct Society {
     #[serde(default)]
     workspace_ownership_claims: HashMap<String, WorkspaceOwnershipClaim>,
     #[serde(default)]
+    workspace_current_owners: HashMap<WorkspaceId, Did>,
+    #[serde(default)]
     workspace_runs: HashMap<String, WorkspaceRun>,
     #[serde(default)]
     intents: HashMap<String, AgentIntent>,
@@ -1157,8 +1166,40 @@ impl Society {
             .insert(workspace);
     }
 
-    pub fn record_workspace_ownership_claim(&mut self, claim: WorkspaceOwnershipClaim) {
+    pub fn record_workspace_ownership_claim(&mut self, claim: WorkspaceOwnershipClaim) -> bool {
+        if claim.previous_owner.is_some() {
+            return false;
+        }
+        if self
+            .workspace_claimed_owner(&claim.workspace)
+            .is_some_and(|owner| owner != claim.owner)
+        {
+            return false;
+        }
+        self.adopt_workspace_ownership_claim(claim)
+    }
+
+    pub fn record_workspace_ownership_transfer(
+        &mut self,
+        signer: &Did,
+        claim: WorkspaceOwnershipClaim,
+    ) -> bool {
+        let Some(previous_owner) = &claim.previous_owner else {
+            return false;
+        };
+        if signer != previous_owner {
+            return false;
+        }
+        if self.workspace_claimed_owner(&claim.workspace).as_ref() != Some(previous_owner) {
+            return false;
+        }
+        self.adopt_workspace_ownership_claim(claim)
+    }
+
+    fn adopt_workspace_ownership_claim(&mut self, claim: WorkspaceOwnershipClaim) -> bool {
         self.register_agent(claim.owner.clone());
+        self.workspace_current_owners
+            .insert(claim.workspace, claim.owner.clone());
         self.workspace_ownership_claims
             .entry(workspace_ownership_claim_key(&claim))
             .and_modify(|existing| {
@@ -1167,6 +1208,7 @@ impl Society {
                 }
             })
             .or_insert(claim);
+        true
     }
 
     pub fn workspace_ownership_claims(
@@ -1192,9 +1234,14 @@ impl Society {
     }
 
     pub fn workspace_claimed_owner(&self, workspace: &WorkspaceId) -> Option<Did> {
-        self.workspace_ownership_claims(workspace)
-            .first()
-            .map(|fact| fact.claim.owner.clone())
+        self.workspace_current_owners
+            .get(workspace)
+            .cloned()
+            .or_else(|| {
+                self.workspace_ownership_claims(workspace)
+                    .first()
+                    .map(|fact| fact.claim.owner.clone())
+            })
     }
 
     fn workspace_ownership_truth_status(&self, claim: &WorkspaceOwnershipClaim) -> FactTruthStatus {
@@ -2024,6 +2071,9 @@ impl Society {
             }
             SocialEventKind::WorkspaceOwnershipClaimed { claim } => {
                 self.record_workspace_ownership_claim(claim.clone());
+            }
+            SocialEventKind::WorkspaceOwnershipTransferred { claim } => {
+                self.record_workspace_ownership_transfer(&event.author, claim.clone());
             }
             SocialEventKind::RelationDeclared {
                 peer,
@@ -4525,6 +4575,7 @@ mod tests {
                 claim: WorkspaceOwnershipClaim {
                     workspace: ws,
                     owner: owner.clone(),
+                    previous_owner: None,
                     root: Some(root),
                     anchor: None,
                     claimed_at: 2,
@@ -4538,6 +4589,79 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim.owner, owner);
         assert_eq!(claims[0].truth_status, FactTruthStatus::Claimed);
+    }
+
+    #[test]
+    fn workspace_ownership_transfer_requires_current_owner() {
+        let owner = did("owner");
+        let next_owner = did("next-owner");
+        let attacker = did("attacker");
+        let ws = WorkspaceId::from_bytes([11; 32]);
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            owner.clone(),
+            1,
+            SocialEventKind::WorkspaceOwnershipClaimed {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: ws,
+                    owner: owner.clone(),
+                    previous_owner: None,
+                    root: None,
+                    anchor: None,
+                    claimed_at: 1,
+                },
+            },
+        ));
+        assert_eq!(society.workspace_claimed_owner(&ws), Some(owner.clone()));
+
+        society.apply_event(&SocialEvent::new(
+            attacker.clone(),
+            2,
+            SocialEventKind::WorkspaceOwnershipClaimed {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: ws,
+                    owner: attacker.clone(),
+                    previous_owner: None,
+                    root: None,
+                    anchor: None,
+                    claimed_at: 2,
+                },
+            },
+        ));
+        assert_eq!(society.workspace_claimed_owner(&ws), Some(owner.clone()));
+
+        society.apply_event(&SocialEvent::new(
+            attacker,
+            3,
+            SocialEventKind::WorkspaceOwnershipTransferred {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: ws,
+                    owner: next_owner.clone(),
+                    previous_owner: Some(owner.clone()),
+                    root: None,
+                    anchor: None,
+                    claimed_at: 3,
+                },
+            },
+        ));
+        assert_eq!(society.workspace_claimed_owner(&ws), Some(owner.clone()));
+
+        society.apply_event(&SocialEvent::new(
+            owner,
+            4,
+            SocialEventKind::WorkspaceOwnershipTransferred {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: ws,
+                    owner: next_owner.clone(),
+                    previous_owner: Some(did("owner")),
+                    root: None,
+                    anchor: None,
+                    claimed_at: 4,
+                },
+            },
+        ));
+        assert_eq!(society.workspace_claimed_owner(&ws), Some(next_owner));
     }
 
     fn provider_manifest(did: Did, name: &str, capability: &str, price: u64) -> AgentManifest {

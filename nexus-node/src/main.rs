@@ -138,6 +138,8 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event intent-response --base <DIR> --intent <ID> --kind <interested|accept|decline|counter|fulfilled> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--evidence <TEXT>]");
     eprintln!("  {prog} event identity-revoke --base <DIR> [--reason <TEXT>] [--revoked-at <TS>]");
     eprintln!("  {prog} event workspace-join --base <DIR> --workspace <HEX>");
+    eprintln!("  {prog} event workspace-claim --base <DIR> --workspace <HEX> [--root <CID_HEX>]");
+    eprintln!("  {prog} event workspace-transfer --base <DIR> --workspace <HEX> --owner <DID> [--root <CID_HEX>]");
     eprintln!("  {prog} event workspace-snapshot --base <DIR> --workspace <HEX> --root <CID_HEX> [--label <TEXT>] [--note <TEXT>]");
     eprintln!("  {prog} event workspace-run --base <DIR> --workspace <HEX> --command <CMD> [--arg <ARG>...] [--exit-code <N>] [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--cwd <DIR>] [--env-key <KEY>] [--stdin <TEXT>|--stdin-cid <CID_HEX> --stdin-bytes <N>] [--timeout-ms <N>] [--failure-kind <KIND> --failure-message <TEXT>] [--started-at <TS>] [--finished-at <TS>] [--note <TEXT>]");
     eprintln!("  {prog} event capability --base <DIR> --subject <DID> --workspace <HEX> [--permission <PERM>...] [--expires-at <TS>] [--note <TEXT>]");
@@ -199,6 +201,29 @@ async fn cmd_create(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     register_workspace_path(&base, ws.root_dir())?;
+    let memory_path = base.join(".nexus-social-memory.json");
+    let mut memory = load_social_memory(&memory_path)?;
+    let now = unix_now();
+    let events = memory.sign_event_sequence(
+        &id,
+        [
+            (now, SocialEventKind::WorkspaceJoined { workspace: ws.id() }),
+            (
+                now,
+                SocialEventKind::WorkspaceOwnershipClaimed {
+                    claim: WorkspaceOwnershipClaim {
+                        workspace: ws.id(),
+                        owner: id.did().clone(),
+                        previous_owner: None,
+                        root: ws.root_cid(),
+                        anchor: None,
+                        claimed_at: now,
+                    },
+                },
+            ),
+        ],
+    )?;
+    record_social_events(&memory_path, &mut memory, events)?;
     println!("Created: {} ({})", ws.name(), ws.id());
     Ok(())
 }
@@ -765,7 +790,11 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             match Workspace::load(&id, &p).await {
                 Ok(ws) => {
                     workspace_ids.push(ws.id());
-                    presence_workspaces.push((ws.id(), ws.root_cid()));
+                    let owner_root = (ws.owner() == id.did()).then_some(ws.root_cid()).flatten();
+                    presence_workspaces.push(PresenceWorkspace {
+                        id: ws.id(),
+                        owner_root,
+                    });
                     println!("  loaded: {} ({})", ws.name(), p.display());
                     server.register(ws);
                 }
@@ -1597,7 +1626,7 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, identity-revoke, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
+            "event subcommand required: manifest, intent, identity-revoke, workspace-join, workspace-claim, workspace-transfer, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -1612,6 +1641,12 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             cmd_event_identity_revoke(args)
         }
         "workspace-join" | "workspace" | "join" => cmd_event_workspace_join(args),
+        "workspace-claim" | "claim-workspace" | "workspace-owner-claim" => {
+            cmd_event_workspace_claim(args)
+        }
+        "workspace-transfer" | "transfer-workspace" | "workspace-owner" => {
+            cmd_event_workspace_transfer(args)
+        }
         "workspace-snapshot" | "snapshot" => cmd_event_workspace_snapshot(args),
         "workspace-run" | "run" => cmd_event_workspace_run(args),
         "capability" | "capability-issue" | "invite" => cmd_event_capability(args),
@@ -1975,6 +2010,101 @@ fn cmd_event_workspace_join(args: &[String]) -> Result<(), Box<dyn std::error::E
             })
         },
         unix_now(),
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_workspace_claim(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut workspace = None;
+    let mut root = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(parse_workspace_id(required_arg(args, i, "--workspace")?)?);
+            }
+            "--root" | "--cid" => {
+                i += 1;
+                root = Some(parse_cid(required_arg(args, i, "--root")?)?);
+            }
+            other => return Err(format!("unknown workspace-claim option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::WorkspaceOwnershipClaimed {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: workspace.ok_or("--workspace required")?,
+                    owner: identity.did().clone(),
+                    previous_owner: None,
+                    root,
+                    anchor: None,
+                    claimed_at: now,
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_workspace_transfer(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut workspace = None;
+    let mut owner = None;
+    let mut root = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(parse_workspace_id(required_arg(args, i, "--workspace")?)?);
+            }
+            "--owner" | "--to" => {
+                i += 1;
+                owner = Some(Did::new(required_arg(args, i, "--owner")?.to_string()));
+            }
+            "--root" | "--cid" => {
+                i += 1;
+                root = Some(parse_cid(required_arg(args, i, "--root")?)?);
+            }
+            other => return Err(format!("unknown workspace-transfer option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::WorkspaceOwnershipTransferred {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: workspace.ok_or("--workspace required")?,
+                    owner: owner.ok_or("--owner required")?,
+                    previous_owner: Some(identity.did().clone()),
+                    root,
+                    anchor: None,
+                    claimed_at: now,
+                },
+            })
+        },
+        now,
     )?;
     println!("{}", event_summary(&event));
     Ok(())
@@ -3584,35 +3714,44 @@ fn build_node_manifest(identity: &NodeIdentity, base: &Path, now: u64) -> AgentM
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresenceWorkspace {
+    id: WorkspaceId,
+    owner_root: Option<Cid>,
+}
+
 fn signed_presence_events(
     identity: &NodeIdentity,
     manifest: AgentManifest,
-    workspaces: &[(WorkspaceId, Option<Cid>)],
+    workspaces: &[PresenceWorkspace],
     memory: &SocialMemory,
     now: u64,
 ) -> Result<Vec<SocialEvent>, Box<dyn std::error::Error>> {
     let mut kinds = Vec::with_capacity(1 + workspaces.len() * 2);
     kinds.push((now, SocialEventKind::ManifestPublished { manifest }));
 
-    for (workspace, root) in workspaces {
+    for workspace in workspaces {
         kinds.push((
             now,
             SocialEventKind::WorkspaceJoined {
-                workspace: *workspace,
+                workspace: workspace.id,
             },
         ));
-        kinds.push((
-            now,
-            SocialEventKind::WorkspaceOwnershipClaimed {
-                claim: WorkspaceOwnershipClaim {
-                    workspace: *workspace,
-                    owner: identity.did().clone(),
-                    root: *root,
-                    anchor: None,
-                    claimed_at: now,
+        if let Some(root) = workspace.owner_root {
+            kinds.push((
+                now,
+                SocialEventKind::WorkspaceOwnershipClaimed {
+                    claim: WorkspaceOwnershipClaim {
+                        workspace: workspace.id,
+                        owner: identity.did().clone(),
+                        previous_owner: None,
+                        root: Some(root),
+                        anchor: None,
+                        claimed_at: now,
+                    },
                 },
-            },
-        ));
+            ));
+        }
     }
 
     Ok(memory.sign_event_sequence(identity, kinds)?)
@@ -3632,7 +3771,7 @@ fn announce_dht_presence(network: &Network, workspace_ids: &[WorkspaceId]) {
 async fn announce_node_presence(
     identity: &NodeIdentity,
     network: &Network,
-    workspaces: &[(WorkspaceId, Option<Cid>)],
+    workspaces: &[PresenceWorkspace],
     social_memory: &mut SocialMemory,
     memory_path: &Path,
     base: &Path,
@@ -4298,6 +4437,19 @@ mod tests {
         let expected = normalize_workspace_path(&temp.path().join("local-computer")).unwrap();
         let paths = local_workspace_paths(temp.path()).unwrap();
         assert_eq!(paths, vec![expected]);
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 2);
+        let workspace = Workspace::load(
+            &load_or_create_identity(temp.path()).unwrap(),
+            temp.path().join("local-computer"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            memory.society().workspace_claimed_owner(&workspace.id()),
+            Some(workspace.owner().clone())
+        );
     }
 
     #[tokio::test]
@@ -5368,7 +5520,10 @@ mod tests {
         for event in signed_presence_events(
             &owner,
             build_node_manifest(&owner, owner_base.path(), 100),
-            &[(workspace_id, Some(root))],
+            &[PresenceWorkspace {
+                id: workspace_id,
+                owner_root: Some(root),
+            }],
             &remote_memory,
             100,
         )
@@ -5673,7 +5828,10 @@ mod tests {
         for event in signed_presence_events(
             &owner,
             build_node_manifest(&owner, owner_base.path(), 200),
-            &[(workspace_id, Some(root))],
+            &[PresenceWorkspace {
+                id: workspace_id,
+                owner_root: Some(root),
+            }],
             &remote_memory,
             200,
         )
@@ -6290,9 +6448,16 @@ mod tests {
     #[test]
     fn node_presence_events_publish_manifest_and_workspace_membership() {
         let identity = NodeIdentity::generate();
+        let owned_root = nexus_storage::Cid::hash_of(b"owned workspace root");
         let workspaces = [
-            (WorkspaceId::from_bytes([31; 32]), None),
-            (WorkspaceId::from_bytes([32; 32]), None),
+            PresenceWorkspace {
+                id: WorkspaceId::from_bytes([31; 32]),
+                owner_root: Some(owned_root),
+            },
+            PresenceWorkspace {
+                id: WorkspaceId::from_bytes([32; 32]),
+                owner_root: None,
+            },
         ];
         let manifest = build_node_manifest(&identity, Path::new("/tmp/alice-node"), 100);
         assert_eq!(manifest.did, *identity.did());
@@ -6303,7 +6468,7 @@ mod tests {
         let events =
             signed_presence_events(&identity, manifest, &workspaces, &SocialMemory::new(), 100)
                 .unwrap();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 4);
         for event in &events {
             event.verify_signature().unwrap();
         }
@@ -6314,32 +6479,31 @@ mod tests {
         ));
         assert!(matches!(
             &events[1].kind,
-            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[0].0
+            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[0].id
         ));
         assert!(matches!(
             &events[2].kind,
             SocialEventKind::WorkspaceOwnershipClaimed { claim }
-                if claim.workspace == workspaces[0].0 && claim.owner == *identity.did()
+                if claim.workspace == workspaces[0].id && claim.owner == *identity.did()
         ));
         assert!(matches!(
             &events[3].kind,
-            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[1].0
-        ));
-        assert!(matches!(
-            &events[4].kind,
-            SocialEventKind::WorkspaceOwnershipClaimed { claim }
-                if claim.workspace == workspaces[1].0 && claim.owner == *identity.did()
+            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[1].id
         ));
 
         let mut memory = SocialMemory::new();
         for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
-        assert_eq!(memory.event_count(), 5);
+        assert_eq!(memory.event_count(), 4);
         assert!(memory.society().has_agent(identity.did()));
         assert_eq!(
-            memory.society().workspace_claimed_owner(&workspaces[0].0),
+            memory.society().workspace_claimed_owner(&workspaces[0].id),
             Some(identity.did().clone())
+        );
+        assert_eq!(
+            memory.society().workspace_claimed_owner(&workspaces[1].id),
+            None
         );
     }
 
@@ -6456,9 +6620,18 @@ mod tests {
         let workspace = WorkspaceId::from_bytes([55; 32]);
         let manifest = build_node_manifest(&identity, Path::new("/tmp/social-node"), 100);
         let mut memory = SocialMemory::new();
-        let events =
-            signed_presence_events(&identity, manifest, &[(workspace, None)], &memory, 100)
-                .unwrap();
+        let root = nexus_storage::Cid::hash_of(b"social view owned workspace");
+        let events = signed_presence_events(
+            &identity,
+            manifest,
+            &[PresenceWorkspace {
+                id: workspace,
+                owner_root: Some(root),
+            }],
+            &memory,
+            100,
+        )
+        .unwrap();
         for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
@@ -7465,6 +7638,55 @@ mod tests {
         for event in memory.events() {
             event.verify_signature().unwrap();
         }
+    }
+
+    #[test]
+    fn event_commands_record_workspace_ownership_claim_and_transfer() {
+        let temp = TempDir::new().unwrap();
+        let owner = load_or_create_identity(temp.path()).unwrap();
+        let next_owner = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([67; 32]);
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "workspace-claim".into(),
+            "--base".into(),
+            base.clone(),
+            "--workspace".into(),
+            workspace.to_string(),
+        ])
+        .unwrap();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "workspace-transfer".into(),
+            "--base".into(),
+            base,
+            "--workspace".into(),
+            workspace.to_string(),
+            "--owner".into(),
+            next_owner.did().to_string(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 2);
+        assert_eq!(
+            memory.society().workspace_claimed_owner(&workspace),
+            Some(next_owner.did().clone())
+        );
+        let claims = memory.society().workspace_ownership_claims(&workspace);
+        assert_eq!(claims.len(), 2);
+        assert!(claims
+            .iter()
+            .any(|fact| fact.claim.owner == *owner.did() && fact.claim.previous_owner.is_none()));
+        assert!(claims
+            .iter()
+            .any(|fact| fact.claim.owner == *next_owner.did()
+                && fact.claim.previous_owner.as_ref() == Some(owner.did())));
     }
 
     #[test]
