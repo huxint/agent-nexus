@@ -367,6 +367,32 @@ pub enum FactTruthStatus {
     Anchored,
 }
 
+/// Social facts that need independent witness evidence before they are treated
+/// as anchored truth instead of signed claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WitnessedFactKind {
+    WorkspaceOwnershipTransfer,
+    SettlementFinality,
+    CollectiveDecision,
+}
+
+impl WitnessedFactKind {
+    pub const ALL: [Self; 3] = [
+        Self::WorkspaceOwnershipTransfer,
+        Self::SettlementFinality,
+        Self::CollectiveDecision,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceOwnershipTransfer => "workspace_ownership_transfer",
+            Self::SettlementFinality => "settlement_finality",
+            Self::CollectiveDecision => "collective_decision",
+        }
+    }
+}
+
 /// A signed statement that an agent owns a workspace.
 ///
 /// This is social truth metadata: it distinguishes "this node has a local
