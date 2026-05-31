@@ -4,19 +4,32 @@
 //! society protocol. It verifies event authorship, de-duplicates gossip, and
 //! can replay accepted events into a [`Society`](crate::society::Society).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use nexus_core::Did;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::protocol::{SocialEvent, SocialProtocolError};
+use crate::protocol::{EquivocationProof, SocialEvent, SocialProtocolError};
 use crate::society::Society;
 
 /// Append-only set of signed social events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SocialEventLog {
     events: Vec<SocialEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<SocialEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    equivocation_proofs: Vec<EquivocationProof>,
     #[serde(skip)]
     index: HashMap<String, usize>,
+    #[serde(skip)]
+    pending_index: HashSet<String>,
+    #[serde(skip)]
+    seq_index: HashMap<(Did, u64), usize>,
+    #[serde(skip)]
+    heads: HashMap<Did, (u64, String)>,
+    #[serde(skip)]
+    equivocation_index: HashSet<String>,
 }
 
 impl<'de> Deserialize<'de> for SocialEventLog {
@@ -27,10 +40,15 @@ impl<'de> Deserialize<'de> for SocialEventLog {
         #[derive(Deserialize)]
         struct StoredLog {
             events: Vec<SocialEvent>,
+            #[serde(default)]
+            pending: Vec<SocialEvent>,
+            #[serde(default)]
+            equivocation_proofs: Vec<EquivocationProof>,
         }
 
         let stored = StoredLog::deserialize(deserializer)?;
-        Self::from_events(stored.events).map_err(serde::de::Error::custom)
+        Self::from_parts(stored.events, stored.pending, stored.equivocation_proofs)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -45,9 +63,23 @@ impl SocialEventLog {
     pub fn from_events(
         events: impl IntoIterator<Item = SocialEvent>,
     ) -> Result<Self, SocialProtocolError> {
+        Self::from_parts(events, std::iter::empty(), std::iter::empty())
+    }
+
+    fn from_parts(
+        events: impl IntoIterator<Item = SocialEvent>,
+        pending: impl IntoIterator<Item = SocialEvent>,
+        equivocation_proofs: impl IntoIterator<Item = EquivocationProof>,
+    ) -> Result<Self, SocialProtocolError> {
         let mut log = Self::new();
         for event in events {
             log.append(event)?;
+        }
+        for event in pending {
+            log.append(event)?;
+        }
+        for proof in equivocation_proofs {
+            log.record_equivocation(proof)?;
         }
         Ok(log)
     }
@@ -64,8 +96,23 @@ impl SocialEventLog {
         &self.events
     }
 
+    pub fn pending_events(&self) -> &[SocialEvent] {
+        &self.pending
+    }
+
+    pub fn equivocation_proofs(&self) -> &[EquivocationProof] {
+        &self.equivocation_proofs
+    }
+
     pub fn contains(&self, event_id: &str) -> bool {
-        self.index.contains_key(event_id)
+        self.index.contains_key(event_id) || self.pending_index.contains(event_id)
+    }
+
+    pub fn next_position(&self, author: &Did) -> (u64, Option<String>) {
+        self.heads
+            .get(author)
+            .map(|(seq, id)| (seq.saturating_add(1), Some(id.clone())))
+            .unwrap_or((0, None))
     }
 
     /// Append a signed event. Returns `true` when the event is newly inserted.
@@ -83,9 +130,31 @@ impl SocialEventLog {
 
             return Err(SocialProtocolError::DuplicateEventConflict { event_id: event.id });
         }
+        if self.pending_index.contains(&event.id) {
+            return Ok(false);
+        }
+        if let Some(existing) = self.seq_index.get(&(event.author.clone(), event.seq)) {
+            let proof = EquivocationProof::new(self.events[*existing].clone(), event)?;
+            return self.record_equivocation(proof);
+        }
+        if let Some(pending) = self
+            .pending
+            .iter()
+            .find(|pending| pending.author == event.author && pending.seq == event.seq)
+            .cloned()
+        {
+            let proof = EquivocationProof::new(pending, event)?;
+            return self.record_equivocation(proof);
+        }
 
-        self.index.insert(event.id.clone(), self.events.len());
-        self.events.push(event);
+        if self.can_accept(&event)? {
+            let author = event.author.clone();
+            self.accept_event(event)?;
+            self.drain_pending_for(&author)?;
+        } else {
+            self.pending_index.insert(event.id.clone());
+            self.pending.push(event);
+        }
         Ok(true)
     }
 
@@ -103,18 +172,110 @@ impl SocialEventLog {
         Ok(inserted)
     }
 
+    fn can_accept(&self, event: &SocialEvent) -> Result<bool, SocialProtocolError> {
+        match self.heads.get(&event.author) {
+            None => {
+                if event.seq == 0 {
+                    if event.prev.is_none() {
+                        Ok(true)
+                    } else {
+                        Err(SocialProtocolError::InvalidChainGenesis {
+                            author: event.author.clone(),
+                        })
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            Some((head_seq, head_id)) => {
+                if event.seq == head_seq.saturating_add(1)
+                    && event.prev.as_deref() == Some(head_id.as_str())
+                {
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    fn accept_event(&mut self, event: SocialEvent) -> Result<(), SocialProtocolError> {
+        let index = self.events.len();
+        self.index.insert(event.id.clone(), index);
+        self.seq_index
+            .insert((event.author.clone(), event.seq), index);
+        self.heads
+            .insert(event.author.clone(), (event.seq, event.id.clone()));
+        self.record_pending_equivocations(&event)?;
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn drain_pending_for(&mut self, author: &Did) -> Result<(), SocialProtocolError> {
+        loop {
+            let Some(position) = self.pending.iter().position(|event| {
+                &event.author == author && self.can_accept(event).unwrap_or(false)
+            }) else {
+                break;
+            };
+
+            let event = self.pending.remove(position);
+            self.pending_index.remove(&event.id);
+            self.accept_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn record_pending_equivocations(
+        &mut self,
+        accepted: &SocialEvent,
+    ) -> Result<(), SocialProtocolError> {
+        let mut position = 0;
+        while position < self.pending.len() {
+            let pending = &self.pending[position];
+            if pending.author == accepted.author && pending.seq == accepted.seq {
+                let pending = self.pending.remove(position);
+                self.pending_index.remove(&pending.id);
+                if pending.id != accepted.id {
+                    self.record_equivocation(EquivocationProof::new(accepted.clone(), pending)?)?;
+                }
+            } else {
+                position += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_equivocation(
+        &mut self,
+        proof: EquivocationProof,
+    ) -> Result<bool, SocialProtocolError> {
+        proof.verify()?;
+        let key = proof.evidence_key();
+        if !self.equivocation_index.insert(key) {
+            return Ok(false);
+        }
+        self.equivocation_proofs.push(proof);
+        Ok(true)
+    }
+
     /// Replay events in deterministic causal order into a society graph.
     pub fn replay_into(&self, society: &mut Society) {
         let mut events: Vec<&SocialEvent> = self.events.iter().collect();
         events.sort_by(|a, b| {
-            a.timestamp
-                .cmp(&b.timestamp)
+            a.author
+                .to_string()
+                .cmp(&b.author.to_string())
+                .then_with(|| a.seq.cmp(&b.seq))
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
                 .then_with(|| a.id.cmp(&b.id))
-                .then_with(|| a.author.to_string().cmp(&b.author.to_string()))
         });
 
         for event in events {
             society.apply_event(event);
+        }
+        for proof in &self.equivocation_proofs {
+            society.record_equivocation_proof(proof.clone());
         }
     }
 
@@ -128,20 +289,15 @@ impl SocialEventLog {
     /// Rebuild the transient index after deserialization.
     pub fn rebuild_index(&mut self) -> Result<(), SocialProtocolError> {
         self.index.clear();
-        for (position, event) in self.events.iter().enumerate() {
-            event.validate()?;
-            if let Some(existing) = self.index.insert(event.id.clone(), position) {
-                let existing_payload = self.events[existing].signing_payload()?;
-                let event_payload = event.signing_payload()?;
-                if existing_payload != event_payload
-                    || self.events[existing].signature != event.signature
-                {
-                    return Err(SocialProtocolError::DuplicateEventConflict {
-                        event_id: event.id.clone(),
-                    });
-                }
-            }
-        }
+        self.pending_index.clear();
+        self.seq_index.clear();
+        self.heads.clear();
+        self.equivocation_index.clear();
+
+        let events = std::mem::take(&mut self.events);
+        let pending = std::mem::take(&mut self.pending);
+        let proofs = std::mem::take(&mut self.equivocation_proofs);
+        *self = Self::from_parts(events, pending, proofs)?;
         Ok(())
     }
 }
@@ -225,6 +381,86 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_eq!(first.id, first.content_id().unwrap());
         assert_eq!(second.id, second.content_id().unwrap());
+    }
+
+    #[test]
+    fn out_of_order_author_chain_drains_when_predecessor_arrives() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = SocialEvent::new_chained(
+            alice.did().clone(),
+            0,
+            None,
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([7; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let second = SocialEvent::new_chained(
+            alice.did().clone(),
+            1,
+            Some(first.id.clone()),
+            2,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("arrived before predecessor".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append(second.clone()).unwrap());
+        assert_eq!(log.len(), 0);
+        assert_eq!(log.pending_events().len(), 1);
+        assert!(log.contains(&second.id));
+
+        assert!(log.append(first).unwrap());
+        assert_eq!(log.len(), 2);
+        assert!(log.pending_events().is_empty());
+
+        let society = log.to_society();
+        assert_eq!(
+            society.edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Collaborator
+        );
+    }
+
+    #[test]
+    fn same_author_sequence_conflict_records_equivocation_proof() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = signed_relation(&alice, &bob, 1);
+        let fork = SocialEvent::new_chained(
+            alice.did().clone(),
+            0,
+            None,
+            2,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([8; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append(first.clone()).unwrap());
+        assert!(log.append(fork.clone()).unwrap());
+
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.equivocation_proofs().len(), 1);
+        let proof = &log.equivocation_proofs()[0];
+        proof.verify().unwrap();
+        assert_eq!(proof.author, *alice.did());
+        assert_eq!(proof.seq, 0);
+        assert_ne!(proof.event_a.id, proof.event_b.id);
+
+        let society = log.to_society();
+        assert!(society.is_equivocating(alice.did()));
+        assert_eq!(society.agent_equivocations(alice.did()).len(), 1);
     }
 
     #[test]

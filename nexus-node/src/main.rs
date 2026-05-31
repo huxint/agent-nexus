@@ -205,14 +205,13 @@ async fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     workspace.join_agent(identity.did(), now)?;
     register_workspace_path(&base, workspace.root_dir())?;
-    let event = SocialEvent::new(
-        identity.did().clone(),
+    let event = memory.sign_event(
+        &identity,
         now,
         SocialEventKind::WorkspaceJoined {
             workspace: workspace.id(),
         },
-    )
-    .sign(&identity)?;
+    )?;
     if memory.ingest_event(event.clone())? {
         save_social_memory(&memory_path, &memory)?;
     }
@@ -458,31 +457,30 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let events = [
-        SocialEvent::new(
-            identity.did().clone(),
-            now,
-            SocialEventKind::WorkspaceJoined {
-                workspace: workspace.id(),
-            },
-        )
-        .sign(&identity)?,
-        SocialEvent::new(
-            identity.did().clone(),
-            now,
-            SocialEventKind::WorkspaceSnapshotted {
-                snapshot: WorkspaceSnapshot {
+    let events = memory.sign_event_sequence(
+        &identity,
+        [
+            (
+                now,
+                SocialEventKind::WorkspaceJoined {
                     workspace: workspace.id(),
-                    actor: identity.did().clone(),
-                    root: cloned_root,
-                    label: Some("cloned".into()),
-                    note: Some(format!("cloned from peer {peer}")),
-                    timestamp: now,
                 },
-            },
-        )
-        .sign(&identity)?,
-    ];
+            ),
+            (
+                now,
+                SocialEventKind::WorkspaceSnapshotted {
+                    snapshot: WorkspaceSnapshot {
+                        workspace: workspace.id(),
+                        actor: identity.did().clone(),
+                        root: cloned_root,
+                        label: Some("cloned".into()),
+                        note: Some(format!("cloned from peer {peer}")),
+                        timestamp: now,
+                    },
+                },
+            ),
+        ],
+    )?;
     let mut inserted = false;
     for event in events {
         if memory.ingest_event(event)? {
@@ -611,13 +609,11 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 finished_at,
                 note: note.clone(),
             };
-            match SocialEvent::new(
-                identity.did().clone(),
+            match memory.sign_event(
+                &identity,
                 finished_at,
                 SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
-            )
-            .sign(&identity)
-            {
+            ) {
                 Ok(event) => {
                     if let Err(record_err) =
                         record_social_events(&memory_path, &mut memory, [event])
@@ -658,20 +654,19 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         timestamp: finished_at,
     };
 
-    let events = [
-        SocialEvent::new(
-            identity.did().clone(),
-            finished_at,
-            SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
-        )
-        .sign(&identity)?,
-        SocialEvent::new(
-            identity.did().clone(),
-            finished_at,
-            SocialEventKind::WorkspaceSnapshotted { snapshot },
-        )
-        .sign(&identity)?,
-    ];
+    let events = memory.sign_event_sequence(
+        &identity,
+        [
+            (
+                finished_at,
+                SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
+            ),
+            (
+                finished_at,
+                SocialEventKind::WorkspaceSnapshotted { snapshot },
+            ),
+        ],
+    )?;
     record_social_events(&memory_path, &mut memory, events)?;
 
     print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -3169,8 +3164,7 @@ where
     let identity = load_or_create_identity(base)?;
     let memory_path = base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
-    let event =
-        SocialEvent::new(identity.did().clone(), now, build_kind(&identity)?).sign(&identity)?;
+    let event = memory.sign_event(&identity, now, build_kind(&identity)?)?;
     if memory.ingest_event(event.clone())? {
         save_social_memory(&memory_path, &memory)?;
     }
@@ -3358,32 +3352,22 @@ fn signed_presence_events(
     identity: &NodeIdentity,
     manifest: AgentManifest,
     workspaces: &[WorkspaceId],
+    memory: &SocialMemory,
     now: u64,
 ) -> Result<Vec<SocialEvent>, Box<dyn std::error::Error>> {
-    let mut events = Vec::with_capacity(1 + workspaces.len());
-    events.push(
-        SocialEvent::new(
-            identity.did().clone(),
-            now,
-            SocialEventKind::ManifestPublished { manifest },
-        )
-        .sign(identity)?,
-    );
+    let mut kinds = Vec::with_capacity(1 + workspaces.len());
+    kinds.push((now, SocialEventKind::ManifestPublished { manifest }));
 
     for workspace in workspaces {
-        events.push(
-            SocialEvent::new(
-                identity.did().clone(),
-                now,
-                SocialEventKind::WorkspaceJoined {
-                    workspace: *workspace,
-                },
-            )
-            .sign(identity)?,
-        );
+        kinds.push((
+            now,
+            SocialEventKind::WorkspaceJoined {
+                workspace: *workspace,
+            },
+        ));
     }
 
-    Ok(events)
+    Ok(memory.sign_event_sequence(identity, kinds)?)
 }
 
 fn announce_dht_presence(network: &Network, workspace_ids: &[WorkspaceId]) {
@@ -3407,7 +3391,8 @@ async fn announce_node_presence(
     now: u64,
 ) {
     let manifest = build_node_manifest(identity, base, now);
-    let events = match signed_presence_events(identity, manifest, workspace_ids, now) {
+    let events = match signed_presence_events(identity, manifest, workspace_ids, social_memory, now)
+    {
         Ok(events) => events,
         Err(err) => {
             tracing::warn!("failed to sign node presence events: {err}");
@@ -3541,8 +3526,8 @@ async fn record_served_workspace_snapshot(
         return;
     }
 
-    let event = match SocialEvent::new(
-        identity.did().clone(),
+    let event = match social_memory.sign_event(
+        identity,
         now,
         SocialEventKind::WorkspaceSnapshotted {
             snapshot: WorkspaceSnapshot {
@@ -3554,9 +3539,7 @@ async fn record_served_workspace_snapshot(
                 timestamp: now,
             },
         },
-    )
-    .sign(identity)
-    {
+    ) {
         Ok(event) => event,
         Err(err) => {
             tracing::warn!("failed to sign served workspace snapshot: {err}");
@@ -3969,6 +3952,26 @@ mod tests {
         )
         .sign(identity)
         .unwrap()
+    }
+
+    fn signed_workspace_events(
+        identity: &NodeIdentity,
+        bytes: &[u8],
+        start_timestamp: u64,
+    ) -> Vec<SocialEvent> {
+        SocialMemory::new()
+            .sign_event_sequence(
+                identity,
+                bytes.iter().enumerate().map(|(offset, byte)| {
+                    (
+                        start_timestamp + offset as u64,
+                        SocialEventKind::WorkspaceJoined {
+                            workspace: WorkspaceId::from_bytes([*byte; 32]),
+                        },
+                    )
+                }),
+            )
+            .unwrap()
     }
 
     fn test_bootstrap_addr(port: u16) -> (String, libp2p::Multiaddr) {
@@ -4971,6 +4974,7 @@ mod tests {
             &owner,
             build_node_manifest(&owner, owner_base.path(), 100),
             &[workspace_id],
+            &remote_memory,
             100,
         )
         .unwrap()
@@ -5275,6 +5279,7 @@ mod tests {
             &owner,
             build_node_manifest(&owner, owner_base.path(), 200),
             &[workspace_id],
+            &remote_memory,
             200,
         )
         .unwrap()
@@ -5884,7 +5889,9 @@ mod tests {
         assert!(manifest.provides_named("native-workspace"));
         assert!(manifest.provides_named("social-event-gossip"));
 
-        let events = signed_presence_events(&identity, manifest, &workspaces, 100).unwrap();
+        let events =
+            signed_presence_events(&identity, manifest, &workspaces, &SocialMemory::new(), 100)
+                .unwrap();
         assert_eq!(events.len(), 3);
         for event in &events {
             event.verify_signature().unwrap();
@@ -5914,11 +5921,11 @@ mod tests {
     #[test]
     fn social_events_response_filters_known_events_and_respects_limit() {
         let identity = NodeIdentity::generate();
-        let event_a = signed_workspace_event(&identity, 41, 1);
-        let event_b = signed_workspace_event(&identity, 42, 2);
-        let event_c = signed_workspace_event(&identity, 43, 3);
+        let events = signed_workspace_events(&identity, &[41, 42, 43], 1);
+        let event_a = events[0].clone();
+        let event_b = events[1].clone();
         let mut memory = SocialMemory::new();
-        for event in [event_a.clone(), event_b.clone(), event_c.clone()] {
+        for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
 
@@ -5938,8 +5945,7 @@ mod tests {
     fn social_events_response_clamps_remote_limit() {
         let identity = NodeIdentity::generate();
         let mut memory = SocialMemory::new();
-        for i in 0..3 {
-            let event = signed_workspace_event(&identity, (i % 251) as u8, i as u64 + 1);
+        for event in signed_workspace_events(&identity, &[0, 1, 2], 1) {
             assert!(memory.ingest_event(event).unwrap());
         }
 
@@ -5956,13 +5962,13 @@ mod tests {
     #[test]
     fn social_events_response_stops_before_frame_limit() {
         let identity = NodeIdentity::generate();
-        let event_a = signed_workspace_event(&identity, 45, 1);
-        let event_b = signed_workspace_event(&identity, 46, 2);
+        let events = signed_workspace_events(&identity, &[45, 46], 1);
+        let event_a = events[0].clone();
         let first_event_json = event_a.to_json().unwrap();
         let max_frame_bytes =
             social_events_response_frame_len(std::slice::from_ref(&first_event_json)).unwrap();
         let mut memory = SocialMemory::new();
-        for event in [event_a, event_b] {
+        for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
 
@@ -6024,8 +6030,9 @@ mod tests {
         let identity = NodeIdentity::generate();
         let workspace = WorkspaceId::from_bytes([55; 32]);
         let manifest = build_node_manifest(&identity, Path::new("/tmp/social-node"), 100);
-        let events = signed_presence_events(&identity, manifest, &[workspace], 100).unwrap();
         let mut memory = SocialMemory::new();
+        let events =
+            signed_presence_events(&identity, manifest, &[workspace], &memory, 100).unwrap();
         for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
@@ -6183,33 +6190,34 @@ mod tests {
         let workspace = WorkspaceId::from_bytes([57; 32]);
         let mut memory = SocialMemory::new();
 
-        let events = [
-            SocialEvent::new(
-                requester.did().clone(),
-                1,
-                SocialEventKind::ManifestPublished {
-                    manifest: AgentManifest::new(requester.did().clone(), "reviewer", 1)
-                        .provide(CapabilityDecl {
-                            name: "code-review".into(),
-                            description: "review workspaces".into(),
-                            version: "1.0".into(),
-                            price_per_unit: 1,
-                            price_unit: "per-request".into(),
-                        })
-                        .preference("high-autonomy"),
-                },
+        let requester_events = memory
+            .sign_event_sequence(
+                &requester,
+                [
+                    (
+                        1,
+                        SocialEventKind::ManifestPublished {
+                            manifest: AgentManifest::new(requester.did().clone(), "reviewer", 1)
+                                .provide(CapabilityDecl {
+                                    name: "code-review".into(),
+                                    description: "review workspaces".into(),
+                                    version: "1.0".into(),
+                                    price_per_unit: 1,
+                                    price_unit: "per-request".into(),
+                                })
+                                .preference("high-autonomy"),
+                        },
+                    ),
+                    (2, SocialEventKind::WorkspaceJoined { workspace }),
+                ],
             )
-            .sign(&requester)
-            .unwrap(),
-            SocialEvent::new(
-                requester.did().clone(),
-                2,
-                SocialEventKind::WorkspaceJoined { workspace },
-            )
-            .sign(&requester)
-            .unwrap(),
-            SocialEvent::new(
-                author.did().clone(),
+            .unwrap();
+        for event in requester_events {
+            assert!(memory.ingest_event(event).unwrap());
+        }
+        let author_event = memory
+            .sign_event(
+                &author,
                 3,
                 SocialEventKind::IntentPublished {
                     intent: AgentIntent {
@@ -6227,12 +6235,8 @@ mod tests {
                     },
                 },
             )
-            .sign(&author)
-            .unwrap(),
-        ];
-        for event in events {
-            assert!(memory.ingest_event(event).unwrap());
-        }
+            .unwrap();
+        assert!(memory.ingest_event(author_event).unwrap());
 
         let view = society_json_for_base(
             temp.path(),
@@ -6286,33 +6290,34 @@ mod tests {
         let memory_path = temp.path().join(".nexus-social-memory.json");
         let mut memory = SocialMemory::new();
 
-        let events = [
-            SocialEvent::new(
-                requester.did().clone(),
-                1,
-                SocialEventKind::ManifestPublished {
-                    manifest: AgentManifest::new(requester.did().clone(), "reviewer", 1)
-                        .provide(CapabilityDecl {
-                            name: "code-review".into(),
-                            description: "review workspaces".into(),
-                            version: "1.0".into(),
-                            price_per_unit: 7,
-                            price_unit: "per-request".into(),
-                        })
-                        .preference("high-autonomy"),
-                },
+        let requester_events = memory
+            .sign_event_sequence(
+                &requester,
+                [
+                    (
+                        1,
+                        SocialEventKind::ManifestPublished {
+                            manifest: AgentManifest::new(requester.did().clone(), "reviewer", 1)
+                                .provide(CapabilityDecl {
+                                    name: "code-review".into(),
+                                    description: "review workspaces".into(),
+                                    version: "1.0".into(),
+                                    price_per_unit: 7,
+                                    price_unit: "per-request".into(),
+                                })
+                                .preference("high-autonomy"),
+                        },
+                    ),
+                    (2, SocialEventKind::WorkspaceJoined { workspace }),
+                ],
             )
-            .sign(&requester)
-            .unwrap(),
-            SocialEvent::new(
-                requester.did().clone(),
-                2,
-                SocialEventKind::WorkspaceJoined { workspace },
-            )
-            .sign(&requester)
-            .unwrap(),
-            SocialEvent::new(
-                author.did().clone(),
+            .unwrap();
+        for event in requester_events {
+            assert!(memory.ingest_event(event).unwrap());
+        }
+        let author_event = memory
+            .sign_event(
+                &author,
                 3,
                 SocialEventKind::IntentPublished {
                     intent: AgentIntent {
@@ -6330,12 +6335,8 @@ mod tests {
                     },
                 },
             )
-            .sign(&author)
-            .unwrap(),
-        ];
-        for event in events {
-            assert!(memory.ingest_event(event).unwrap());
-        }
+            .unwrap();
+        assert!(memory.ingest_event(author_event).unwrap());
         save_social_memory(&memory_path, &memory).unwrap();
 
         cmd_act(&[
@@ -6689,54 +6690,60 @@ mod tests {
         let root_b = Cid::hash_of(b"task two output root");
         let mut memory = SocialMemory::new();
 
-        let events = [
-            SocialEvent::new(
-                publisher.did().clone(),
+        let publisher_event = memory
+            .sign_event(
+                &publisher,
                 1,
                 SocialEventKind::ManifestPublished {
                     manifest: AgentManifest::new(publisher.did().clone(), "publisher", 1),
                 },
             )
-            .sign(&publisher)
-            .unwrap(),
-            SocialEvent::new(
-                executor.did().clone(),
-                2,
-                SocialEventKind::ManifestPublished {
-                    manifest: AgentManifest::new(executor.did().clone(), "executor", 2),
-                },
+            .unwrap();
+        assert!(memory.ingest_event(publisher_event).unwrap());
+
+        let executor_events = memory
+            .sign_event_sequence(
+                &executor,
+                [
+                    (
+                        2,
+                        SocialEventKind::ManifestPublished {
+                            manifest: AgentManifest::new(executor.did().clone(), "executor", 2),
+                        },
+                    ),
+                    (
+                        4,
+                        SocialEventKind::WorkspaceJoined {
+                            workspace: workspace_a,
+                        },
+                    ),
+                ],
             )
-            .sign(&executor)
-            .unwrap(),
-            SocialEvent::new(
-                observer.did().clone(),
-                3,
-                SocialEventKind::ManifestPublished {
-                    manifest: AgentManifest::new(observer.did().clone(), "observer", 3),
-                },
+            .unwrap();
+        for event in executor_events {
+            assert!(memory.ingest_event(event).unwrap());
+        }
+
+        let observer_events = memory
+            .sign_event_sequence(
+                &observer,
+                [
+                    (
+                        3,
+                        SocialEventKind::ManifestPublished {
+                            manifest: AgentManifest::new(observer.did().clone(), "observer", 3),
+                        },
+                    ),
+                    (
+                        5,
+                        SocialEventKind::WorkspaceJoined {
+                            workspace: workspace_b,
+                        },
+                    ),
+                ],
             )
-            .sign(&observer)
-            .unwrap(),
-            SocialEvent::new(
-                executor.did().clone(),
-                4,
-                SocialEventKind::WorkspaceJoined {
-                    workspace: workspace_a,
-                },
-            )
-            .sign(&executor)
-            .unwrap(),
-            SocialEvent::new(
-                observer.did().clone(),
-                5,
-                SocialEventKind::WorkspaceJoined {
-                    workspace: workspace_b,
-                },
-            )
-            .sign(&observer)
-            .unwrap(),
-        ];
-        for event in events {
+            .unwrap();
+        for event in observer_events {
             assert!(memory.ingest_event(event).unwrap());
         }
 
@@ -6763,42 +6770,36 @@ mod tests {
         );
         let task_two_id = task_two.id.clone();
         for (task, timestamp) in [(task_one, 10), (task_two, 20)] {
-            assert!(memory
-                .ingest_event(
-                    SocialEvent::new(
-                        publisher.did().clone(),
-                        timestamp,
-                        SocialEventKind::TaskPublished { task },
-                    )
-                    .sign(&publisher)
-                    .unwrap()
+            let event = memory
+                .sign_event(
+                    &publisher,
+                    timestamp,
+                    SocialEventKind::TaskPublished { task },
                 )
-                .unwrap());
+                .unwrap();
+            assert!(memory.ingest_event(event).unwrap());
         }
 
         for (task_id, workspace, output_root, timestamp) in [
             (task_one_id.clone(), workspace_a, root_a, 30),
             (task_two_id.clone(), workspace_b, root_b, 40),
         ] {
-            assert!(memory
-                .ingest_event(
-                    SocialEvent::new(
-                        publisher.did().clone(),
-                        timestamp,
-                        SocialEventKind::TaskAccepted {
-                            acceptance: TaskAcceptance {
-                                task_id: task_id.clone(),
-                                publisher: publisher.did().clone(),
-                                bidder: executor.did().clone(),
-                                price: 10,
-                                accepted_at: timestamp,
-                            },
+            let accepted = memory
+                .sign_event(
+                    &publisher,
+                    timestamp,
+                    SocialEventKind::TaskAccepted {
+                        acceptance: TaskAcceptance {
+                            task_id: task_id.clone(),
+                            publisher: publisher.did().clone(),
+                            bidder: executor.did().clone(),
+                            price: 10,
+                            accepted_at: timestamp,
                         },
-                    )
-                    .sign(&publisher)
-                    .unwrap()
+                    },
                 )
-                .unwrap());
+                .unwrap();
+            assert!(memory.ingest_event(accepted).unwrap());
 
             let stdout = format!("ok:{task_id}");
             let output = ProcessOutput {
@@ -6827,29 +6828,26 @@ mod tests {
             )
             .sign(&executor)
             .unwrap();
-            assert!(memory
-                .ingest_event(
-                    SocialEvent::new(
-                        executor.did().clone(),
-                        timestamp + 1,
-                        SocialEventKind::TaskCompleted {
-                            result: TaskResult {
-                                task_id,
-                                executor: executor.did().clone(),
-                                success: true,
-                                exit_code: 0,
-                                stdout,
-                                stderr: String::new(),
-                                actual_cost: 10,
-                                error: None,
-                                receipt: Some(Box::new(receipt)),
-                            },
+            let completed = memory
+                .sign_event(
+                    &executor,
+                    timestamp + 1,
+                    SocialEventKind::TaskCompleted {
+                        result: TaskResult {
+                            task_id,
+                            executor: executor.did().clone(),
+                            success: true,
+                            exit_code: 0,
+                            stdout,
+                            stderr: String::new(),
+                            actual_cost: 10,
+                            error: None,
+                            receipt: Some(Box::new(receipt)),
                         },
-                    )
-                    .sign(&executor)
-                    .unwrap()
+                    },
                 )
-                .unwrap());
+                .unwrap();
+            assert!(memory.ingest_event(completed).unwrap());
         }
 
         let task_slice = society_json_for_base(

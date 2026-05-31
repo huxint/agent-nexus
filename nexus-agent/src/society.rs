@@ -14,7 +14,7 @@ use nexus_storage::Cid;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{AgentManifest, CapabilityDecl};
-use crate::protocol::{SocialEvent, SocialEventKind};
+use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind};
 use crate::task::{Task, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskState};
 
 fn acceptance_key(acceptance: &TaskAcceptance) -> String {
@@ -684,6 +684,8 @@ pub struct Society {
     settlements: HashMap<String, SettlementRecord>,
     #[serde(default)]
     applied_task_results: HashSet<String>,
+    #[serde(default)]
+    equivocations: HashMap<Did, Vec<EquivocationProof>>,
 }
 
 impl Society {
@@ -715,6 +717,42 @@ impl Society {
                 .then_with(|| a.id.cmp(&b.id))
         });
         settlements
+    }
+
+    pub fn is_equivocating(&self, author: &Did) -> bool {
+        self.equivocations
+            .get(author)
+            .is_some_and(|proofs| !proofs.is_empty())
+    }
+
+    pub fn equivocation_proofs(&self) -> Vec<&EquivocationProof> {
+        let mut proofs = self
+            .equivocations
+            .values()
+            .flat_map(|proofs| proofs.iter())
+            .collect::<Vec<_>>();
+        proofs.sort_by(|a, b| {
+            a.author
+                .to_string()
+                .cmp(&b.author.to_string())
+                .then_with(|| a.seq.cmp(&b.seq))
+                .then_with(|| a.evidence_key().cmp(&b.evidence_key()))
+        });
+        proofs
+    }
+
+    pub fn agent_equivocations(&self, author: &Did) -> Vec<&EquivocationProof> {
+        let mut proofs = self
+            .equivocations
+            .get(author)
+            .map(|proofs| proofs.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        proofs.sort_by(|a, b| {
+            a.seq
+                .cmp(&b.seq)
+                .then_with(|| a.evidence_key().cmp(&b.evidence_key()))
+        });
+        proofs
     }
 
     pub fn settlement(&self, id: &str) -> Option<&SettlementRecord> {
@@ -1476,6 +1514,9 @@ impl Society {
                 {
                     return None;
                 }
+                if self.is_equivocating(&intent.author) {
+                    return None;
+                }
 
                 let responses = self.responses_for_intent(&intent.id);
                 if responses
@@ -1556,6 +1597,9 @@ impl Society {
         self.register_agent(event.author.clone());
 
         match &event.kind {
+            SocialEventKind::EquivocationObserved { proof } => {
+                self.record_equivocation_proof(proof.as_ref().clone());
+            }
             SocialEventKind::ManifestPublished { manifest } => {
                 self.register_agent(manifest.did.clone());
                 self.manifests
@@ -1672,7 +1716,11 @@ impl Society {
         let mut candidates: Vec<&SocialEdge> = self
             .edges
             .values()
-            .filter(|edge| edge.from == *agent && edge.kind != RelationKind::Blocked)
+            .filter(|edge| {
+                edge.from == *agent
+                    && edge.kind != RelationKind::Blocked
+                    && !self.is_equivocating(&edge.to)
+            })
             .collect();
 
         candidates.sort_by(|a, b| {
@@ -1934,6 +1982,21 @@ impl Society {
             .or_insert(settlement);
     }
 
+    pub fn record_equivocation_proof(&mut self, proof: EquivocationProof) {
+        if proof.verify().is_err() {
+            return;
+        }
+        self.register_agent(proof.author.clone());
+        let proofs = self.equivocations.entry(proof.author.clone()).or_default();
+        if proofs
+            .iter()
+            .any(|existing| existing.evidence_key() == proof.evidence_key())
+        {
+            return;
+        }
+        proofs.push(proof);
+    }
+
     fn apply_known_task_result(&mut self, task_id: &str) {
         if self.applied_task_results.contains(task_id) {
             return;
@@ -2086,6 +2149,9 @@ impl Society {
             let Some(capability_decl) = manifest.find_provided(capability) else {
                 continue;
             };
+            if self.is_equivocating(&manifest.did) {
+                continue;
+            }
 
             if let Some(requester) = requester {
                 if self
