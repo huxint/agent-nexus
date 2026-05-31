@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::manifest::AgentManifest;
 use crate::society::{
     AgentIntent, CapabilityGrant, CapabilityRevocation, CollectiveDecision, CollectiveProposal,
-    CollectiveVote, IdentityRevocation, IntentResponse, Interaction, RelationKind,
-    SettlementRecord, TaskDispute, WorkspaceRun, WorkspaceSnapshot,
+    CollectiveVote, IdentityRevocation, IdentityRotation, IntentResponse, Interaction,
+    RelationKind, SettlementRecord, TaskDispute, WorkspaceRun, WorkspaceSnapshot,
 };
 use crate::task::{
     ExecutionAttestation, ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer,
@@ -48,6 +48,12 @@ pub enum SocialProtocolError {
         author: Did,
         subject: Did,
     },
+
+    #[error("identity rotation target must differ from previous DID {did}")]
+    InvalidIdentityRotationTargetSelf { did: Did },
+
+    #[error("invalid identity rotation target DID {target}: {source}")]
+    InvalidIdentityRotationTarget { target: Did, source: DidError },
 
     #[error("social event is missing an author signature")]
     MissingSignature,
@@ -159,6 +165,8 @@ pub enum SocialEventKind {
     ManifestPublished { manifest: AgentManifest },
     /// Revoke the author's identity in the social layer.
     IdentityRevoked { revocation: IdentityRevocation },
+    /// Link the author's current DID to a successor DID.
+    IdentityRotated { rotation: IdentityRotation },
     /// Join a workspace as a social presence event.
     WorkspaceJoined { workspace: WorkspaceId },
     /// Claim ownership of a workspace as signed social truth metadata.
@@ -525,6 +533,21 @@ impl SocialEvent {
             }
             SocialEventKind::IdentityRevoked { revocation } => {
                 self.ensure_subject("identity revocation", &revocation.did)
+            }
+            SocialEventKind::IdentityRotated { rotation } => {
+                self.ensure_subject("identity rotation", &rotation.previous)?;
+                if rotation.previous == rotation.next {
+                    return Err(SocialProtocolError::InvalidIdentityRotationTargetSelf {
+                        did: rotation.previous.clone(),
+                    });
+                }
+                parse_did(rotation.next.as_str()).map_err(|source| {
+                    SocialProtocolError::InvalidIdentityRotationTarget {
+                        target: rotation.next.clone(),
+                        source,
+                    }
+                })?;
+                Ok(())
             }
             SocialEventKind::InteractionRecorded { interaction } => {
                 self.ensure_subject("interaction", &interaction.from)
@@ -1196,6 +1219,81 @@ mod tests {
         assert!(matches!(
             event.validate().unwrap_err(),
             SocialProtocolError::AuthorSubjectMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_accepts_identity_rotation_signed_by_previous_identity() {
+        let previous = NodeIdentity::generate();
+        let next = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            previous.did().clone(),
+            1,
+            SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: previous.did().clone(),
+                    next: next.did().clone(),
+                    reason: Some("routine key rotation".into()),
+                    rotated_at: 1,
+                },
+            },
+        )
+        .sign(&previous)
+        .unwrap();
+
+        event.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_identity_rotation_for_another_identity() {
+        let author = NodeIdentity::generate();
+        let previous = NodeIdentity::generate();
+        let next = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            author.did().clone(),
+            1,
+            SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: previous.did().clone(),
+                    next: next.did().clone(),
+                    reason: Some("stolen key".into()),
+                    rotated_at: 1,
+                },
+            },
+        )
+        .sign(&author)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch {
+                event: "identity rotation",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_identity_rotation_to_self() {
+        let identity = NodeIdentity::generate();
+        let event = SocialEvent::new(
+            identity.did().clone(),
+            1,
+            SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: identity.did().clone(),
+                    next: identity.did().clone(),
+                    reason: None,
+                    rotated_at: 1,
+                },
+            },
+        )
+        .sign(&identity)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::InvalidIdentityRotationTargetSelf { .. }
         ));
     }
 

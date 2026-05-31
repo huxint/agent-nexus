@@ -675,6 +675,15 @@ pub struct IdentityRevocation {
     pub revoked_at: u64,
 }
 
+/// A signed social fact that links an old DID to a successor DID.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityRotation {
+    pub previous: Did,
+    pub next: Did,
+    pub reason: Option<String>,
+    pub rotated_at: u64,
+}
+
 /// A signed claim that an agent observed or created a workspace snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -875,6 +884,8 @@ pub struct Society {
     agents: HashSet<Did>,
     #[serde(default)]
     identity_revocations: HashMap<Did, IdentityRevocation>,
+    #[serde(default)]
+    identity_rotations: HashMap<Did, IdentityRotation>,
     manifests: HashMap<Did, AgentManifest>,
     edges: HashMap<(Did, Did), SocialEdge>,
     #[serde(default)]
@@ -1056,6 +1067,22 @@ impl Society {
             .or_insert(revocation);
     }
 
+    pub fn record_identity_rotation(&mut self, rotation: IdentityRotation) {
+        if rotation.previous == rotation.next {
+            return;
+        }
+        self.register_agent(rotation.previous.clone());
+        self.register_agent(rotation.next.clone());
+        self.identity_rotations
+            .entry(rotation.previous.clone())
+            .and_modify(|existing| {
+                if rotation.rotated_at >= existing.rotated_at {
+                    *existing = rotation.clone();
+                }
+            })
+            .or_insert(rotation);
+    }
+
     pub fn identity_revocation(&self, did: &Did) -> Option<&IdentityRevocation> {
         self.identity_revocations.get(did)
     }
@@ -1069,6 +1096,32 @@ impl Society {
                 .then_with(|| a.did.to_string().cmp(&b.did.to_string()))
         });
         revocations
+    }
+
+    pub fn identity_rotation(&self, did: &Did) -> Option<&IdentityRotation> {
+        self.identity_rotations.get(did)
+    }
+
+    pub fn identity_rotations(&self) -> Vec<&IdentityRotation> {
+        let mut rotations: Vec<&IdentityRotation> = self.identity_rotations.values().collect();
+        rotations.sort_by(|a, b| {
+            a.rotated_at
+                .cmp(&b.rotated_at)
+                .then_with(|| a.previous.to_string().cmp(&b.previous.to_string()))
+        });
+        rotations
+    }
+
+    pub fn active_identity(&self, did: &Did) -> Did {
+        let mut current = did.clone();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            let Some(rotation) = self.identity_rotation(&current) else {
+                break;
+            };
+            current = rotation.next.clone();
+        }
+        current
     }
 
     pub fn is_identity_revoked(&self, did: &Did) -> bool {
@@ -2124,6 +2177,9 @@ impl Society {
             }
             SocialEventKind::IdentityRevoked { revocation } => {
                 self.record_identity_revocation(revocation.clone());
+            }
+            SocialEventKind::IdentityRotated { rotation } => {
+                self.record_identity_rotation(rotation.clone());
             }
             SocialEventKind::WorkspaceJoined { workspace } => {
                 self.join_workspace(event.author.clone(), *workspace);
@@ -3965,6 +4021,72 @@ mod tests {
         assert_eq!(revocation.did, *identity.did());
         assert_eq!(revocation.reason.as_deref(), Some("key compromised"));
         assert_eq!(society.identity_revocations().len(), 1);
+    }
+
+    #[test]
+    fn identity_rotation_links_previous_identity_to_successor() {
+        let previous = NodeIdentity::generate();
+        let next = NodeIdentity::generate();
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            previous.did().clone(),
+            1,
+            SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: previous.did().clone(),
+                    next: next.did().clone(),
+                    reason: Some("routine rotation".into()),
+                    rotated_at: 1,
+                },
+            },
+        ));
+
+        assert!(society.has_agent(previous.did()));
+        assert!(society.has_agent(next.did()));
+        assert_eq!(society.active_identity(previous.did()), next.did().clone());
+        assert_eq!(society.active_identity(next.did()), next.did().clone());
+        let rotation = society.identity_rotation(previous.did()).unwrap();
+        assert_eq!(rotation.next, *next.did());
+        assert_eq!(rotation.reason.as_deref(), Some("routine rotation"));
+        assert_eq!(society.identity_rotations().len(), 1);
+    }
+
+    #[test]
+    fn identity_rotation_keeps_latest_successor_and_stops_cycles() {
+        let previous = NodeIdentity::generate();
+        let stale_next = NodeIdentity::generate();
+        let next = NodeIdentity::generate();
+        let mut society = Society::new();
+
+        society.record_identity_rotation(IdentityRotation {
+            previous: previous.did().clone(),
+            next: stale_next.did().clone(),
+            reason: Some("old".into()),
+            rotated_at: 1,
+        });
+        society.record_identity_rotation(IdentityRotation {
+            previous: previous.did().clone(),
+            next: next.did().clone(),
+            reason: Some("new".into()),
+            rotated_at: 2,
+        });
+        society.record_identity_rotation(IdentityRotation {
+            previous: next.did().clone(),
+            next: previous.did().clone(),
+            reason: Some("bad cycle".into()),
+            rotated_at: 3,
+        });
+
+        assert_eq!(society.identity_rotations().len(), 2);
+        assert_eq!(
+            society.identity_rotation(previous.did()).unwrap().next,
+            *next.did()
+        );
+        assert_eq!(
+            society.active_identity(previous.did()),
+            previous.did().clone()
+        );
     }
 
     #[test]

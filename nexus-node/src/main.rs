@@ -9,7 +9,7 @@
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
-//!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
+//!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
 
@@ -35,11 +35,11 @@ use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
     CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt,
-    IdentityRevocation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
-    IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
-    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun,
-    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
-    MAX_SOCIAL_EVENT_JSON_BYTES,
+    IdentityRevocation, IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind,
+    IntentResponse, IntentResponseKind, Interaction, InteractionOutcome, RelationKind,
+    SettlementRecord, SocialEvent, SocialEventKind, SocialMemory, TaskDispute,
+    WorkspaceOwnershipClaim, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
+    WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -137,6 +137,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event intent --base <DIR> --kind <goal|need|offer|proposal|status> --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>]");
     eprintln!("  {prog} event intent-response --base <DIR> --intent <ID> --kind <interested|accept|decline|counter|fulfilled> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--evidence <TEXT>]");
     eprintln!("  {prog} event identity-revoke --base <DIR> [--reason <TEXT>] [--revoked-at <TS>]");
+    eprintln!("  {prog} event identity-rotate --base <DIR> --next <DID> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!("  {prog} event workspace-join --base <DIR> --workspace <HEX>");
     eprintln!("  {prog} event workspace-claim --base <DIR> --workspace <HEX> [--root <CID_HEX>]");
     eprintln!("  {prog} event workspace-transfer --base <DIR> --workspace <HEX> --owner <DID> [--root <CID_HEX>]");
@@ -1626,7 +1627,7 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, identity-revoke, workspace-join, workspace-claim, workspace-transfer, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
+            "event subcommand required: manifest, intent, identity-revoke, identity-rotate, workspace-join, workspace-claim, workspace-transfer, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -1639,6 +1640,9 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "intent-response" | "respond" | "response" => cmd_event_intent_response(args),
         "identity-revoke" | "identity-revoked" | "revoke-identity" => {
             cmd_event_identity_revoke(args)
+        }
+        "identity-rotate" | "identity-rotated" | "rotate-identity" => {
+            cmd_event_identity_rotate(args)
         }
         "workspace-join" | "workspace" | "join" => cmd_event_workspace_join(args),
         "workspace-claim" | "claim-workspace" | "workspace-owner-claim" => {
@@ -1974,6 +1978,57 @@ fn cmd_event_identity_revoke(args: &[String]) -> Result<(), Box<dyn std::error::
                     did: identity.did().clone(),
                     reason,
                     revoked_at: revoked_at.unwrap_or(now),
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_identity_rotate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut next = None;
+    let mut reason = None;
+    let mut rotated_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--next" => {
+                i += 1;
+                next = Some(Did::new(required_arg(args, i, "--next")?.to_string()));
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            "--rotated-at" => {
+                i += 1;
+                rotated_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--rotated-at")?,
+                    "--rotated-at",
+                )?);
+            }
+            other => return Err(format!("unknown identity-rotate option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::IdentityRotated {
+                rotation: IdentityRotation {
+                    previous: identity.did().clone(),
+                    next: next.ok_or("--next required")?,
+                    reason,
+                    rotated_at: rotated_at.unwrap_or(now),
                 },
             })
         },
@@ -7740,6 +7795,74 @@ mod tests {
         );
         assert_eq!(view["agents"][0]["revocation"]["reason"], "key compromised");
         assert_eq!(view["agents"][0]["revocation"]["revoked_at"], 456);
+        for event in memory.events() {
+            event.verify_signature().unwrap();
+        }
+    }
+
+    #[test]
+    fn event_commands_record_identity_rotation() {
+        let temp = TempDir::new().unwrap();
+        let previous = load_or_create_identity(temp.path()).unwrap();
+        let next = NodeIdentity::generate();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "manifest".into(),
+            "--base".into(),
+            base.clone(),
+            "--name".into(),
+            "rotating-agent".into(),
+        ])
+        .unwrap();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "identity-rotate".into(),
+            "--base".into(),
+            base,
+            "--next".into(),
+            next.did().to_string(),
+            "--reason".into(),
+            "routine rotation".into(),
+            "--rotated-at".into(),
+            "789".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 2);
+        assert_eq!(
+            memory.society().active_identity(previous.did()),
+            next.did().clone()
+        );
+        let view = society_json(&memory);
+        let previous_agent = view["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["did"] == previous.did().to_string())
+            .unwrap();
+        assert_eq!(previous_agent["active_did"], next.did().to_string());
+        assert_eq!(previous_agent["rotated"], true);
+        assert_eq!(
+            previous_agent["rotation"]["previous"],
+            previous.did().to_string()
+        );
+        assert_eq!(previous_agent["rotation"]["next"], next.did().to_string());
+        assert_eq!(previous_agent["rotation"]["reason"], "routine rotation");
+        assert_eq!(previous_agent["rotation"]["rotated_at"], 789);
+        assert_eq!(
+            view["identity_rotations"][0]["previous"],
+            previous.did().to_string()
+        );
+        assert_eq!(
+            view["identity_rotations"][0]["next"],
+            next.did().to_string()
+        );
         for event in memory.events() {
             event.verify_signature().unwrap();
         }

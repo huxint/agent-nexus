@@ -3,11 +3,11 @@ use std::path::Path;
 use nexus_agent::{
     capability_signature_id, task_result_claim_id, AgentIntent, CapabilityGrant,
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
-    ExecutionReceipt, GovernanceSignal, IdentityRevocation, IntentRecommendation, IntentResponse,
-    Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
-    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WitnessedFactKind,
-    WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
-    WorkspaceSnapshot,
+    ExecutionReceipt, GovernanceSignal, IdentityRevocation, IdentityRotation, IntentRecommendation,
+    IntentResponse, Interaction, ProviderRecommendation, ReputationScore, SettlementRecord,
+    SocialEdge, SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability,
+    WitnessedFactKind, WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext,
+    WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -119,6 +119,8 @@ pub(crate) fn society_json_for_base(
         .map(|did| {
             let manifest = society.agent_manifest(did);
             let revocation = society.identity_revocation(did);
+            let rotation = society.identity_rotation(did);
+            let active_identity = society.active_identity(did);
             let provider_recommendations = manifest
                 .map(|manifest| {
                     manifest
@@ -136,6 +138,9 @@ pub(crate) fn society_json_for_base(
                 .unwrap_or_default();
             serde_json::json!({
                 "did": did.to_string(),
+                "active_did": active_identity.to_string(),
+                "rotated": active_identity != *did,
+                "rotation": rotation.map(identity_rotation_json),
                 "revoked": revocation.is_some(),
                 "revocation": revocation.map(identity_revocation_json),
                 "manifest": manifest,
@@ -466,6 +471,12 @@ pub(crate) fn society_json_for_base(
         "events": memory.event_count(),
         "policies": society_policies_json(),
         "agents": agents,
+        "identity_rotations": society
+            .identity_rotations()
+            .into_iter()
+            .filter(|rotation| identity_rotation_matches_filters(rotation, &options))
+            .map(identity_rotation_json)
+            .collect::<Vec<_>>(),
         "workspaces": workspaces,
         "discovered_workspaces": discovered_workspaces,
         "collectives": collectives,
@@ -510,13 +521,15 @@ fn agent_matches_filters(
     did: &Did,
     options: &SocietyJsonOptions,
 ) -> bool {
-    options
-        .agent_filter
-        .as_ref()
-        .is_none_or(|agent| did == agent)
-        && options
-            .workspace_filter
-            .is_none_or(|workspace| agent_uses_workspace(society, did, &workspace))
+    options.agent_filter.as_ref().is_none_or(|agent| {
+        did == agent
+            || society.active_identity(did) == *agent
+            || society
+                .identity_rotation(did)
+                .is_some_and(|rotation| rotation.next == *agent)
+    }) && options
+        .workspace_filter
+        .is_none_or(|workspace| agent_uses_workspace(society, did, &workspace))
         && options.task_filter.as_ref().is_none_or(|task_id| {
             society.task(task_id).is_some_and(|task| {
                 task.publisher == *did
@@ -553,6 +566,18 @@ fn agent_matches_filters(
                         })
             })
         })
+}
+
+fn identity_rotation_matches_filters(
+    rotation: &IdentityRotation,
+    options: &SocietyJsonOptions,
+) -> bool {
+    options
+        .agent_filter
+        .as_ref()
+        .is_none_or(|agent| rotation.previous == *agent || rotation.next == *agent)
+        && options.workspace_filter.is_none()
+        && options.task_filter.is_none()
 }
 
 fn member_matches_filters(
@@ -992,6 +1017,15 @@ fn identity_revocation_json(revocation: &IdentityRevocation) -> serde_json::Valu
         "did": revocation.did.to_string(),
         "reason": revocation.reason,
         "revoked_at": revocation.revoked_at,
+    })
+}
+
+fn identity_rotation_json(rotation: &IdentityRotation) -> serde_json::Value {
+    serde_json::json!({
+        "previous": rotation.previous.to_string(),
+        "next": rotation.next.to_string(),
+        "reason": rotation.reason,
+        "rotated_at": rotation.rotated_at,
     })
 }
 
