@@ -138,6 +138,18 @@ fn workspace_snapshot_key(snapshot: &WorkspaceSnapshot) -> String {
     )
 }
 
+fn workspace_ownership_claim_key(claim: &WorkspaceOwnershipClaim) -> String {
+    format!(
+        "{}|{}|{}",
+        claim.workspace,
+        claim.owner,
+        claim
+            .root
+            .map(|root| hex::encode(root.as_bytes()))
+            .unwrap_or_default()
+    )
+}
+
 fn workspace_run_key(run: &WorkspaceRun) -> String {
     let bytes = serde_json::to_vec(run).unwrap_or_else(|_| {
         format!(
@@ -326,11 +338,33 @@ pub struct CollectiveVote {
 }
 
 /// Whether a social fact is only signed by its claimant or independently anchored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactTruthStatus {
     Claimed,
     Anchored,
+}
+
+/// A signed statement that an agent owns a workspace.
+///
+/// This is social truth metadata: it distinguishes "this node has a local
+/// copy" from "this identity claims stewardship of the workspace". Anchors can
+/// later upgrade that claim into a witnessed fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOwnershipClaim {
+    pub workspace: WorkspaceId,
+    pub owner: Did,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<Cid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AuthorityAnchor>,
+    pub claimed_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOwnershipFact {
+    pub claim: WorkspaceOwnershipClaim,
+    pub truth_status: FactTruthStatus,
 }
 
 /// Possible outcome of a collective governance decision.
@@ -810,6 +844,8 @@ pub struct Society {
     #[serde(default)]
     workspace_snapshots: HashMap<String, WorkspaceSnapshot>,
     #[serde(default)]
+    workspace_ownership_claims: HashMap<String, WorkspaceOwnershipClaim>,
+    #[serde(default)]
     workspace_runs: HashMap<String, WorkspaceRun>,
     #[serde(default)]
     intents: HashMap<String, AgentIntent>,
@@ -1119,6 +1155,58 @@ impl Society {
             .entry(agent)
             .or_default()
             .insert(workspace);
+    }
+
+    pub fn record_workspace_ownership_claim(&mut self, claim: WorkspaceOwnershipClaim) {
+        self.register_agent(claim.owner.clone());
+        self.workspace_ownership_claims
+            .entry(workspace_ownership_claim_key(&claim))
+            .and_modify(|existing| {
+                if claim.claimed_at >= existing.claimed_at {
+                    *existing = claim.clone();
+                }
+            })
+            .or_insert(claim);
+    }
+
+    pub fn workspace_ownership_claims(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Vec<WorkspaceOwnershipFact> {
+        let mut claims = self
+            .workspace_ownership_claims
+            .values()
+            .filter(|claim| claim.workspace == *workspace)
+            .map(|claim| WorkspaceOwnershipFact {
+                claim: claim.clone(),
+                truth_status: self.workspace_ownership_truth_status(claim),
+            })
+            .collect::<Vec<_>>();
+        claims.sort_by(|a, b| {
+            b.truth_status
+                .cmp(&a.truth_status)
+                .then_with(|| b.claim.claimed_at.cmp(&a.claim.claimed_at))
+                .then_with(|| a.claim.owner.to_string().cmp(&b.claim.owner.to_string()))
+        });
+        claims
+    }
+
+    pub fn workspace_claimed_owner(&self, workspace: &WorkspaceId) -> Option<Did> {
+        self.workspace_ownership_claims(workspace)
+            .first()
+            .map(|fact| fact.claim.owner.clone())
+    }
+
+    fn workspace_ownership_truth_status(&self, claim: &WorkspaceOwnershipClaim) -> FactTruthStatus {
+        if claim
+            .anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.validate().is_ok())
+        {
+            FactTruthStatus::Anchored
+        } else {
+            FactTruthStatus::Claimed
+        }
     }
 
     pub fn workspace_members(&self, workspace: &WorkspaceId) -> Vec<&Did> {
@@ -1933,6 +2021,9 @@ impl Society {
             }
             SocialEventKind::WorkspaceJoined { workspace } => {
                 self.join_workspace(event.author.clone(), *workspace);
+            }
+            SocialEventKind::WorkspaceOwnershipClaimed { claim } => {
+                self.record_workspace_ownership_claim(claim.clone());
             }
             SocialEventKind::RelationDeclared {
                 peer,
@@ -4409,6 +4500,44 @@ mod tests {
         assert_eq!(members, vec![&alice, &bob]);
         assert_eq!(society.agent_workspaces(&alice), vec![ws, other]);
         assert_eq!(society.agent_workspaces(&bob), vec![ws]);
+    }
+
+    #[test]
+    fn workspace_ownership_claims_are_distinct_from_local_membership() {
+        let owner = did("owner");
+        let guest = did("guest");
+        let ws = WorkspaceId::from_bytes([10; 32]);
+        let root = nexus_storage::Cid::hash_of(b"owner root");
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            guest.clone(),
+            1,
+            SocialEventKind::WorkspaceJoined { workspace: ws },
+        ));
+        assert_eq!(society.workspace_members(&ws), vec![&guest]);
+        assert_eq!(society.workspace_claimed_owner(&ws), None);
+
+        society.apply_event(&SocialEvent::new(
+            owner.clone(),
+            2,
+            SocialEventKind::WorkspaceOwnershipClaimed {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: ws,
+                    owner: owner.clone(),
+                    root: Some(root),
+                    anchor: None,
+                    claimed_at: 2,
+                },
+            },
+        ));
+
+        assert_eq!(society.workspace_members(&ws), vec![&guest]);
+        assert_eq!(society.workspace_claimed_owner(&ws), Some(owner.clone()));
+        let claims = society.workspace_ownership_claims(&ws);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim.owner, owner);
+        assert_eq!(claims[0].truth_status, FactTruthStatus::Claimed);
     }
 
     fn provider_manifest(did: Did, name: &str, capability: &str, price: u64) -> AgentManifest {

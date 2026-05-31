@@ -37,8 +37,9 @@ use nexus_agent::{
     CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt,
     IdentityRevocation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
     IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
-    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
+    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -754,6 +755,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut server = WorkspaceServer::new(network_arc);
     let mut net_clone = network.clone();
     let mut workspace_ids = Vec::new();
+    let mut presence_workspaces = Vec::new();
 
     println!("Node PeerId: {}", net_clone.local_peer_id());
 
@@ -763,6 +765,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             match Workspace::load(&id, &p).await {
                 Ok(ws) => {
                     workspace_ids.push(ws.id());
+                    presence_workspaces.push((ws.id(), ws.root_cid()));
                     println!("  loaded: {} ({})", ws.name(), p.display());
                     server.register(ws);
                 }
@@ -775,7 +778,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     announce_node_presence(
         &id,
         &network,
-        &workspace_ids,
+        &presence_workspaces,
         &mut social_memory,
         &memory_path,
         &base,
@@ -3584,18 +3587,30 @@ fn build_node_manifest(identity: &NodeIdentity, base: &Path, now: u64) -> AgentM
 fn signed_presence_events(
     identity: &NodeIdentity,
     manifest: AgentManifest,
-    workspaces: &[WorkspaceId],
+    workspaces: &[(WorkspaceId, Option<Cid>)],
     memory: &SocialMemory,
     now: u64,
 ) -> Result<Vec<SocialEvent>, Box<dyn std::error::Error>> {
-    let mut kinds = Vec::with_capacity(1 + workspaces.len());
+    let mut kinds = Vec::with_capacity(1 + workspaces.len() * 2);
     kinds.push((now, SocialEventKind::ManifestPublished { manifest }));
 
-    for workspace in workspaces {
+    for (workspace, root) in workspaces {
         kinds.push((
             now,
             SocialEventKind::WorkspaceJoined {
                 workspace: *workspace,
+            },
+        ));
+        kinds.push((
+            now,
+            SocialEventKind::WorkspaceOwnershipClaimed {
+                claim: WorkspaceOwnershipClaim {
+                    workspace: *workspace,
+                    owner: identity.did().clone(),
+                    root: *root,
+                    anchor: None,
+                    claimed_at: now,
+                },
             },
         ));
     }
@@ -3617,15 +3632,14 @@ fn announce_dht_presence(network: &Network, workspace_ids: &[WorkspaceId]) {
 async fn announce_node_presence(
     identity: &NodeIdentity,
     network: &Network,
-    workspace_ids: &[WorkspaceId],
+    workspaces: &[(WorkspaceId, Option<Cid>)],
     social_memory: &mut SocialMemory,
     memory_path: &Path,
     base: &Path,
     now: u64,
 ) {
     let manifest = build_node_manifest(identity, base, now);
-    let events = match signed_presence_events(identity, manifest, workspace_ids, social_memory, now)
-    {
+    let events = match signed_presence_events(identity, manifest, workspaces, social_memory, now) {
         Ok(events) => events,
         Err(err) => {
             tracing::warn!("failed to sign node presence events: {err}");
@@ -5354,7 +5368,7 @@ mod tests {
         for event in signed_presence_events(
             &owner,
             build_node_manifest(&owner, owner_base.path(), 100),
-            &[workspace_id],
+            &[(workspace_id, Some(root))],
             &remote_memory,
             100,
         )
@@ -5659,7 +5673,7 @@ mod tests {
         for event in signed_presence_events(
             &owner,
             build_node_manifest(&owner, owner_base.path(), 200),
-            &[workspace_id],
+            &[(workspace_id, Some(root))],
             &remote_memory,
             200,
         )
@@ -6277,8 +6291,8 @@ mod tests {
     fn node_presence_events_publish_manifest_and_workspace_membership() {
         let identity = NodeIdentity::generate();
         let workspaces = [
-            WorkspaceId::from_bytes([31; 32]),
-            WorkspaceId::from_bytes([32; 32]),
+            (WorkspaceId::from_bytes([31; 32]), None),
+            (WorkspaceId::from_bytes([32; 32]), None),
         ];
         let manifest = build_node_manifest(&identity, Path::new("/tmp/alice-node"), 100);
         assert_eq!(manifest.did, *identity.did());
@@ -6289,7 +6303,7 @@ mod tests {
         let events =
             signed_presence_events(&identity, manifest, &workspaces, &SocialMemory::new(), 100)
                 .unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 5);
         for event in &events {
             event.verify_signature().unwrap();
         }
@@ -6300,19 +6314,33 @@ mod tests {
         ));
         assert!(matches!(
             &events[1].kind,
-            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[0]
+            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[0].0
         ));
         assert!(matches!(
             &events[2].kind,
-            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[1]
+            SocialEventKind::WorkspaceOwnershipClaimed { claim }
+                if claim.workspace == workspaces[0].0 && claim.owner == *identity.did()
+        ));
+        assert!(matches!(
+            &events[3].kind,
+            SocialEventKind::WorkspaceJoined { workspace } if *workspace == workspaces[1].0
+        ));
+        assert!(matches!(
+            &events[4].kind,
+            SocialEventKind::WorkspaceOwnershipClaimed { claim }
+                if claim.workspace == workspaces[1].0 && claim.owner == *identity.did()
         ));
 
         let mut memory = SocialMemory::new();
         for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
-        assert_eq!(memory.event_count(), 3);
+        assert_eq!(memory.event_count(), 5);
         assert!(memory.society().has_agent(identity.did()));
+        assert_eq!(
+            memory.society().workspace_claimed_owner(&workspaces[0].0),
+            Some(identity.did().clone())
+        );
     }
 
     #[test]
@@ -6429,13 +6457,14 @@ mod tests {
         let manifest = build_node_manifest(&identity, Path::new("/tmp/social-node"), 100);
         let mut memory = SocialMemory::new();
         let events =
-            signed_presence_events(&identity, manifest, &[workspace], &memory, 100).unwrap();
+            signed_presence_events(&identity, manifest, &[(workspace, None)], &memory, 100)
+                .unwrap();
         for event in events {
             assert!(memory.ingest_event(event).unwrap());
         }
 
         let view = society_json(&memory);
-        assert_eq!(view["events"], 2);
+        assert_eq!(view["events"], 3);
         assert_eq!(view["policies"]["economy"]["mode"], "social_record");
         assert_eq!(view["policies"]["economy"]["enforcement"], "advisory");
         assert_eq!(view["policies"]["economy"]["settlement_gate"], false);
@@ -6455,6 +6484,18 @@ mod tests {
         assert_eq!(
             view["workspaces"][0]["members"][0],
             identity.did().to_string()
+        );
+        assert_eq!(
+            view["workspaces"][0]["claimed_owner"],
+            identity.did().to_string()
+        );
+        assert_eq!(
+            view["workspaces"][0]["ownership_claims"][0]["owner"],
+            identity.did().to_string()
+        );
+        assert_eq!(
+            view["workspaces"][0]["ownership_claims"][0]["truth_status"],
+            "claimed"
         );
         assert_eq!(
             view["workspaces"][0]["snapshots"].as_array().unwrap().len(),

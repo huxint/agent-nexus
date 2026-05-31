@@ -5,8 +5,8 @@ use nexus_agent::{
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
     ExecutionReceipt, GovernanceSignal, IdentityRevocation, IntentRecommendation, IntentResponse,
     Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
-    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WorkspaceRun,
-    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
+    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WorkspaceOwnershipFact,
+    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -193,6 +193,14 @@ pub(crate) fn society_json_for_base(
                     .into_iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
+                "ownership_claims": society
+                    .workspace_ownership_claims(&workspace)
+                    .into_iter()
+                    .map(workspace_ownership_fact_json)
+                    .collect::<Vec<_>>(),
+                "claimed_owner": society
+                    .workspace_claimed_owner(&workspace)
+                    .map(|owner| owner.to_string()),
                 "capability_grants": society
                     .workspace_capability_grants(&workspace)
                     .into_iter()
@@ -570,6 +578,10 @@ fn workspace_matches_filters(
                     .workspace_snapshots(workspace)
                     .into_iter()
                     .any(|snapshot| snapshot.actor == *agent)
+                || society
+                    .workspace_ownership_claims(workspace)
+                    .into_iter()
+                    .any(|fact| fact.claim.owner == *agent)
                 || society
                     .workspace_capability_grants(workspace)
                     .into_iter()
@@ -1180,6 +1192,17 @@ fn workspace_snapshot_json(snapshot: &WorkspaceSnapshot) -> serde_json::Value {
         "label": snapshot.label,
         "note": snapshot.note,
         "timestamp": snapshot.timestamp,
+    })
+}
+
+fn workspace_ownership_fact_json(fact: WorkspaceOwnershipFact) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": fact.claim.workspace.to_string(),
+        "owner": fact.claim.owner.to_string(),
+        "root": fact.claim.root.map(|root| hex::encode(root.as_bytes())),
+        "truth_status": fact.truth_status,
+        "anchored": fact.truth_status == nexus_agent::FactTruthStatus::Anchored,
+        "claimed_at": fact.claim.claimed_at,
     })
 }
 
