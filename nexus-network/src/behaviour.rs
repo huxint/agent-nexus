@@ -14,6 +14,8 @@ use nexus_sync::message::{SyncRequest, SyncResponse};
 use nexus_sync::{ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC, SYNC_PROTOCOL};
 use tracing::warn;
 
+const GOSSIP_MAX_TRANSMIT_SIZE: usize = 1_048_576;
+
 // ---------------------------------------------------------------------------
 // Behaviour
 // ---------------------------------------------------------------------------
@@ -113,8 +115,10 @@ impl CompositeBehaviour {
         .into();
 
         let gs_config = gossipsub::ConfigBuilder::default()
-            .max_transmit_size(1_048_576)
+            .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
             .heartbeat_interval(std::time::Duration::from_secs(10))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .validate_messages()
             .build()
             .map_err(|err| format!("gossipsub config: {err}"))?;
         let mut gossipsub = gossipsub::Behaviour::new(
@@ -122,6 +126,10 @@ impl CompositeBehaviour {
             gs_config,
         )
         .map_err(|err| format!("gossipsub behaviour: {err}"))?;
+        let (score_params, score_thresholds) = default_gossipsub_peer_score();
+        gossipsub
+            .with_peer_score(score_params, score_thresholds)
+            .map_err(|err| format!("gossipsub peer score: {err}"))?;
 
         for topic in [ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC] {
             gossipsub
@@ -148,5 +156,51 @@ impl CompositeBehaviour {
             sync,
             identify,
         })
+    }
+}
+
+fn default_gossipsub_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
+    let mut score_params = gossipsub::PeerScoreParams::default();
+    score_params.topics.insert(
+        gossipsub::IdentTopic::new(ANNOUNCE_TOPIC).hash(),
+        gossip_topic_score_params(),
+    );
+    score_params.topics.insert(
+        gossipsub::IdentTopic::new(SOCIAL_EVENT_TOPIC).hash(),
+        gossip_topic_score_params(),
+    );
+
+    (score_params, gossipsub::PeerScoreThresholds::default())
+}
+
+fn gossip_topic_score_params() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        invalid_message_deliveries_weight: -16.0,
+        invalid_message_deliveries_decay: 0.3,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_gossip_peer_score_covers_social_and_announcement_topics() {
+        let (params, thresholds) = default_gossipsub_peer_score();
+
+        params.validate().unwrap();
+        thresholds.validate().unwrap();
+        assert!(params
+            .topics
+            .contains_key(&gossipsub::IdentTopic::new(ANNOUNCE_TOPIC).hash()));
+        assert!(params
+            .topics
+            .contains_key(&gossipsub::IdentTopic::new(SOCIAL_EVENT_TOPIC).hash()));
+        assert!(params
+            .topics
+            .values()
+            .all(|topic| topic.invalid_message_deliveries_weight < 0.0));
     }
 }

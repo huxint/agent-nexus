@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::{
@@ -25,17 +25,21 @@ use nexus_sync::{ANNOUNCE_TOPIC, SOCIAL_EVENT_TOPIC};
 use crate::behaviour::{CompositeBehaviour, ToSwarm};
 use crate::transport;
 
+const SOCIAL_EVENT_RATE_LIMIT_PER_WINDOW: usize = 32;
+const SOCIAL_EVENT_RATE_WINDOW: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Config / Events
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NetworkConfig {
     pub listen_addr: Multiaddr,
     pub bootstrap_peers: Vec<Multiaddr>,
     pub kademlia_mode: kad::Mode,
     pub bootstrap_interval: Duration,
     pub enable_mdns: bool,
+    pub social_event_validator: SocialEventValidator,
 }
 
 impl Default for NetworkConfig {
@@ -46,9 +50,12 @@ impl Default for NetworkConfig {
             kademlia_mode: kad::Mode::Server,
             bootstrap_interval: Duration::from_secs(30),
             enable_mdns: true,
+            social_event_validator: Arc::new(|_| gossipsub::MessageAcceptance::Accept),
         }
     }
 }
+
+pub type SocialEventValidator = Arc<dyn Fn(&[u8]) -> gossipsub::MessageAcceptance + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
@@ -188,6 +195,8 @@ impl Network {
         let (sync_request_tx, mut sync_request_rx) = mpsc::unbounded_channel();
         let listen_addrs = Arc::new(Mutex::new(Vec::new()));
         let connected_peers = Arc::new(Mutex::new(HashSet::new()));
+        let social_event_validator = Arc::clone(&config.social_event_validator);
+        let mut social_event_rate_limits: HashMap<PeerId, SocialEventRateState> = HashMap::new();
 
         let mut pending_outbound: HashMap<OutboundRequestId, SyncReplySender> = HashMap::new();
         let mut pending_inbound: HashMap<InboundRequestId, ResponseChannel<SyncResponse>> =
@@ -252,12 +261,16 @@ impl Network {
                     Some(event) = swarm.next() => {
                         handle_swarm_event(
                             event,
-                            &event_tx_clone,
-                            &listen_addrs_clone,
-                            &connected_peers_clone,
-                            &mut pending_outbound,
-                            &mut pending_inbound,
-                            &mut swarm,
+                            SwarmEventContext {
+                                event_tx: &event_tx_clone,
+                                listen_addrs: &listen_addrs_clone,
+                                connected_peers: &connected_peers_clone,
+                                pending_out: &mut pending_outbound,
+                                pending_in: &mut pending_inbound,
+                                swarm: &mut swarm,
+                                social_event_validator: social_event_validator.as_ref(),
+                                social_event_rate_limits: &mut social_event_rate_limits,
+                            },
                         );
                     }
                     _ = tick.tick() => {
@@ -362,22 +375,52 @@ pub fn workspace_discovery_key(workspace_id: &nexus_core::WorkspaceId) -> Vec<u8
 // Event handler
 // ---------------------------------------------------------------------------
 
-fn handle_swarm_event(
-    event: SwarmEvent<ToSwarm>,
-    event_tx: &broadcast::Sender<NetworkEvent>,
-    listen_addrs: &Arc<Mutex<Vec<Multiaddr>>>,
-    connected_peers: &Arc<Mutex<HashSet<PeerId>>>,
-    pending_out: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<SyncResponse, String>>>,
-    pending_in: &mut HashMap<InboundRequestId, ResponseChannel<SyncResponse>>,
-    swarm: &mut libp2p::Swarm<CompositeBehaviour>,
-) {
+struct SwarmEventContext<'a> {
+    event_tx: &'a broadcast::Sender<NetworkEvent>,
+    listen_addrs: &'a Arc<Mutex<Vec<Multiaddr>>>,
+    connected_peers: &'a Arc<Mutex<HashSet<PeerId>>>,
+    pending_out: &'a mut HashMap<OutboundRequestId, oneshot::Sender<Result<SyncResponse, String>>>,
+    pending_in: &'a mut HashMap<InboundRequestId, ResponseChannel<SyncResponse>>,
+    swarm: &'a mut libp2p::Swarm<CompositeBehaviour>,
+    social_event_validator: &'a (dyn Fn(&[u8]) -> gossipsub::MessageAcceptance + Send + Sync),
+    social_event_rate_limits: &'a mut HashMap<PeerId, SocialEventRateState>,
+}
+
+#[derive(Debug)]
+struct SocialEventRateState {
+    window_started_at: Instant,
+    accepted_in_window: usize,
+}
+
+impl SocialEventRateState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            accepted_in_window: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.window_started_at) >= SOCIAL_EVENT_RATE_WINDOW {
+            self.window_started_at = now;
+            self.accepted_in_window = 0;
+        }
+        if self.accepted_in_window >= SOCIAL_EVENT_RATE_LIMIT_PER_WINDOW {
+            return false;
+        }
+        self.accepted_in_window += 1;
+        true
+    }
+}
+
+fn handle_swarm_event(event: SwarmEvent<ToSwarm>, ctx: SwarmEventContext<'_>) {
     match event {
         SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::RoutingUpdated {
             peer,
             is_new_peer,
             ..
         })) => {
-            let _ = event_tx.send(NetworkEvent::RoutingUpdated {
+            let _ = ctx.event_tx.send(NetworkEvent::RoutingUpdated {
                 peer_id: peer,
                 is_new: is_new_peer,
             });
@@ -387,7 +430,7 @@ fn handle_swarm_event(
             ..
         })) => {
             for info in peers {
-                let _ = event_tx.send(NetworkEvent::PeerDiscovered {
+                let _ = ctx.event_tx.send(NetworkEvent::PeerDiscovered {
                     peer_id: info.peer_id,
                 });
             }
@@ -401,12 +444,14 @@ fn handle_swarm_event(
             providers.sort();
             providers.dedup();
             for peer in &providers {
-                if peer != swarm.local_peer_id() {
-                    let _ = swarm.dial(*peer);
+                if peer != ctx.swarm.local_peer_id() {
+                    let _ = ctx.swarm.dial(*peer);
                 }
-                let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id: *peer });
+                let _ = ctx
+                    .event_tx
+                    .send(NetworkEvent::PeerDiscovered { peer_id: *peer });
             }
-            let _ = event_tx.send(NetworkEvent::ProvidersFound {
+            let _ = ctx.event_tx.send(NetworkEvent::ProvidersFound {
                 key: key.to_vec(),
                 providers,
             });
@@ -440,13 +485,15 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(ToSwarm::Mdns(libp2p::mdns::Event::Discovered(peers))) => {
             for (peer, addr) in peers {
-                if peer == *swarm.local_peer_id() {
+                if peer == *ctx.swarm.local_peer_id() {
                     continue;
                 }
                 debug!("mDNS discovered {peer} at {addr}");
-                behaviour_add_address(swarm.behaviour_mut(), &peer, addr.clone());
-                let _ = swarm.dial(addr.with(Protocol::P2p(peer)));
-                let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id: peer });
+                behaviour_add_address(ctx.swarm.behaviour_mut(), &peer, addr.clone());
+                let _ = ctx.swarm.dial(addr.with(Protocol::P2p(peer)));
+                let _ = ctx
+                    .event_tx
+                    .send(NetworkEvent::PeerDiscovered { peer_id: peer });
             }
         }
         SwarmEvent::Behaviour(ToSwarm::Mdns(libp2p::mdns::Event::Expired(peers))) => {
@@ -460,24 +507,62 @@ fn handle_swarm_event(
             ..
         })) => {
             for addr in info.listen_addrs {
-                behaviour_add_address(swarm.behaviour_mut(), &peer_id, addr);
+                behaviour_add_address(ctx.swarm.behaviour_mut(), &peer_id, addr);
             }
-            let _ = event_tx.send(NetworkEvent::PeerDiscovered { peer_id });
+            let _ = ctx.event_tx.send(NetworkEvent::PeerDiscovered { peer_id });
         }
         SwarmEvent::Behaviour(ToSwarm::Gossipsub(gossipsub::Event::Message {
-            message, ..
+            propagation_source,
+            message_id,
+            message,
         })) => match message.topic.as_str() {
             ANNOUNCE_TOPIC => {
-                let _ = event_tx.send(NetworkEvent::WorkspaceAnnounce {
+                report_gossip_validation(
+                    ctx.swarm,
+                    &message_id,
+                    &propagation_source,
+                    gossipsub::MessageAcceptance::Accept,
+                );
+                let _ = ctx.event_tx.send(NetworkEvent::WorkspaceAnnounce {
                     source: message.source,
                     data: message.data,
                 });
             }
             SOCIAL_EVENT_TOPIC => {
-                let _ = event_tx.send(NetworkEvent::SocialEvent {
-                    source: message.source,
-                    data: message.data,
-                });
+                let rate_acceptance =
+                    social_event_rate_acceptance(ctx.social_event_rate_limits, propagation_source);
+                let validation_acceptance =
+                    if matches!(rate_acceptance, gossipsub::MessageAcceptance::Accept) {
+                        (ctx.social_event_validator)(&message.data)
+                    } else {
+                        rate_acceptance
+                    };
+
+                match validation_acceptance {
+                    gossipsub::MessageAcceptance::Accept => {
+                        report_gossip_validation(
+                            ctx.swarm,
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Accept,
+                        );
+                        let _ = ctx.event_tx.send(NetworkEvent::SocialEvent {
+                            source: message.source,
+                            data: message.data,
+                        });
+                    }
+                    acceptance => {
+                        debug!(
+                            "dropping social gossip message {message_id} from {propagation_source}: {acceptance:?}"
+                        );
+                        report_gossip_validation(
+                            ctx.swarm,
+                            &message_id,
+                            &propagation_source,
+                            acceptance,
+                        );
+                    }
+                }
             }
             _ => {}
         },
@@ -492,8 +577,8 @@ fn handle_swarm_event(
                 channel,
                 ..
             } => {
-                pending_in.insert(request_id, channel);
-                let _ = event_tx.send(NetworkEvent::SyncRequest {
+                ctx.pending_in.insert(request_id, channel);
+                let _ = ctx.event_tx.send(NetworkEvent::SyncRequest {
                     peer,
                     request_id,
                     request,
@@ -503,7 +588,7 @@ fn handle_swarm_event(
                 request_id,
                 response,
             } => {
-                if let Some(tx) = pending_out.remove(&request_id) {
+                if let Some(tx) = ctx.pending_out.remove(&request_id) {
                     let _ = tx.send(Ok(response));
                 }
             }
@@ -515,7 +600,7 @@ fn handle_swarm_event(
             ..
         })) => {
             debug!("sync outbound failure to {peer}: {error}");
-            if let Some(tx) = pending_out.remove(&request_id) {
+            if let Some(tx) = ctx.pending_out.remove(&request_id) {
                 let _ = tx.send(Err(error.to_string()));
             }
         }
@@ -526,7 +611,7 @@ fn handle_swarm_event(
             ..
         })) => {
             warn!("sync inbound failure from {peer}: {error}");
-            pending_in.remove(&request_id);
+            ctx.pending_in.remove(&request_id);
         }
         SwarmEvent::Behaviour(ToSwarm::Sync(request_response::Event::ResponseSent {
             peer,
@@ -537,16 +622,16 @@ fn handle_swarm_event(
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             info!("Listening on {address}");
-            if let Ok(mut addrs) = listen_addrs.lock() {
+            if let Ok(mut addrs) = ctx.listen_addrs.lock() {
                 if !addrs.contains(&address) {
                     addrs.push(address.clone());
                 }
             }
-            let _ = event_tx.send(NetworkEvent::Listening(address));
+            let _ = ctx.event_tx.send(NetworkEvent::Listening(address));
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
             info!("External address confirmed: {address}");
-            if let Ok(mut addrs) = listen_addrs.lock() {
+            if let Ok(mut addrs) = ctx.listen_addrs.lock() {
                 if !addrs.contains(&address) {
                     addrs.push(address);
                 }
@@ -554,10 +639,10 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             debug!("Connected to {peer_id}");
-            if let Ok(mut peers) = connected_peers.lock() {
+            if let Ok(mut peers) = ctx.connected_peers.lock() {
                 peers.insert(peer_id);
             }
-            let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
+            let _ = ctx.event_tx.send(NetworkEvent::PeerConnected(peer_id));
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
@@ -566,13 +651,43 @@ fn handle_swarm_event(
         } => {
             debug!("Disconnected from {peer_id}");
             if num_established == 0 {
-                if let Ok(mut peers) = connected_peers.lock() {
+                if let Ok(mut peers) = ctx.connected_peers.lock() {
                     peers.remove(&peer_id);
                 }
             }
-            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+            let _ = ctx.event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
         }
         _ => {}
+    }
+}
+
+fn social_event_rate_acceptance(
+    rate_limits: &mut HashMap<PeerId, SocialEventRateState>,
+    source: PeerId,
+) -> gossipsub::MessageAcceptance {
+    let now = Instant::now();
+    let state = rate_limits
+        .entry(source)
+        .or_insert_with(|| SocialEventRateState::new(now));
+    if state.allow(now) {
+        gossipsub::MessageAcceptance::Accept
+    } else {
+        gossipsub::MessageAcceptance::Reject
+    }
+}
+
+fn report_gossip_validation(
+    swarm: &mut libp2p::Swarm<CompositeBehaviour>,
+    message_id: &gossipsub::MessageId,
+    propagation_source: &PeerId,
+    acceptance: gossipsub::MessageAcceptance,
+) {
+    if let Err(err) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .report_message_validation_result(message_id, propagation_source, acceptance)
+    {
+        debug!("gossipsub validation result for {message_id} could not be reported: {err:?}");
     }
 }
 
@@ -598,4 +713,26 @@ fn behaviour_add_address(behaviour: &mut CompositeBehaviour, peer: &PeerId, addr
 
 fn discovery_key_label(key: &[u8]) -> String {
     String::from_utf8_lossy(key).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn social_event_rate_limit_rejects_after_window_budget() {
+        let peer = PeerId::random();
+        let mut rate_limits = HashMap::new();
+
+        for _ in 0..SOCIAL_EVENT_RATE_LIMIT_PER_WINDOW {
+            assert!(matches!(
+                social_event_rate_acceptance(&mut rate_limits, peer),
+                gossipsub::MessageAcceptance::Accept
+            ));
+        }
+        assert!(matches!(
+            social_event_rate_acceptance(&mut rate_limits, peer),
+            gossipsub::MessageAcceptance::Reject
+        ));
+    }
 }
