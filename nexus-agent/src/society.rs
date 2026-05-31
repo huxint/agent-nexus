@@ -117,6 +117,13 @@ fn decision_anchor_subject_matches(
             .is_some_and(|claim_id| locator.contains(&format!("claim:{claim_id}")))
 }
 
+fn anchor_subject_matches(anchor: &AuthorityAnchor, subject: &str) -> bool {
+    anchor
+        .locator
+        .as_deref()
+        .is_none_or(|locator| locator.contains(subject))
+}
+
 fn capability_grant_key(grant: &CapabilityGrant) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -153,6 +160,16 @@ fn workspace_ownership_claim_key(claim: &WorkspaceOwnershipClaim) -> String {
             .map(|root| hex::encode(root.as_bytes()))
             .unwrap_or_default()
     )
+}
+
+fn workspace_ownership_anchor_subject(claim: &WorkspaceOwnershipClaim) -> String {
+    match &claim.previous_owner {
+        Some(previous_owner) => format!(
+            "workspace:{}:owner:{}:from:{}",
+            claim.workspace, claim.owner, previous_owner
+        ),
+        None => format!("workspace:{}:owner:{}", claim.workspace, claim.owner),
+    }
 }
 
 fn workspace_run_key(run: &WorkspaceRun) -> String {
@@ -1245,15 +1262,27 @@ impl Society {
     }
 
     fn workspace_ownership_truth_status(&self, claim: &WorkspaceOwnershipClaim) -> FactTruthStatus {
-        if claim
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.validate().is_ok())
-        {
+        if self.workspace_ownership_anchor_valid(claim) {
             FactTruthStatus::Anchored
         } else {
             FactTruthStatus::Claimed
         }
+    }
+
+    fn workspace_ownership_anchor_valid(&self, claim: &WorkspaceOwnershipClaim) -> bool {
+        let Some(anchor) = claim.anchor.as_ref() else {
+            return false;
+        };
+        if anchor.validate().is_err() {
+            return false;
+        }
+        if !anchor_subject_matches(anchor, &workspace_ownership_anchor_subject(claim)) {
+            return false;
+        }
+        if anchor.kind != AuthorityKind::CollectiveQuorum {
+            return true;
+        }
+        self.collective_quorum_anchor_has_member_attestors(anchor)
     }
 
     pub fn workspace_members(&self, workspace: &WorkspaceId) -> Vec<&Did> {
@@ -2483,15 +2512,7 @@ impl Society {
         if anchor.kind != AuthorityKind::CollectiveQuorum {
             return true;
         }
-        let Some(collective) = self.collectives.get(&decision.collective_id) else {
-            return false;
-        };
-        let threshold = anchor.threshold.unwrap_or(0);
-        let unique_attestors = anchor.attestors.iter().collect::<HashSet<_>>();
-        unique_attestors.len() >= threshold
-            && unique_attestors
-                .iter()
-                .all(|attestor| collective.members.contains(*attestor))
+        self.collective_quorum_anchor_has_member_attestors_for(anchor, &decision.collective_id)
     }
 
     fn settlement_anchor_valid(&self, settlement: &SettlementRecord) -> bool {
@@ -2508,9 +2529,21 @@ impl Society {
         if anchor.kind != AuthorityKind::CollectiveQuorum {
             return true;
         }
+        self.collective_quorum_anchor_has_member_attestors(anchor)
+    }
+
+    fn collective_quorum_anchor_has_member_attestors(&self, anchor: &AuthorityAnchor) -> bool {
         let Some(collective_id) = anchor_collective_id(anchor) else {
             return false;
         };
+        self.collective_quorum_anchor_has_member_attestors_for(anchor, collective_id)
+    }
+
+    fn collective_quorum_anchor_has_member_attestors_for(
+        &self,
+        anchor: &AuthorityAnchor,
+        collective_id: &str,
+    ) -> bool {
         let Some(collective) = self.collectives.get(collective_id) else {
             return false;
         };
@@ -4662,6 +4695,89 @@ mod tests {
             },
         ));
         assert_eq!(society.workspace_claimed_owner(&ws), Some(next_owner));
+    }
+
+    #[test]
+    fn workspace_ownership_anchor_requires_matching_subject_and_member_quorum() {
+        let owner = did("owner");
+        let alice = did("alice");
+        let bob = did("bob");
+        let outsider = did("outsider");
+        let anchored_ws = WorkspaceId::from_bytes([12; 32]);
+        let wrong_subject_ws = WorkspaceId::from_bytes([13; 32]);
+        let outsider_ws = WorkspaceId::from_bytes([14; 32]);
+        let mut society = Society::new();
+        society.apply_event(&SocialEvent::new(
+            alice.clone(),
+            1,
+            SocialEventKind::CollectiveDeclared {
+                collective_id: "ownership-witnesses".into(),
+                name: "Ownership Witnesses".into(),
+                purpose: "witness workspace owner facts".into(),
+                members: vec![alice.clone(), bob.clone()],
+            },
+        ));
+
+        for (workspace, owner, subject, attestors) in [
+            (
+                anchored_ws,
+                owner.clone(),
+                format!("workspace:{anchored_ws}:owner:{owner}"),
+                vec![alice.clone(), bob.clone()],
+            ),
+            (
+                wrong_subject_ws,
+                did("wrong-subject-owner"),
+                format!("workspace:{wrong_subject_ws}:owner:{}", did("someone-else")),
+                vec![alice.clone(), bob.clone()],
+            ),
+            (
+                outsider_ws,
+                did("outsider-attested-owner"),
+                format!(
+                    "workspace:{outsider_ws}:owner:{}",
+                    did("outsider-attested-owner")
+                ),
+                vec![alice, outsider],
+            ),
+        ] {
+            let anchor = AuthorityAnchor {
+                kind: AuthorityKind::CollectiveQuorum,
+                commitment_hex: hash_hex(owner.to_string().len() as u8),
+                locator: Some(format!(
+                    "collective:ownership-witnesses/proposal:owner#{subject}"
+                )),
+                attestors,
+                threshold: Some(2),
+            };
+            society.apply_event(&SocialEvent::new(
+                owner.clone(),
+                2,
+                SocialEventKind::WorkspaceOwnershipClaimed {
+                    claim: WorkspaceOwnershipClaim {
+                        workspace,
+                        owner,
+                        previous_owner: None,
+                        root: None,
+                        anchor: Some(anchor),
+                        claimed_at: 2,
+                    },
+                },
+            ));
+        }
+
+        assert_eq!(
+            society.workspace_ownership_claims(&anchored_ws)[0].truth_status,
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(
+            society.workspace_ownership_claims(&wrong_subject_ws)[0].truth_status,
+            FactTruthStatus::Claimed
+        );
+        assert_eq!(
+            society.workspace_ownership_claims(&outsider_ws)[0].truth_status,
+            FactTruthStatus::Claimed
+        );
     }
 
     fn provider_manifest(did: Did, name: &str, capability: &str, price: u64) -> AgentManifest {
