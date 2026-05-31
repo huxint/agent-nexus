@@ -362,7 +362,7 @@ pub(crate) fn society_json_for_base(
                 "settlements": society
                     .task_settlements(&task.id)
                     .into_iter()
-                    .map(settlement_json)
+                    .map(|settlement| settlement_json(society, settlement))
                     .collect::<Vec<_>>(),
             })
         })
@@ -415,7 +415,7 @@ pub(crate) fn society_json_for_base(
         .settlements()
         .into_iter()
         .filter(|settlement| settlement_matches_filters(settlement, &options))
-        .map(settlement_json)
+        .map(|settlement| settlement_json(society, settlement))
         .collect::<Vec<_>>();
     let discovered_workspaces =
         if options.task_filter.is_some() && options.workspace_filter.is_none() {
@@ -1168,7 +1168,10 @@ fn task_result_json(result: &TaskResult) -> serde_json::Value {
     })
 }
 
-fn settlement_json(settlement: &SettlementRecord) -> serde_json::Value {
+fn settlement_json(
+    society: &nexus_agent::Society,
+    settlement: &SettlementRecord,
+) -> serde_json::Value {
     serde_json::json!({
         "id": settlement.id,
         "task_id": settlement.task_id,
@@ -1176,8 +1179,9 @@ fn settlement_json(settlement: &SettlementRecord) -> serde_json::Value {
         "payer": settlement.payer.to_string(),
         "payee": settlement.payee.to_string(),
         "amount": settlement.amount,
-        "truth_status": settlement.truth_status(),
+        "truth_status": society.settlement_truth_status(settlement),
         "anchor": settlement.authority_anchor(),
+        "checkpoint_subject": settlement.checkpoint_subject(),
         "proof": settlement.proof,
         "settled_at": settlement.settled_at,
     })
