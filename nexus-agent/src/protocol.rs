@@ -117,6 +117,9 @@ pub enum SocialProtocolError {
     #[error("social event JSON is {actual} bytes, exceeding max {max}")]
     EventTooLarge { actual: usize, max: usize },
 
+    #[error("invalid compacted social log: {reason}")]
+    InvalidCompactedLog { reason: String },
+
     #[error("equivocation proof authors differ: {left} != {right}")]
     EquivocationAuthorMismatch { left: Did, right: Did },
 

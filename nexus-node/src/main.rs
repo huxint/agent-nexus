@@ -112,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "bootstrap" => cmd_bootstrap(&args)?,
         "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
+        "social-memory" | "memory" => cmd_social_memory(&args)?,
         "act" => cmd_act(&args)?,
         "event" => cmd_event(&args)?,
         "demo" => cmd_demo().await?,
@@ -135,6 +136,7 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
+    eprintln!("  {prog} social-memory compact --base <DIR> --retain-events <N>");
     eprintln!("  {prog} act --base <DIR> --intent <ID> --kind <respond-intent|offer-task|join-workspace|propose-collective> [--body <TEXT>] [--price <N>] [--eta <SECS>] [--collective <ID>] [--proposal <ID>] [--deadline <TS>]");
     eprintln!("  {prog} event manifest --base <DIR> [--name <NAME>] [--description <TEXT>] [--provide <NAME>] [--goal <TEXT>] [--value <TEXT>] [--preference <TEXT>] [--role <TEXT>]");
     eprintln!("  {prog} event intent --base <DIR> --kind <goal|need|offer|proposal|status> --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>]");
@@ -1450,6 +1452,62 @@ fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         print_society_json(&base, &memory, options)?;
     } else {
         print_society_text(&base, &memory);
+    }
+    Ok(())
+}
+
+fn cmd_social_memory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() < 3 {
+        return Err("social-memory subcommand required: compact".into());
+    }
+    match args[2].as_str() {
+        "compact" => cmd_social_memory_compact(args),
+        other => Err(format!("unknown social-memory subcommand: {other}").into()),
+    }
+}
+
+fn cmd_social_memory_compact(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut retain_events = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--retain-events" => {
+                i += 1;
+                retain_events = Some(parse_usize_arg(
+                    required_arg(args, i, "--retain-events")?,
+                    "--retain-events",
+                )?);
+            }
+            other => return Err(format!("unknown social-memory compact option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let retain_events = retain_events.ok_or("--retain-events required")?;
+    let memory_path = base.join(".nexus-social-memory.json");
+    let mut memory = load_social_memory(&memory_path)?;
+    let before_total = memory.event_count();
+    let before_retained = memory.retained_event_count();
+    let compacted = memory.compact_retaining_recent(retain_events)?;
+    if compacted {
+        save_social_memory(&memory_path, &memory)?;
+    }
+
+    println!(
+        "Social memory compacted: changed={} total_events={} retained_events={} compacted_events={} previous_retained_events={}",
+        compacted,
+        memory.event_count(),
+        memory.retained_event_count(),
+        memory.compacted_event_count(),
+        before_retained
+    );
+    if before_total != memory.event_count() {
+        return Err("social memory compaction changed logical event count".into());
     }
     Ok(())
 }
@@ -7002,6 +7060,39 @@ mod tests {
         let loaded = load_social_memory(&memory_path).unwrap();
         assert_eq!(loaded.event_count(), 1);
         assert!(loaded.society().has_agent(identity.did()));
+    }
+
+    #[test]
+    fn social_memory_compact_command_retains_tail_and_society_view() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let memory_path = temp.path().join(".nexus-social-memory.json");
+        let mut memory = SocialMemory::new();
+        let events = signed_workspace_events(&identity, &[81, 82, 83, 84], 1);
+        assert_eq!(memory.ingest_events(events).unwrap(), 4);
+        save_social_memory(&memory_path, &memory).unwrap();
+
+        cmd_social_memory(&[
+            "nexus-node".into(),
+            "social-memory".into(),
+            "compact".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--retain-events".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        let compacted = load_social_memory(&memory_path).unwrap();
+        assert_eq!(compacted.event_count(), 4);
+        assert_eq!(compacted.retained_event_count(), 1);
+        assert_eq!(compacted.compacted_event_count(), 3);
+        assert!(compacted.society().has_agent(identity.did()));
+        let raw =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&memory_path).unwrap())
+                .unwrap();
+        assert_eq!(raw["log"]["events"].as_array().unwrap().len(), 1);
+        assert!(raw["log"]["compacted_base"].is_object());
     }
 
     #[test]
