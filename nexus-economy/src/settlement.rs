@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const HASH_HEX_LEN: usize = 64;
 const MUTUAL_CREDIT_SIGNATURE_DOMAIN: &str = "nexus:mutual-credit-settlement:v1";
+const TEE_ATTESTATION_DOMAIN: &str = "nexus:tee-attestation:v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityKind {
@@ -77,6 +78,15 @@ pub struct LightningSettlement {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeeAttestation {
+    pub measurement_hex: String,
+    pub report_data_hex: String,
+    pub quote_locator: String,
+    pub verifier: Did,
+    pub verified_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchoredCheckpoint {
     pub checkpoint: StateCheckpoint,
     pub anchor: AuthorityAnchor,
@@ -89,6 +99,7 @@ pub enum SettlementProof {
     MutualCredit(MutualCreditSettlement),
     ExternalPayment(ExternalPaymentSettlement),
     Lightning(LightningSettlement),
+    TeeAttestation(TeeAttestation),
     AnchoredCheckpoint(AnchoredCheckpoint),
 }
 
@@ -108,6 +119,9 @@ pub enum SettlementError {
 
     #[error("lightning preimage does not match payment hash")]
     LightningPreimageMismatch,
+
+    #[error("TEE attestation commitment mismatch")]
+    TeeAttestationCommitmentMismatch,
 
     #[error("anchor commitment does not match checkpoint")]
     AnchorCommitmentMismatch,
@@ -168,6 +182,19 @@ impl AuthorityAnchor {
             AuthorityKind::Bitcoin | AuthorityKind::ExternalChain => {
                 require_non_empty("locator", self.locator.as_deref().unwrap_or_default())?;
             }
+            AuthorityKind::TeeAttestation => {
+                require_non_empty("locator", self.locator.as_deref().unwrap_or_default())?;
+                let threshold = self.threshold.unwrap_or(0);
+                if threshold == 0 {
+                    return Err(SettlementError::MissingField { field: "threshold" });
+                }
+                if self.attestors.len() < threshold {
+                    return Err(SettlementError::InsufficientQuorum {
+                        attestors: self.attestors.len(),
+                        threshold,
+                    });
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -181,6 +208,7 @@ impl SettlementProof {
             Self::MutualCredit(proof) => proof.validate(),
             Self::ExternalPayment(proof) => proof.validate(),
             Self::Lightning(proof) => proof.validate(),
+            Self::TeeAttestation(proof) => proof.validate(),
             Self::AnchoredCheckpoint(proof) => proof.validate(),
         }
     }
@@ -291,6 +319,69 @@ impl LightningSettlement {
         let expected = hex::encode(Sha256::digest(preimage));
         if expected != self.payment_hash_hex.to_ascii_lowercase() {
             return Err(SettlementError::LightningPreimageMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl TeeAttestation {
+    pub fn validate(&self) -> Result<(), SettlementError> {
+        validate_hash_hex("measurement_hex", &self.measurement_hex)?;
+        validate_hash_hex("report_data_hex", &self.report_data_hex)?;
+        require_non_empty("quote_locator", &self.quote_locator)?;
+        Ok(())
+    }
+
+    pub fn commitment_hex(&self) -> Result<String, SettlementError> {
+        self.validate()?;
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            domain: &'static str,
+            measurement_hex: &'a str,
+            report_data_hex: &'a str,
+            quote_locator: &'a str,
+            verifier: &'a Did,
+            verified_at: u64,
+        }
+
+        let payload = serde_json::to_vec(&Payload {
+            domain: TEE_ATTESTATION_DOMAIN,
+            measurement_hex: &self.measurement_hex.to_ascii_lowercase(),
+            report_data_hex: &self.report_data_hex.to_ascii_lowercase(),
+            quote_locator: &self.quote_locator,
+            verifier: &self.verifier,
+            verified_at: self.verified_at,
+        })
+        .map_err(|err| SettlementError::Serialization(err.to_string()))?;
+        Ok(hex::encode(Sha256::digest(payload)))
+    }
+
+    pub fn authority_anchor(&self) -> Result<AuthorityAnchor, SettlementError> {
+        Ok(AuthorityAnchor {
+            kind: AuthorityKind::TeeAttestation,
+            commitment_hex: self.commitment_hex()?,
+            locator: Some(self.quote_locator.clone()),
+            attestors: vec![self.verifier.clone()],
+            threshold: Some(1),
+        })
+    }
+
+    pub fn verify_anchor(&self, anchor: &AuthorityAnchor) -> Result<(), SettlementError> {
+        self.validate()?;
+        anchor.validate()?;
+        if anchor.kind != AuthorityKind::TeeAttestation {
+            return Err(SettlementError::MissingField {
+                field: "tee_attestation_anchor",
+            });
+        }
+        if anchor.commitment_hex.to_ascii_lowercase() != self.commitment_hex()? {
+            return Err(SettlementError::TeeAttestationCommitmentMismatch);
+        }
+        if anchor.locator.as_deref() != Some(self.quote_locator.as_str()) {
+            return Err(SettlementError::TeeAttestationCommitmentMismatch);
+        }
+        if !anchor.attestors.contains(&self.verifier) {
+            return Err(SettlementError::TeeAttestationCommitmentMismatch);
         }
         Ok(())
     }
@@ -434,6 +525,28 @@ mod tests {
                 attestors: 1,
                 threshold: 2,
             }
+        );
+    }
+
+    #[test]
+    fn tee_attestation_commits_to_quote_payload() {
+        let attestation = TeeAttestation {
+            measurement_hex: hash_hex(10),
+            report_data_hex: hash_hex(11),
+            quote_locator: "tee://quote/123".into(),
+            verifier: Did::new("did:key:verifier"),
+            verified_at: 42,
+        };
+        let anchor = attestation.authority_anchor().unwrap();
+
+        assert_eq!(anchor.kind, AuthorityKind::TeeAttestation);
+        attestation.verify_anchor(&anchor).unwrap();
+
+        let mut wrong = anchor;
+        wrong.commitment_hex = hash_hex(12);
+        assert_eq!(
+            attestation.verify_anchor(&wrong).unwrap_err(),
+            SettlementError::TeeAttestationCommitmentMismatch
         );
     }
 

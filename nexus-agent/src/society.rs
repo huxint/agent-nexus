@@ -518,13 +518,17 @@ impl SettlementRecord {
             SettlementProof::AnchoredCheckpoint(proof) if proof.validate().is_ok() => {
                 FactTruthStatus::Anchored
             }
+            SettlementProof::TeeAttestation(proof) if proof.validate().is_ok() => {
+                FactTruthStatus::Anchored
+            }
             _ => FactTruthStatus::Claimed,
         }
     }
 
-    pub fn authority_anchor(&self) -> Option<&AuthorityAnchor> {
+    pub fn authority_anchor(&self) -> Option<AuthorityAnchor> {
         match &self.proof {
-            SettlementProof::AnchoredCheckpoint(proof) => Some(&proof.anchor),
+            SettlementProof::AnchoredCheckpoint(proof) => Some(proof.anchor.clone()),
+            SettlementProof::TeeAttestation(proof) => proof.authority_anchor().ok(),
             _ => None,
         }
     }
@@ -2542,20 +2546,23 @@ impl Society {
     }
 
     fn settlement_anchor_valid(&self, settlement: &SettlementRecord) -> bool {
-        let SettlementProof::AnchoredCheckpoint(proof) = &settlement.proof else {
-            return false;
-        };
-        if proof.validate().is_err() {
-            return false;
+        match &settlement.proof {
+            SettlementProof::AnchoredCheckpoint(proof) => {
+                if proof.validate().is_err() {
+                    return false;
+                }
+                if !checkpoint_subject_matches_settlement(&proof.checkpoint.subject, settlement) {
+                    return false;
+                }
+                let anchor = &proof.anchor;
+                if anchor.kind != AuthorityKind::CollectiveQuorum {
+                    return true;
+                }
+                self.collective_quorum_anchor_has_member_attestors(anchor)
+            }
+            SettlementProof::TeeAttestation(proof) => proof.validate().is_ok(),
+            _ => false,
         }
-        if !checkpoint_subject_matches_settlement(&proof.checkpoint.subject, settlement) {
-            return false;
-        }
-        let anchor = &proof.anchor;
-        if anchor.kind != AuthorityKind::CollectiveQuorum {
-            return true;
-        }
-        self.collective_quorum_anchor_has_member_attestors(anchor)
     }
 
     fn collective_quorum_anchor_has_member_attestors(&self, anchor: &AuthorityAnchor) -> bool {
@@ -3523,7 +3530,7 @@ mod tests {
     use nexus_crypto::NodeIdentity;
     use nexus_economy::{
         AnchoredCheckpoint, AuthorityAnchor, AuthorityKind, LightningSettlement,
-        MutualCreditSettlement, SettlementProof, StateCheckpoint,
+        MutualCreditSettlement, SettlementProof, StateCheckpoint, TeeAttestation,
     };
     use nexus_runtime::{ProcessOutput, ResourceUsage};
     use sha2::{Digest, Sha256};
@@ -3712,6 +3719,44 @@ mod tests {
             FactTruthStatus::Anchored
         );
         assert!(stored.authority_anchor().is_some());
+    }
+
+    #[test]
+    fn tee_attested_settlement_is_anchored_truth() {
+        let payer = did("payer");
+        let payee = did("payee");
+        let verifier = did("tee-verifier");
+        let attestation = TeeAttestation {
+            measurement_hex: hash_hex(20),
+            report_data_hex: hash_hex(21),
+            quote_locator: "tee://quote/task-1".into(),
+            verifier: verifier.clone(),
+            verified_at: 12,
+        };
+        let settlement = SettlementRecord {
+            id: "settlement-tee".into(),
+            task_id: Some("task-1".into()),
+            claim_id: Some("claim-tee".into()),
+            payer: payer.clone(),
+            payee,
+            amount: 12,
+            proof: SettlementProof::TeeAttestation(attestation),
+            settled_at: 12,
+        };
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            payer,
+            12,
+            SocialEventKind::SettlementRecorded { settlement },
+        ));
+
+        let stored = society.settlement("settlement-tee").unwrap();
+        assert_eq!(
+            society.settlement_truth_status(stored),
+            FactTruthStatus::Anchored
+        );
+        assert_eq!(stored.authority_anchor().unwrap().attestors, vec![verifier]);
     }
 
     #[test]

@@ -21,5 +21,6 @@ pub use reputation::ReputationScore;
 pub use settlement::{
     AnchoredCheckpoint, AuthorityAnchor, AuthorityKind, ExternalPaymentSettlement,
     LightningSettlement, MutualCreditSettlement, SettlementError, SettlementProof, StateCheckpoint,
+    TeeAttestation,
 };
 pub use trust::{find_payment_paths, PaymentPath, TrustGraph};
