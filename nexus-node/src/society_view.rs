@@ -919,11 +919,24 @@ fn capability_grant_json(
             "admin": grant.capability.permissions.admin,
         },
         "expires_at": grant.capability.expires_at,
+        "delegation_depth": grant.capability.delegation_depth,
+        "delegation_chain_length": capability_delegation_chain_length(&grant.capability),
+        "delegated": grant.capability.parent.is_some(),
         "issued_at": grant.issued_at,
         "revoked": revocation.is_some(),
         "revocation": revocation.map(capability_revocation_json),
         "note": grant.note,
     })
+}
+
+fn capability_delegation_chain_length(capability: &nexus_core::Capability) -> usize {
+    let mut length = 0;
+    let mut cursor = capability.parent.as_deref();
+    while let Some(parent) = cursor {
+        length += 1;
+        cursor = parent.parent.as_deref();
+    }
+    length
 }
 
 fn capability_revocation_json(revocation: &CapabilityRevocation) -> serde_json::Value {

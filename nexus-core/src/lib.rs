@@ -177,6 +177,13 @@ pub struct Capability {
     pub permissions: PermissionSet,
     /// Unix timestamp (seconds) after which this capability is invalid.
     pub expires_at: u64,
+    /// Optional parent token proving that the issuer was allowed to delegate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<Capability>>,
+    /// Remaining delegation depth after this token. `None` means no further
+    /// delegation is allowed; `Some(0)` is the same for child tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<u8>,
     /// Ed25519 signature over the canonical serialisation of the fields above.
     pub signature: Vec<u8>,
 }

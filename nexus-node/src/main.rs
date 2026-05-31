@@ -6654,6 +6654,12 @@ mod tests {
             view["capability_grants"][0]["note"],
             "join shared workspace"
         );
+        assert_eq!(view["capability_grants"][0]["delegated"], false);
+        assert_eq!(
+            view["capability_grants"][0]["delegation_depth"],
+            serde_json::Value::Null
+        );
+        assert_eq!(view["capability_grants"][0]["delegation_chain_length"], 0);
         assert_eq!(view["capability_grants"][0]["revoked"], false);
         let capability_signature_id = view["capability_grants"][0]["capability_signature_id"]
             .as_str()
