@@ -1,6 +1,6 @@
 //! Network — high-level wrapper around a libp2p [`Swarm`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,6 +92,7 @@ pub struct Network {
     sync_request_tx: SyncRequestSender,
     event_rx: broadcast::Receiver<NetworkEvent>,
     listen_addrs: Arc<Mutex<Vec<Multiaddr>>>,
+    connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 impl Clone for Network {
@@ -103,6 +104,7 @@ impl Clone for Network {
             sync_request_tx: self.sync_request_tx.clone(),
             event_rx: self.event_tx.subscribe(),
             listen_addrs: Arc::clone(&self.listen_addrs),
+            connected_peers: Arc::clone(&self.connected_peers),
         }
     }
 }
@@ -183,6 +185,7 @@ impl Network {
         let (event_tx, event_rx) = broadcast::channel(256);
         let (sync_request_tx, mut sync_request_rx) = mpsc::unbounded_channel();
         let listen_addrs = Arc::new(Mutex::new(Vec::new()));
+        let connected_peers = Arc::new(Mutex::new(HashSet::new()));
 
         let mut pending_outbound: HashMap<OutboundRequestId, SyncReplySender> = HashMap::new();
         let mut pending_inbound: HashMap<InboundRequestId, ResponseChannel<SyncResponse>> =
@@ -190,6 +193,7 @@ impl Network {
 
         let event_tx_clone = event_tx.clone();
         let listen_addrs_clone = Arc::clone(&listen_addrs);
+        let connected_peers_clone = Arc::clone(&connected_peers);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(config.bootstrap_interval);
             loop {
@@ -244,7 +248,15 @@ impl Network {
                         pending_outbound.insert(rid, reply_tx);
                     }
                     Some(event) = swarm.next() => {
-                        handle_swarm_event(event, &event_tx_clone, &listen_addrs_clone, &mut pending_outbound, &mut pending_inbound, &mut swarm);
+                        handle_swarm_event(
+                            event,
+                            &event_tx_clone,
+                            &listen_addrs_clone,
+                            &connected_peers_clone,
+                            &mut pending_outbound,
+                            &mut pending_inbound,
+                            &mut swarm,
+                        );
                     }
                     _ = tick.tick() => {
                         if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -263,6 +275,7 @@ impl Network {
             sync_request_tx,
             event_rx,
             listen_addrs,
+            connected_peers,
         })
     }
 
@@ -290,6 +303,12 @@ impl Network {
             .lock()
             .map(|addrs| addrs.clone())
             .unwrap_or_default()
+    }
+    pub fn is_connected(&self, peer: PeerId) -> bool {
+        self.connected_peers
+            .lock()
+            .map(|peers| peers.contains(&peer))
+            .unwrap_or(false)
     }
     pub async fn publish_announce(&self, d: Vec<u8>) -> NexusResult<()> {
         self.publish_gossip(GossipTopic::WorkspaceAnnounce, d).await
@@ -345,6 +364,7 @@ fn handle_swarm_event(
     event: SwarmEvent<ToSwarm>,
     event_tx: &broadcast::Sender<NetworkEvent>,
     listen_addrs: &Arc<Mutex<Vec<Multiaddr>>>,
+    connected_peers: &Arc<Mutex<HashSet<PeerId>>>,
     pending_out: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<SyncResponse, String>>>,
     pending_in: &mut HashMap<InboundRequestId, ResponseChannel<SyncResponse>>,
     swarm: &mut libp2p::Swarm<CompositeBehaviour>,
@@ -532,10 +552,22 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             debug!("Connected to {peer_id}");
+            if let Ok(mut peers) = connected_peers.lock() {
+                peers.insert(peer_id);
+            }
             let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established,
+            ..
+        } => {
             debug!("Disconnected from {peer_id}");
+            if num_established == 0 {
+                if let Ok(mut peers) = connected_peers.lock() {
+                    peers.remove(&peer_id);
+                }
+            }
             let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
         }
         _ => {}

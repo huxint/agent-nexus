@@ -407,12 +407,13 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         if let Some(discovered) = discover_clone_source(&base, &workspace_id, None)? {
-            peer = Some(discovered.peer);
+            let discovered_peer = discovered.peer;
+            peer = Some(discovered_peer);
             if bootstrap.is_empty() {
                 bootstrap = discovered.addrs.clone();
             }
             discovered_source = Some(discovered);
-            peer_ready = true;
+            peer_ready = online_network.is_connected(discovered_peer);
         }
         network = Some(online_network);
     }
@@ -439,7 +440,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !peer_ready {
-        wait_for_peer(&network, peer, Duration::from_secs(15)).await?;
+        wait_for_peer_connected(&network, peer, Duration::from_secs(15)).await?;
     }
     let memory_path = base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
@@ -1111,9 +1112,7 @@ fn verify_workspace_announcement(
     if let Some(root) = &announcement.root {
         parse_cid(root)?;
     }
-    for addr in &announcement.addrs {
-        addr.parse::<libp2p::Multiaddr>()?;
-    }
+    normalized_announcement_bootstrap_addrs(announcement)?;
     let signature = announcement
         .signature
         .as_deref()
@@ -1121,6 +1120,53 @@ fn verify_workspace_announcement(
     let payload = workspace_announcement_signing_payload(announcement)?;
     verify_did_signature(&announcement.author, &payload, signature)?;
     Ok(())
+}
+
+fn announcement_peer_id(
+    announcement: &WorkspaceAnnouncement,
+) -> Result<libp2p::PeerId, Box<dyn std::error::Error>> {
+    announcement
+        .peer
+        .parse()
+        .map_err(|err| format!("invalid announcement peer {}: {err}", announcement.peer).into())
+}
+
+fn multiaddr_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
+    addr.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
+}
+
+fn normalized_announcement_bootstrap_addrs(
+    announcement: &WorkspaceAnnouncement,
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let peer = announcement_peer_id(announcement)?;
+    normalized_peer_bootstrap_addrs(peer, &announcement.addrs)
+}
+
+fn normalized_peer_bootstrap_addrs(
+    peer: libp2p::PeerId,
+    raw_addrs: &[String],
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let mut normalized = Vec::new();
+    for addr in raw_addrs {
+        let addr = addr.parse::<libp2p::Multiaddr>()?;
+        match multiaddr_peer_id(&addr) {
+            Some(addr_peer) if addr_peer != peer => {
+                return Err(format!(
+                    "announcement addr peer {addr_peer} does not match peer {peer}"
+                )
+                .into());
+            }
+            Some(_) => push_unique_bootstrap_addr(&mut normalized, addr),
+            None => push_unique_bootstrap_addr(
+                &mut normalized,
+                addr.with(libp2p::multiaddr::Protocol::P2p(peer)),
+            ),
+        }
+    }
+    Ok(normalized)
 }
 
 fn discovered_workspace_views(
@@ -1179,19 +1225,25 @@ fn discovered_workspace_views(
         let latest = authoritative_announcements
             .first()
             .expect("grouped discovery entries cannot be empty");
+        let verified = !verified_announcements.is_empty();
         let mut peers = authoritative_announcements
             .iter()
             .map(|announcement| announcement.peer.clone())
             .collect::<Vec<_>>();
         peers.sort();
         peers.dedup();
-        let mut addrs = authoritative_announcements
-            .iter()
-            .flat_map(|announcement| announcement.addrs.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut addrs = Vec::new();
+        for announcement in authoritative_announcements {
+            if verified {
+                if let Ok(normalized) = normalized_announcement_bootstrap_addrs(announcement) {
+                    addrs.extend(normalized.into_iter().map(|addr| addr.to_string()));
+                }
+            } else {
+                addrs.extend(announcement.addrs.iter().cloned());
+            }
+        }
         addrs.sort();
         addrs.dedup();
-        let verified = !verified_announcements.is_empty();
         let clone_ready = verified && !addrs.is_empty();
         if filter.verified_only && !verified {
             continue;
@@ -1312,10 +1364,7 @@ fn discover_clone_source(
             continue;
         }
         let peer = announcement.peer.parse::<libp2p::PeerId>()?;
-        let mut addrs = Vec::new();
-        for addr in &announcement.addrs {
-            addrs.push(addr.parse::<libp2p::Multiaddr>()?);
-        }
+        let addrs = normalized_announcement_bootstrap_addrs(&announcement)?;
         let root = announcement.root.as_deref().map(parse_cid).transpose()?;
         return Ok(Some(DiscoveredCloneSource {
             peer,
@@ -1328,6 +1377,7 @@ fn discover_clone_source(
     Ok(None)
 }
 
+#[cfg(test)]
 async fn wait_for_peer(
     network: &Network,
     peer: libp2p::PeerId,
@@ -1348,6 +1398,35 @@ async fn wait_for_peer(
     })
     .await
     .map_err(|_| format!("timed out waiting for peer {peer}"))??;
+    Ok(())
+}
+
+async fn wait_for_peer_connected(
+    network: &Network,
+    peer: libp2p::PeerId,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if network.is_connected(peer) {
+        return Ok(());
+    }
+
+    let mut events = network.clone();
+    network.dial_peer(peer);
+    tokio::time::timeout(timeout, async {
+        loop {
+            if network.is_connected(peer) {
+                break;
+            }
+            match events.next_event().await {
+                Some(NetworkEvent::PeerConnected(connected)) if connected == peer => break,
+                Some(_) => {}
+                None => return Err("network event stream ended"),
+            }
+        }
+        Ok::<(), &'static str>(())
+    })
+    .await
+    .map_err(|_| format!("timed out waiting for connection to peer {peer}"))??;
     Ok(())
 }
 
@@ -5169,14 +5248,30 @@ fn cached_workspace_bootstrap_peers(base: &Path) -> Vec<libp2p::Multiaddr> {
         if verify_workspace_announcement(&announcement).is_err() {
             continue;
         }
-        for addr in announcement.addrs {
-            match addr.parse::<libp2p::Multiaddr>() {
-                Ok(addr) => push_unique_bootstrap_addr(&mut addrs, addr),
-                Err(err) => tracing::warn!("ignored cached bootstrap address {addr}: {err}"),
+        match normalized_announcement_bootstrap_addrs(&announcement) {
+            Ok(announcement_addrs) => {
+                for addr in announcement_addrs {
+                    push_unique_bootstrap_addr(&mut addrs, addr);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "ignored cached bootstrap addresses for {}: {err}",
+                    announcement.peer
+                );
             }
         }
     }
     addrs
+}
+
+fn announcement_bootstrap_addr_strings(
+    announcement: &WorkspaceAnnouncement,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(normalized_announcement_bootstrap_addrs(announcement)?
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect())
 }
 
 fn peer_cache_path(base: &Path) -> PathBuf {
@@ -5199,9 +5294,33 @@ fn load_peer_cache(base: &Path) -> Result<Vec<PeerCacheEntry>, Box<dyn std::erro
 
     let mut peers = Vec::new();
     for entry in entries {
-        let mut peer = serde_json::from_value::<PeerCacheEntry>(entry)?;
-        peer.addrs.sort();
-        peer.addrs.dedup();
+        let mut peer = match serde_json::from_value::<PeerCacheEntry>(entry) {
+            Ok(peer) => peer,
+            Err(err) => {
+                tracing::warn!(
+                    "ignored invalid peer cache entry in {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let peer_id = match peer.peer.parse::<libp2p::PeerId>() {
+            Ok(peer_id) => peer_id,
+            Err(err) => {
+                tracing::warn!(
+                    "ignored peer cache entry with invalid peer id {}: {err}",
+                    peer.peer
+                );
+                continue;
+            }
+        };
+        peer.addrs = match normalized_peer_bootstrap_addrs(peer_id, &peer.addrs) {
+            Ok(addrs) => addrs.into_iter().map(|addr| addr.to_string()).collect(),
+            Err(err) => {
+                tracing::warn!("ignored peer cache entry for {}: {err}", peer.peer);
+                continue;
+            }
+        };
         peers.push(peer);
     }
     peers.sort_by(|a, b| a.peer.cmp(&b.peer));
@@ -5227,14 +5346,8 @@ fn cache_peer_from_announcement(
     announcement: &WorkspaceAnnouncement,
     now: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    upsert_peer_cache(
-        base,
-        &announcement.peer,
-        &announcement.addrs,
-        now,
-        None,
-        None,
-    )
+    let addrs = announcement_bootstrap_addr_strings(announcement)?;
+    upsert_peer_cache(base, &announcement.peer, &addrs, now, None, None)
 }
 
 fn mark_peer_cache_connected(
@@ -5261,6 +5374,13 @@ fn upsert_peer_cache(
     connected_at: Option<u64>,
     failed: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let peer_id = peer
+        .parse::<libp2p::PeerId>()
+        .map_err(|err| format!("invalid peer cache id {peer}: {err}"))?;
+    let normalized_addrs = normalized_peer_bootstrap_addrs(peer_id, addrs)?
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>();
     let mut entries = load_peer_cache(base)?;
     if let Some(existing) = entries.iter_mut().find(|entry| entry.peer == peer) {
         existing.last_seen = existing.last_seen.max(now);
@@ -5273,7 +5393,7 @@ fn upsert_peer_cache(
             existing.failures = existing.failures.saturating_add(1);
             existing.last_failure = Some(now);
         }
-        for addr in addrs {
+        for addr in &normalized_addrs {
             if !existing.addrs.contains(addr) {
                 existing.addrs.push(addr.clone());
             }
@@ -5281,7 +5401,7 @@ fn upsert_peer_cache(
         existing.addrs.sort();
         existing.addrs.dedup();
     } else {
-        let mut addrs = addrs.to_vec();
+        let mut addrs = normalized_addrs;
         addrs.sort();
         addrs.dedup();
         entries.push(PeerCacheEntry {
@@ -6383,7 +6503,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (config_addr, config_peer) = test_bootstrap_addr(4011);
         let (cache_addr, cache_peer) = test_bootstrap_addr(4012);
-        let (peer_cache_addr, peer_cache_peer) = test_bootstrap_addr(4013);
+        let (_peer_cache_addr, peer_cache_peer) = test_bootstrap_addr(4013);
 
         std::fs::write(
             bootstrap_config_path(temp.path()),
@@ -6398,7 +6518,7 @@ mod tests {
         let identity = NodeIdentity::generate();
         let announcement = WorkspaceAnnouncement {
             version: WORKSPACE_ANNOUNCEMENT_VERSION,
-            peer: "cached-peer".into(),
+            peer: multiaddr_peer_id(&cache_peer).unwrap().to_string(),
             addrs: vec![cache_addr],
             author: identity.did().clone(),
             workspace: WorkspaceId::from_bytes([90; 32]).to_string(),
@@ -6418,8 +6538,8 @@ mod tests {
 
         upsert_peer_cache(
             temp.path(),
-            "peer-cache-source",
-            &[peer_cache_addr],
+            &multiaddr_peer_id(&peer_cache_peer).unwrap().to_string(),
+            &["/ip4/127.0.0.1/udp/4013/quic-v1".into()],
             2,
             Some(3),
             None,
@@ -6432,6 +6552,7 @@ mod tests {
 
         let entries = load_peer_cache(temp.path()).unwrap();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].addrs, vec![peer_cache_peer.to_string()]);
         assert_eq!(entries[0].last_connected, Some(3));
         assert_eq!(entries[0].failures, 0);
 
@@ -6442,6 +6563,50 @@ mod tests {
                 .effective_peers
                 .contains(&peer_cache_peer.to_string()));
         }
+    }
+
+    #[test]
+    fn peer_cache_load_normalizes_addresses_and_ignores_invalid_rows() {
+        let temp = TempDir::new().unwrap();
+        let peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let other_peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let raw_addr = "/ip4/127.0.0.1/udp/4021/quic-v1";
+        let normalized_addr = format!("{raw_addr}/p2p/{peer}");
+
+        std::fs::write(
+            peer_cache_path(temp.path()),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "peers": [
+                    {
+                        "peer": "not-a-peer",
+                        "addrs": [raw_addr],
+                        "last_seen": 1
+                    },
+                    {
+                        "peer": peer.to_string(),
+                        "addrs": [raw_addr],
+                        "last_seen": 2,
+                        "failures": 1
+                    },
+                    {
+                        "peer": other_peer.to_string(),
+                        "addrs": [normalized_addr],
+                        "last_seen": 3
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let entries = load_peer_cache(temp.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].peer, peer.to_string());
+        assert_eq!(entries[0].addrs, vec![normalized_addr.clone()]);
+        assert_eq!(
+            peer_cache_bootstrap_peers(temp.path()),
+            vec![normalized_addr.parse::<libp2p::Multiaddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -6623,10 +6788,24 @@ mod tests {
         .unwrap();
         assert!(announcement.signature.is_some());
         verify_workspace_announcement(&announcement).unwrap();
+        let normalized_addrs = normalized_announcement_bootstrap_addrs(&announcement).unwrap();
+        assert_eq!(normalized_addrs.len(), 1);
+        assert!(normalized_addrs[0].to_string().contains("/p2p/"));
 
         let mut tampered = announcement.clone();
         tampered.root = Some(hex::encode(Cid::hash_of(b"forged root").as_bytes()));
         assert!(verify_workspace_announcement(&tampered).is_err());
+
+        let mut wrong_peer = announcement.clone();
+        wrong_peer.peer = "not-a-peer".into();
+        assert!(verify_workspace_announcement(&wrong_peer).is_err());
+
+        let other_peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let mut wrong_addr_peer = announcement.clone();
+        wrong_addr_peer.addrs = vec![format!("/ip4/127.0.0.1/udp/5555/quic-v1/p2p/{other_peer}")];
+        wrong_addr_peer.signature = None;
+        let wrong_addr_peer = sign_workspace_announcement(wrong_addr_peer, &identity).unwrap();
+        assert!(verify_workspace_announcement(&wrong_addr_peer).is_err());
 
         let mut unsigned = announcement;
         unsigned.signature = None;
@@ -6648,9 +6827,10 @@ mod tests {
         .await
         .unwrap();
         workspace.snapshot().await.unwrap();
+        let peer = nexus_network::to_peer_id(&identity);
         let announcement = workspace_announcement(
             &identity,
-            nexus_network::to_peer_id(&identity),
+            peer,
             vec!["/ip4/127.0.0.1/udp/5555/quic-v1".parse().unwrap()],
             &workspace,
             35,
@@ -6682,7 +6862,10 @@ mod tests {
         assert!(views[0].verified);
         assert!(views[0].clone_ready);
         assert_eq!(views[0].name, "verified-lab");
-        assert_eq!(views[0].addrs, vec!["/ip4/127.0.0.1/udp/5555/quic-v1"]);
+        assert_eq!(
+            views[0].addrs,
+            vec![format!("/ip4/127.0.0.1/udp/5555/quic-v1/p2p/{peer}")]
+        );
 
         let relevance_sorted =
             discovered_workspace_views(&announcements, &DiscoveryFilter::default());
@@ -6724,7 +6907,10 @@ mod tests {
             .unwrap()
             .expect("signed addressed announcement should be selectable");
         assert_eq!(source.peer, peer);
-        assert_eq!(source.addrs, vec![addr]);
+        assert_eq!(
+            source.addrs,
+            vec![addr.with(libp2p::multiaddr::Protocol::P2p(peer))]
+        );
         assert_eq!(source.owner, *identity.did());
         assert_eq!(source.root, workspace.root_cid());
     }
