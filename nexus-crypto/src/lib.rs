@@ -17,6 +17,9 @@ pub mod capability;
 pub mod did;
 pub mod identity;
 
-pub use capability::{sign_capability, verify_capability, SigningError};
+pub use capability::{
+    delegate_capability, sign_capability, sign_capability_with_depth, verify_capability,
+    SigningError,
+};
 pub use did::{derive_did, parse_did, DidError};
 pub use identity::{verify_did_signature, IdentitySignatureError, NodeIdentity};

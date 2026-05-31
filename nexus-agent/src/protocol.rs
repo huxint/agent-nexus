@@ -507,7 +507,9 @@ impl EquivocationProof {
 mod tests {
     use super::*;
     use nexus_core::PermissionSet;
-    use nexus_crypto::capability::sign_capability;
+    use nexus_crypto::capability::{
+        delegate_capability, sign_capability, sign_capability_with_depth,
+    };
     use nexus_crypto::NodeIdentity;
     use nexus_economy::{LightningSettlement, SettlementProof};
     use nexus_runtime::{ProcessOutput, ResourceUsage};
@@ -972,12 +974,13 @@ mod tests {
     fn validation_rejects_invalid_capability_grant_signature() {
         let issuer = NodeIdentity::generate();
         let subject = NodeIdentity::generate();
-        let mut capability = sign_capability(
+        let mut capability = sign_capability_with_depth(
             &issuer,
             subject.did(),
             WorkspaceId::from_bytes([10; 32]),
             PermissionSet::READ_WRITE,
             10,
+            None,
         )
         .unwrap();
         capability.signature[0] ^= 0xff;
@@ -999,6 +1002,48 @@ mod tests {
             event.validate().unwrap_err(),
             SocialProtocolError::InvalidCapabilityGrant(_)
         ));
+    }
+
+    #[test]
+    fn validation_accepts_delegated_capability_grant_chain() {
+        let owner = NodeIdentity::generate();
+        let delegate = NodeIdentity::generate();
+        let subject = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([13; 32]);
+        let parent = sign_capability_with_depth(
+            &owner,
+            delegate.did(),
+            workspace,
+            PermissionSet::READ_WRITE,
+            100,
+            Some(1),
+        )
+        .unwrap();
+        let capability = delegate_capability(
+            &delegate,
+            parent,
+            subject.did(),
+            PermissionSet::READ_ONLY,
+            90,
+            None,
+            1,
+        )
+        .unwrap();
+        let event = SocialEvent::new(
+            delegate.did().clone(),
+            1,
+            SocialEventKind::CapabilityIssued {
+                grant: CapabilityGrant {
+                    capability,
+                    issued_at: 1,
+                    note: Some("delegated invite".into()),
+                },
+            },
+        )
+        .sign(&delegate)
+        .unwrap();
+
+        assert!(event.validate().is_ok());
     }
 
     #[test]

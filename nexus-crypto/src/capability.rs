@@ -6,7 +6,7 @@
 //! ## Canonical serialisation (for signing)
 //!
 //! We serialise the *unsigned* fields to CBOR in a fixed order:
-//!   [issuer, subject, workspace, permissions(read,write,exec,admin), expires_at]
+//!   [issuer, subject, workspace, permissions(read,write,exec,admin), expires_at, parent, delegation_depth]
 //!
 //! The signature covers this exact byte string.  Verification reconstructs
 //! the same bytes and checks the Ed25519 signature.
@@ -38,6 +38,23 @@ pub enum SigningError {
         actual: WorkspaceId,
     },
 
+    #[error("delegated capability issuer {issuer} is not the parent subject {parent_subject}")]
+    DelegationIssuerMismatch { issuer: Did, parent_subject: Did },
+
+    #[error("delegated capability permissions exceed parent permissions")]
+    DelegationPermissionsExceedParent,
+
+    #[error(
+        "delegated capability expiry {child_expires_at} exceeds parent expiry {parent_expires_at}"
+    )]
+    DelegationExpiryExceedsParent {
+        child_expires_at: u64,
+        parent_expires_at: u64,
+    },
+
+    #[error("parent capability does not allow further delegation")]
+    DelegationDepthExceeded,
+
     #[error("DID parse error: {0}")]
     DidParse(#[from] crate::did::DidError),
 }
@@ -57,16 +74,30 @@ pub fn sign_capability(
     permissions: PermissionSet,
     expires_at: u64,
 ) -> NexusResult<Capability> {
+    sign_capability_with_depth(issuer, subject, workspace, permissions, expires_at, None)
+        .map_err(|err| NexusError::Crypto(err.to_string()))
+}
+
+/// Create a signed capability token that may itself delegate further.
+pub fn sign_capability_with_depth(
+    issuer: &NodeIdentity,
+    subject: &Did,
+    workspace: WorkspaceId,
+    permissions: PermissionSet,
+    expires_at: u64,
+    delegation_depth: Option<u8>,
+) -> Result<Capability, SigningError> {
     let unsigned = CapabilityFields {
         issuer: issuer.did().clone(),
         subject: subject.clone(),
         workspace,
         permissions: permissions.clone(),
         expires_at,
+        parent: None,
+        delegation_depth,
     };
 
-    let payload = canonical_encode(&unsigned)
-        .map_err(|e| NexusError::Crypto(format!("canonical encode: {e}")))?;
+    let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
 
     let sig = issuer.sign(&payload);
 
@@ -76,6 +107,69 @@ pub fn sign_capability(
         workspace: unsigned.workspace,
         permissions: unsigned.permissions,
         expires_at: unsigned.expires_at,
+        parent: None,
+        delegation_depth,
+        signature: sig.to_bytes().to_vec(),
+    })
+}
+
+/// Create a delegated capability token from an existing valid parent token.
+///
+/// The parent subject becomes the delegated token issuer. The delegated token
+/// must stay within the parent's workspace, permissions, expiry, and remaining
+/// delegation depth.
+pub fn delegate_capability(
+    issuer: &NodeIdentity,
+    parent: Capability,
+    subject: &Did,
+    permissions: PermissionSet,
+    expires_at: u64,
+    delegation_depth: Option<u8>,
+    now: u64,
+) -> Result<Capability, SigningError> {
+    verify_capability(&parent, now)?;
+    if parent.subject != *issuer.did() {
+        return Err(SigningError::DelegationIssuerMismatch {
+            issuer: issuer.did().clone(),
+            parent_subject: parent.subject.clone(),
+        });
+    }
+    ensure_delegation_within_parent(
+        issuer.did(),
+        parent.workspace,
+        &permissions,
+        expires_at,
+        &parent,
+    )?;
+    let max_child_depth = parent
+        .delegation_depth
+        .ok_or(SigningError::DelegationDepthExceeded)?
+        .checked_sub(1)
+        .ok_or(SigningError::DelegationDepthExceeded)?;
+    if delegation_depth.unwrap_or(0) > max_child_depth {
+        return Err(SigningError::DelegationDepthExceeded);
+    }
+
+    let unsigned = CapabilityFields {
+        issuer: issuer.did().clone(),
+        subject: subject.clone(),
+        workspace: parent.workspace,
+        permissions: permissions.clone(),
+        expires_at,
+        parent: Some(parent.clone()),
+        delegation_depth,
+    };
+    let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
+    let sig = issuer.sign(&payload);
+
+    Ok(Capability {
+        issuer: unsigned.issuer,
+        subject: unsigned.subject,
+        workspace: unsigned.workspace,
+        permissions,
+        expires_at,
+        parent: Some(Box::new(parent)),
+        delegation_depth,
         signature: sig.to_bytes().to_vec(),
     })
 }
@@ -103,9 +197,23 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), SigningError>
         workspace: cap.workspace,
         permissions: cap.permissions.clone(),
         expires_at: cap.expires_at,
+        parent: cap.parent.as_deref().cloned(),
+        delegation_depth: cap.delegation_depth,
     };
 
     let payload = canonical_encode(&unsigned).map_err(SigningError::Serialisation)?;
+    let legacy_payload = if cap.parent.is_none() && cap.delegation_depth.is_none() {
+        let legacy_unsigned = LegacyCapabilityFields {
+            issuer: cap.issuer.clone(),
+            subject: cap.subject.clone(),
+            workspace: cap.workspace,
+            permissions: cap.permissions.clone(),
+            expires_at: cap.expires_at,
+        };
+        Some(canonical_encode_legacy(&legacy_unsigned).map_err(SigningError::Serialisation)?)
+    } else {
+        None
+    };
 
     // 3. Extract issuer's VerifyingKey from DID
     let raw_pk = parse_did(cap.issuer.as_str())?;
@@ -115,8 +223,34 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), SigningError>
     let sig = Signature::from_slice(&cap.signature).map_err(|_| SigningError::InvalidSignature)?;
 
     // 5. Verify
-    vk.verify(&payload, &sig)
-        .map_err(|_| SigningError::InvalidSignature)
+    if vk.verify(&payload, &sig).is_err()
+        && legacy_payload
+            .as_deref()
+            .is_none_or(|legacy_payload| vk.verify(legacy_payload, &sig).is_err())
+    {
+        return Err(SigningError::InvalidSignature);
+    }
+
+    if let Some(parent) = cap.parent.as_deref() {
+        verify_capability(parent, now)?;
+        ensure_delegation_within_parent(
+            &cap.issuer,
+            cap.workspace,
+            &cap.permissions,
+            cap.expires_at,
+            parent,
+        )?;
+        let max_child_depth = parent
+            .delegation_depth
+            .ok_or(SigningError::DelegationDepthExceeded)?
+            .checked_sub(1)
+            .ok_or(SigningError::DelegationDepthExceeded)?;
+        if cap.delegation_depth.unwrap_or(0) > max_child_depth {
+            return Err(SigningError::DelegationDepthExceeded);
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify a capability AND check that `caller` is the subject.
@@ -161,6 +295,18 @@ struct CapabilityFields {
     workspace: WorkspaceId,
     permissions: PermissionSet,
     expires_at: u64,
+    parent: Option<Capability>,
+    delegation_depth: Option<u8>,
+}
+
+/// The v1 unsigned fields, kept so persisted non-delegated tokens continue to verify.
+#[derive(serde::Serialize)]
+struct LegacyCapabilityFields {
+    issuer: Did,
+    subject: Did,
+    workspace: WorkspaceId,
+    permissions: PermissionSet,
+    expires_at: u64,
 }
 
 /// Encode `fields` to a deterministic CBOR byte string.
@@ -169,6 +315,50 @@ fn canonical_encode(fields: &CapabilityFields) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     ciborium::into_writer(fields, &mut buf).map_err(|e| format!("CBOR encode: {e}"))?;
     Ok(buf)
+}
+
+fn canonical_encode_legacy(fields: &LegacyCapabilityFields) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(fields, &mut buf).map_err(|e| format!("CBOR encode: {e}"))?;
+    Ok(buf)
+}
+
+fn ensure_delegation_within_parent(
+    issuer: &Did,
+    workspace: WorkspaceId,
+    permissions: &PermissionSet,
+    expires_at: u64,
+    parent: &Capability,
+) -> Result<(), SigningError> {
+    if parent.subject != *issuer {
+        return Err(SigningError::DelegationIssuerMismatch {
+            issuer: issuer.clone(),
+            parent_subject: parent.subject.clone(),
+        });
+    }
+    if parent.workspace != workspace {
+        return Err(SigningError::WorkspaceMismatch {
+            expected: parent.workspace,
+            actual: workspace,
+        });
+    }
+    if expires_at > parent.expires_at {
+        return Err(SigningError::DelegationExpiryExceedsParent {
+            child_expires_at: expires_at,
+            parent_expires_at: parent.expires_at,
+        });
+    }
+    if !permissions_within_parent(permissions, &parent.permissions) {
+        return Err(SigningError::DelegationPermissionsExceedParent);
+    }
+    Ok(())
+}
+
+fn permissions_within_parent(child: &PermissionSet, parent: &PermissionSet) -> bool {
+    (!child.read || parent.can_read())
+        && (!child.write || parent.can_write())
+        && (!child.exec || parent.can_exec())
+        && (!child.admin || parent.is_admin())
 }
 
 // ---------------------------------------------------------------------------
@@ -248,5 +438,95 @@ mod tests {
         // Charlie tries to use Bob's capability
         let err = verify_capability_for_caller(&cap, charlie.did(), ws, ts_now()).unwrap_err();
         assert!(matches!(err, SigningError::SubjectMismatch { .. }));
+    }
+
+    #[test]
+    fn delegated_capability_chain_verifies_with_bounded_depth() {
+        let owner = NodeIdentity::generate();
+        let delegate = NodeIdentity::generate();
+        let grantee = NodeIdentity::generate();
+        let ws = WorkspaceId::from_bytes([0x11u8; 32]);
+        let now = ts_now();
+        let parent = sign_capability_with_depth(
+            &owner,
+            delegate.did(),
+            ws,
+            PermissionSet::READ_WRITE,
+            now + 3600,
+            Some(1),
+        )
+        .unwrap();
+
+        let delegated = delegate_capability(
+            &delegate,
+            parent.clone(),
+            grantee.did(),
+            PermissionSet::READ_ONLY,
+            now + 1800,
+            None,
+            now,
+        )
+        .expect("delegation must succeed");
+
+        assert_eq!(delegated.issuer, *delegate.did());
+        assert_eq!(delegated.subject, *grantee.did());
+        assert!(delegated.parent.is_some());
+        assert!(verify_capability(&delegated, now).is_ok());
+        assert!(verify_capability_for_caller(&delegated, grantee.did(), ws, now).is_ok());
+    }
+
+    #[test]
+    fn delegated_capability_cannot_exceed_parent_permissions_or_depth() {
+        let owner = NodeIdentity::generate();
+        let delegate = NodeIdentity::generate();
+        let grantee = NodeIdentity::generate();
+        let ws = WorkspaceId::from_bytes([0x12u8; 32]);
+        let now = ts_now();
+        let parent = sign_capability_with_depth(
+            &owner,
+            delegate.did(),
+            ws,
+            PermissionSet::READ_ONLY,
+            now + 3600,
+            Some(1),
+        )
+        .unwrap();
+
+        let err = delegate_capability(
+            &delegate,
+            parent.clone(),
+            grantee.did(),
+            PermissionSet::READ_WRITE,
+            now + 1800,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SigningError::DelegationPermissionsExceedParent
+        ));
+
+        let delegated = delegate_capability(
+            &delegate,
+            parent,
+            grantee.did(),
+            PermissionSet::READ_ONLY,
+            now + 1800,
+            None,
+            now,
+        )
+        .unwrap();
+        let err = delegate_capability(
+            &grantee,
+            delegated,
+            owner.did(),
+            PermissionSet::READ_ONLY,
+            now + 1200,
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SigningError::DelegationDepthExceeded));
     }
 }
