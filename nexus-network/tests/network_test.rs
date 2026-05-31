@@ -24,8 +24,15 @@ async fn wait_for_listen(net: &mut Network) -> libp2p::Multiaddr {
 }
 
 async fn wait_for_peer_connection(net: &mut Network, peer: libp2p::PeerId) {
+    if net.is_connected(peer) {
+        return;
+    }
+
     tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(event) = net.next_event().await {
+            if net.is_connected(peer) {
+                break;
+            }
             if matches!(event, NetworkEvent::PeerConnected(connected) if connected == peer) {
                 break;
             }
@@ -95,6 +102,19 @@ fn with_peer(addr: libp2p::Multiaddr, peer: libp2p::PeerId) -> libp2p::Multiaddr
     addr.with(Protocol::P2p(peer))
 }
 
+fn dns4_localhost_with_peer(addr: &libp2p::Multiaddr, peer: libp2p::PeerId) -> libp2p::Multiaddr {
+    let port = addr
+        .iter()
+        .find_map(|protocol| match protocol {
+            Protocol::Udp(port) => Some(port),
+            _ => None,
+        })
+        .expect("test listen address should include udp port");
+    format!("/dns4/localhost/udp/{port}/quic-v1/p2p/{peer}")
+        .parse()
+        .unwrap()
+}
+
 /// Start two nodes and verify they can discover each other via Kademlia.
 #[tokio::test]
 async fn two_nodes_discover_each_other() {
@@ -159,6 +179,31 @@ async fn two_nodes_discover_each_other() {
         a_discovered_b || b_discovered_a,
         "nodes should discover each other"
     );
+}
+
+#[tokio::test]
+async fn dns_bootstrap_addr_connects_to_peer() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let id_a = NodeIdentity::generate();
+    let config_a = NetworkConfig {
+        listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+        bootstrap_peers: Vec::new(),
+        ..Default::default()
+    };
+    let mut net_a = Network::new(&id_a, config_a).await.expect("node A start");
+    let addr_a = wait_for_listen(&mut net_a).await;
+
+    let id_b = NodeIdentity::generate();
+    let config_b = NetworkConfig {
+        listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+        bootstrap_peers: vec![dns4_localhost_with_peer(&addr_a, net_a.local_peer_id())],
+        ..Default::default()
+    };
+    let mut net_b = Network::new(&id_b, config_b).await.expect("node B start");
+
+    wait_for_peer_connection(&mut net_b, net_a.local_peer_id()).await;
+    assert!(net_b.is_connected(net_a.local_peer_id()));
 }
 
 /// Provider records let a node find a workspace-serving peer through the DHT

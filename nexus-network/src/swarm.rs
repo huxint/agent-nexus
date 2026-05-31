@@ -164,6 +164,8 @@ impl Network {
                     .boxed()
             })
             .map_err(|err| NexusError::Network(format!("transport: {err}")))?
+            .with_dns()
+            .map_err(|err| NexusError::Network(format!("dns transport: {err}")))?
             .with_behaviour(|_key| behaviour)
             .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
