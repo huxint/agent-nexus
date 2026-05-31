@@ -11,7 +11,7 @@ use nexus_core::Did;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind, SocialProtocolError};
-use crate::society::Society;
+use crate::society::{IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRotation, Society};
 
 /// Accepted clock skew for signed social events.
 ///
@@ -26,6 +26,13 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn identity_recovery_approval_key(approval: &IdentityRecoveryApproval) -> String {
+    format!(
+        "{}|{}|{}",
+        approval.identity, approval.recovered, approval.guardian
+    )
 }
 
 /// Append-only set of signed social events.
@@ -50,6 +57,10 @@ pub struct SocialEventLog {
     heads: HashMap<Did, (u64, String)>,
     #[serde(skip)]
     rotations: HashMap<Did, Did>,
+    #[serde(skip)]
+    recovery_policies: HashMap<Did, IdentityRecoveryPolicy>,
+    #[serde(skip)]
+    recovery_approvals: HashMap<String, IdentityRecoveryApproval>,
     #[serde(skip)]
     equivocation_index: HashSet<String>,
 }
@@ -290,6 +301,8 @@ impl SocialEventLog {
         self.heads
             .insert(event.author.clone(), (event.seq, event.id.clone()));
         self.record_identity_rotation(&event);
+        self.record_identity_recovery_policy(&event);
+        self.record_identity_recovery_approval(&event);
         self.record_pending_equivocations(&event)?;
         self.observed_at.push(observed_at);
         self.events.push(event);
@@ -307,6 +320,7 @@ impl SocialEventLog {
             let event = self.pending.remove(position);
             let observed_at = self.pending_observed_at.remove(position);
             self.pending_index.remove(&event.id);
+            self.validate_identity_rotation_authority(&event)?;
             self.accept_event(event, observed_at)?;
         }
         Ok(())
@@ -402,6 +416,8 @@ impl SocialEventLog {
         self.seq_index.clear();
         self.heads.clear();
         self.rotations.clear();
+        self.recovery_policies.clear();
+        self.recovery_approvals.clear();
         self.equivocation_index.clear();
 
         let events = std::mem::take(&mut self.events)
@@ -436,6 +452,103 @@ impl SocialEventLog {
                 .insert(rotation.previous.clone(), rotation.next.clone());
         }
     }
+
+    fn record_identity_recovery_policy(&mut self, event: &SocialEvent) {
+        if let SocialEventKind::IdentityRecoveryPolicy { policy } = &event.kind {
+            let mut policy = policy.clone();
+            policy.guardians.sort_by_key(|did| did.to_string());
+            policy.guardians.dedup();
+            if policy.guardians.is_empty()
+                || policy.threshold == 0
+                || policy.threshold > policy.guardians.len()
+            {
+                return;
+            }
+            self.recovery_policies
+                .entry(policy.identity.clone())
+                .and_modify(|existing| {
+                    if policy.updated_at >= existing.updated_at {
+                        *existing = policy.clone();
+                    }
+                })
+                .or_insert(policy);
+            if let Some(rotation) = self.identity_recovery_rotation(&event.author) {
+                self.rotations
+                    .insert(rotation.previous.clone(), rotation.next.clone());
+            }
+        }
+    }
+
+    fn record_identity_recovery_approval(&mut self, event: &SocialEvent) {
+        if let SocialEventKind::IdentityRecoveryApproved { approval } = &event.kind {
+            if approval.identity == approval.recovered {
+                return;
+            }
+            let key = identity_recovery_approval_key(approval);
+            self.recovery_approvals
+                .entry(key)
+                .and_modify(|existing| {
+                    if approval.approved_at >= existing.approved_at {
+                        *existing = approval.clone();
+                    }
+                })
+                .or_insert(approval.clone());
+            if let Some(rotation) = self.identity_recovery_rotation(&approval.identity) {
+                self.rotations
+                    .insert(rotation.previous.clone(), rotation.next.clone());
+            }
+        }
+    }
+
+    fn identity_recovery_policy(&self, did: &Did) -> Option<&IdentityRecoveryPolicy> {
+        self.recovery_policies.get(did)
+    }
+
+    fn identity_recovery_approvals(&self, did: &Did) -> Vec<&IdentityRecoveryApproval> {
+        self.recovery_approvals
+            .values()
+            .filter(|approval| approval.identity == *did)
+            .collect()
+    }
+
+    fn identity_recovery_rotation(&self, did: &Did) -> Option<IdentityRotation> {
+        let policy = self.identity_recovery_policy(did)?;
+        let mut by_recovered: HashMap<Did, Vec<&IdentityRecoveryApproval>> = HashMap::new();
+        for approval in self.identity_recovery_approvals(did) {
+            if !policy.guardians.contains(&approval.guardian) {
+                continue;
+            }
+            by_recovered
+                .entry(approval.recovered.clone())
+                .or_default()
+                .push(approval);
+        }
+
+        by_recovered
+            .into_iter()
+            .filter(|(_recovered, approvals)| approvals.len() >= policy.threshold)
+            .filter_map(|(recovered, approvals)| {
+                let approved_at = approvals
+                    .iter()
+                    .map(|approval| approval.approved_at)
+                    .max()?;
+                let reason = approvals
+                    .iter()
+                    .filter_map(|approval| approval.reason.clone())
+                    .next();
+                Some(IdentityRotation {
+                    previous: did.clone(),
+                    next: recovered,
+                    reason,
+                    rotated_at: approved_at,
+                })
+            })
+            .min_by(|a, b| {
+                a.rotated_at
+                    .cmp(&b.rotated_at)
+                    .then_with(|| a.next.to_string().cmp(&b.next.to_string()))
+            })
+    }
 }
 
 fn fill_observed_times(observed_at: Vec<u64>) -> impl Iterator<Item = u64> {
@@ -454,7 +567,9 @@ mod tests {
     use nexus_crypto::NodeIdentity;
 
     use crate::protocol::{SocialEventKind, SocialProtocolError};
-    use crate::society::{IdentityRotation, RelationKind};
+    use crate::society::{
+        IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRotation, RelationKind,
+    };
 
     fn signed_relation(
         identity: &NodeIdentity,
@@ -634,6 +749,105 @@ mod tests {
         ));
         assert!(log.append(successor_event).unwrap());
         assert!(!log.append(rotation).unwrap());
+    }
+
+    #[test]
+    fn identity_recovery_threshold_requires_successor_for_future_events() {
+        let identity = NodeIdentity::generate();
+        let guardian_a = NodeIdentity::generate();
+        let guardian_b = NodeIdentity::generate();
+        let recovered = NodeIdentity::generate();
+        let peer = NodeIdentity::generate();
+
+        let policy = SocialEvent::new(
+            identity.did().clone(),
+            1,
+            SocialEventKind::IdentityRecoveryPolicy {
+                policy: IdentityRecoveryPolicy {
+                    identity: identity.did().clone(),
+                    guardians: vec![guardian_a.did().clone(), guardian_b.did().clone()],
+                    threshold: 2,
+                    updated_at: 1,
+                },
+            },
+        )
+        .sign(&identity)
+        .unwrap();
+        let approval_a = SocialEvent::new(
+            guardian_a.did().clone(),
+            2,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian_a.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("lost old key".into()),
+                    approved_at: 2,
+                },
+            },
+        )
+        .sign(&guardian_a)
+        .unwrap();
+        let approval_b = SocialEvent::new(
+            guardian_b.did().clone(),
+            3,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian_b.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("second guardian".into()),
+                    approved_at: 3,
+                },
+            },
+        )
+        .sign(&guardian_b)
+        .unwrap();
+
+        let mut log = SocialEventLog::new();
+        assert!(log.append(policy.clone()).unwrap());
+        assert!(log.append(approval_a).unwrap());
+        assert_eq!(
+            log.to_society().active_identity(identity.did()),
+            *identity.did()
+        );
+        assert!(log.append(approval_b).unwrap());
+        assert_eq!(
+            log.to_society().active_identity(identity.did()),
+            recovered.did().clone()
+        );
+
+        let old_key_event = SocialEvent::new_chained(
+            identity.did().clone(),
+            1,
+            Some(policy.id.clone()),
+            4,
+            SocialEventKind::RelationDeclared {
+                peer: peer.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("old key should no longer act".into()),
+            },
+        )
+        .sign(&identity)
+        .unwrap();
+        assert!(matches!(
+            log.append(old_key_event).unwrap_err(),
+            SocialProtocolError::IdentityRotated { author, successor }
+                if author == *identity.did() && successor == *recovered.did()
+        ));
+
+        let recovered_event = SocialEvent::new(
+            recovered.did().clone(),
+            4,
+            SocialEventKind::RelationDeclared {
+                peer: peer.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("recovered key now acts".into()),
+            },
+        )
+        .sign(&recovered)
+        .unwrap();
+        assert!(log.append(recovered_event).unwrap());
     }
 
     #[test]

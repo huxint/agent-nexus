@@ -36,11 +36,11 @@ use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
     CollectiveVote, CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt,
-    IdentityRevocation, IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind,
-    IntentResponse, IntentResponseKind, Interaction, InteractionOutcome, RelationKind,
-    SettlementRecord, SocialEvent, SocialEventKind, SocialMemory, TaskDispute,
-    WorkspaceOwnershipClaim, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
-    WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
+    IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation, IdentityRotation,
+    IntentActionKind, IntentActionPlan, IntentKind, IntentResponse, IntentResponseKind,
+    Interaction, InteractionOutcome, RelationKind, SettlementRecord, SocialEvent, SocialEventKind,
+    SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun, WorkspaceRunContext,
+    WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -141,6 +141,8 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event intent-response --base <DIR> --intent <ID> --kind <interested|accept|decline|counter|fulfilled> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--evidence <TEXT>]");
     eprintln!("  {prog} event identity-revoke --base <DIR> [--reason <TEXT>] [--revoked-at <TS>]");
     eprintln!("  {prog} event identity-rotate --base <DIR> --next <DID> [--reason <TEXT>] [--rotated-at <TS>]");
+    eprintln!("  {prog} event identity-recovery-policy --base <DIR> --guardian <DID>... --threshold <N> [--updated-at <TS>]");
+    eprintln!("  {prog} event identity-recovery-approve --base <DIR> --identity <DID> --recovered <DID> [--reason <TEXT>] [--approved-at <TS>]");
     eprintln!("  {prog} event workspace-join --base <DIR> --workspace <HEX>");
     eprintln!("  {prog} event workspace-claim --base <DIR> --workspace <HEX> [--root <CID_HEX>]");
     eprintln!("  {prog} event workspace-transfer --base <DIR> --workspace <HEX> --owner <DID> [--root <CID_HEX>]");
@@ -1698,7 +1700,7 @@ fn cmd_identity_rotate(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, identity-revoke, identity-rotate, workspace-join, workspace-claim, workspace-transfer, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
+            "event subcommand required: manifest, intent, identity-revoke, identity-rotate, identity-recovery-policy, identity-recovery-approve, workspace-join, workspace-claim, workspace-transfer, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -1714,6 +1716,10 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         "identity-rotate" | "identity-rotated" | "rotate-identity" => {
             cmd_event_identity_rotate(args)
+        }
+        "identity-recovery-policy" | "recovery-policy" => cmd_event_identity_recovery_policy(args),
+        "identity-recovery-approve" | "identity-recovery-approval" | "recovery-approve" => {
+            cmd_event_identity_recovery_approve(args)
         }
         "workspace-join" | "workspace" | "join" => cmd_event_workspace_join(args),
         "workspace-claim" | "claim-workspace" | "workspace-owner-claim" => {
@@ -2100,6 +2106,121 @@ fn cmd_event_identity_rotate(args: &[String]) -> Result<(), Box<dyn std::error::
                     next: next.ok_or("--next required")?,
                     reason,
                     rotated_at: rotated_at.unwrap_or(now),
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_identity_recovery_policy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut guardians = Vec::new();
+    let mut threshold = None;
+    let mut updated_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--guardian" => {
+                i += 1;
+                guardians.push(Did::new(required_arg(args, i, "--guardian")?.to_string()));
+            }
+            "--threshold" => {
+                i += 1;
+                threshold = Some(parse_usize_arg(
+                    required_arg(args, i, "--threshold")?,
+                    "--threshold",
+                )?);
+            }
+            "--updated-at" => {
+                i += 1;
+                updated_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--updated-at")?,
+                    "--updated-at",
+                )?);
+            }
+            other => {
+                return Err(format!("unknown identity-recovery-policy option: {other}").into());
+            }
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            Ok(SocialEventKind::IdentityRecoveryPolicy {
+                policy: IdentityRecoveryPolicy {
+                    identity: identity.did().clone(),
+                    guardians,
+                    threshold: threshold.ok_or("--threshold required")?,
+                    updated_at: updated_at.unwrap_or(now),
+                },
+            })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_identity_recovery_approve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut identity = None;
+    let mut recovered = None;
+    let mut reason = None;
+    let mut approved_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--identity" => {
+                i += 1;
+                identity = Some(Did::new(required_arg(args, i, "--identity")?.to_string()));
+            }
+            "--recovered" => {
+                i += 1;
+                recovered = Some(Did::new(required_arg(args, i, "--recovered")?.to_string()));
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            "--approved-at" => {
+                i += 1;
+                approved_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--approved-at")?,
+                    "--approved-at",
+                )?);
+            }
+            other => {
+                return Err(format!("unknown identity-recovery-approve option: {other}").into());
+            }
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |guardian| {
+            Ok(SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.ok_or("--identity required")?,
+                    guardian: guardian.did().clone(),
+                    recovered: recovered.ok_or("--recovered required")?,
+                    reason,
+                    approved_at: approved_at.unwrap_or(now),
                 },
             })
         },
@@ -8007,6 +8128,106 @@ mod tests {
                 .rotated_at,
             900
         );
+    }
+
+    #[test]
+    fn event_commands_record_identity_recovery_threshold() {
+        let owner_base = TempDir::new().unwrap();
+        let guardian_a_base = TempDir::new().unwrap();
+        let guardian_b_base = TempDir::new().unwrap();
+        let owner = load_or_create_identity(owner_base.path()).unwrap();
+        let guardian_a = load_or_create_identity(guardian_a_base.path()).unwrap();
+        let guardian_b = load_or_create_identity(guardian_b_base.path()).unwrap();
+        let recovered = NodeIdentity::generate();
+        let owner_base_arg = owner_base.path().to_string_lossy().to_string();
+        let guardian_a_base_arg = guardian_a_base.path().to_string_lossy().to_string();
+        let guardian_b_base_arg = guardian_b_base.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "identity-recovery-policy".into(),
+            "--base".into(),
+            owner_base_arg.clone(),
+            "--guardian".into(),
+            guardian_a.did().to_string(),
+            "--guardian".into(),
+            guardian_b.did().to_string(),
+            "--threshold".into(),
+            "2".into(),
+            "--updated-at".into(),
+            "1000".into(),
+        ])
+        .unwrap();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "identity-recovery-approve".into(),
+            "--base".into(),
+            guardian_a_base_arg,
+            "--identity".into(),
+            owner.did().to_string(),
+            "--recovered".into(),
+            recovered.did().to_string(),
+            "--reason".into(),
+            "lost old key".into(),
+            "--approved-at".into(),
+            "1001".into(),
+        ])
+        .unwrap();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "identity-recovery-approve".into(),
+            "--base".into(),
+            guardian_b_base_arg,
+            "--identity".into(),
+            owner.did().to_string(),
+            "--recovered".into(),
+            recovered.did().to_string(),
+            "--reason".into(),
+            "second guardian".into(),
+            "--approved-at".into(),
+            "1002".into(),
+        ])
+        .unwrap();
+
+        let mut memory =
+            load_social_memory(&owner_base.path().join(".nexus-social-memory.json")).unwrap();
+        for base in [&guardian_a_base, &guardian_b_base] {
+            let guardian_memory =
+                load_social_memory(&base.path().join(".nexus-social-memory.json")).unwrap();
+            for event in guardian_memory.events() {
+                assert!(memory.ingest_event(event.clone()).unwrap());
+            }
+        }
+        let memory_path = owner_base.path().join(".nexus-social-memory.json");
+        save_social_memory(&memory_path, &memory).unwrap();
+
+        assert_eq!(memory.event_count(), 3);
+        assert_eq!(
+            memory.society().active_identity(owner.did()),
+            recovered.did().clone()
+        );
+        let view = society_json(&memory);
+        let owner_agent = view["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["did"] == owner.did().to_string())
+            .unwrap();
+        assert_eq!(owner_agent["active_did"], recovered.did().to_string());
+        assert_eq!(owner_agent["recovery_threshold_met"], true);
+        assert_eq!(owner_agent["recovery_policy"]["threshold"], 2);
+        assert_eq!(
+            owner_agent["recovery_approvals"].as_array().unwrap().len(),
+            2
+        );
+        for event in memory.events() {
+            event.verify_signature().unwrap();
+        }
     }
 
     #[test]

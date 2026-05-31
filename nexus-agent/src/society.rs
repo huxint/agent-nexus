@@ -35,6 +35,13 @@ fn cancellation_key(cancellation: &TaskCancellation) -> String {
     )
 }
 
+fn identity_recovery_approval_key(approval: &IdentityRecoveryApproval) -> String {
+    format!(
+        "{}|{}|{}",
+        approval.identity, approval.recovered, approval.guardian
+    )
+}
+
 /// Stable social identifier for a task result claim.
 ///
 /// The ID commits to the full [`TaskResult`] content rather than only stdout,
@@ -684,6 +691,25 @@ pub struct IdentityRotation {
     pub rotated_at: u64,
 }
 
+/// A signed recovery policy that names guardians for an identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityRecoveryPolicy {
+    pub identity: Did,
+    pub guardians: Vec<Did>,
+    pub threshold: usize,
+    pub updated_at: u64,
+}
+
+/// A guardian-signed approval to recover an identity to a new DID.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityRecoveryApproval {
+    pub identity: Did,
+    pub guardian: Did,
+    pub recovered: Did,
+    pub reason: Option<String>,
+    pub approved_at: u64,
+}
+
 /// A signed claim that an agent observed or created a workspace snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -886,6 +912,10 @@ pub struct Society {
     identity_revocations: HashMap<Did, IdentityRevocation>,
     #[serde(default)]
     identity_rotations: HashMap<Did, IdentityRotation>,
+    #[serde(default)]
+    identity_recovery_policies: HashMap<Did, IdentityRecoveryPolicy>,
+    #[serde(default)]
+    identity_recovery_approvals: HashMap<String, IdentityRecoveryApproval>,
     manifests: HashMap<Did, AgentManifest>,
     edges: HashMap<(Did, Did), SocialEdge>,
     #[serde(default)]
@@ -1083,6 +1113,51 @@ impl Society {
             .or_insert(rotation);
     }
 
+    pub fn record_identity_recovery_policy(&mut self, mut policy: IdentityRecoveryPolicy) {
+        policy.guardians.sort_by_key(|did| did.to_string());
+        policy.guardians.dedup();
+        if policy.guardians.is_empty()
+            || policy.threshold == 0
+            || policy.threshold > policy.guardians.len()
+        {
+            return;
+        }
+        self.register_agent(policy.identity.clone());
+        for guardian in &policy.guardians {
+            self.register_agent(guardian.clone());
+        }
+        self.identity_recovery_policies
+            .entry(policy.identity.clone())
+            .and_modify(|existing| {
+                if policy.updated_at >= existing.updated_at {
+                    *existing = policy.clone();
+                }
+            })
+            .or_insert(policy);
+    }
+
+    pub fn record_identity_recovery_approval(&mut self, approval: IdentityRecoveryApproval) {
+        if approval.identity == approval.recovered {
+            return;
+        }
+        self.register_agent(approval.identity.clone());
+        self.register_agent(approval.guardian.clone());
+        self.register_agent(approval.recovered.clone());
+        let key = identity_recovery_approval_key(&approval);
+        self.identity_recovery_approvals
+            .entry(key)
+            .and_modify(|existing| {
+                if approval.approved_at >= existing.approved_at {
+                    *existing = approval.clone();
+                }
+            })
+            .or_insert(approval.clone());
+
+        if let Some(rotation) = self.identity_recovery_rotation(&approval.identity) {
+            self.record_identity_rotation(rotation);
+        }
+    }
+
     pub fn identity_revocation(&self, did: &Did) -> Option<&IdentityRevocation> {
         self.identity_revocations.get(did)
     }
@@ -1112,10 +1187,86 @@ impl Society {
         rotations
     }
 
+    pub fn identity_recovery_policy(&self, did: &Did) -> Option<&IdentityRecoveryPolicy> {
+        self.identity_recovery_policies.get(did)
+    }
+
+    pub fn identity_recovery_policies(&self) -> Vec<&IdentityRecoveryPolicy> {
+        let mut policies: Vec<&IdentityRecoveryPolicy> =
+            self.identity_recovery_policies.values().collect();
+        policies.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.identity.to_string().cmp(&b.identity.to_string()))
+        });
+        policies
+    }
+
+    pub fn identity_recovery_approvals(&self, did: &Did) -> Vec<&IdentityRecoveryApproval> {
+        let mut approvals = self
+            .identity_recovery_approvals
+            .values()
+            .filter(|approval| approval.identity == *did)
+            .collect::<Vec<_>>();
+        approvals.sort_by(|a, b| {
+            a.approved_at
+                .cmp(&b.approved_at)
+                .then_with(|| a.guardian.to_string().cmp(&b.guardian.to_string()))
+        });
+        approvals
+    }
+
+    pub fn identity_recovery_threshold_met(&self, did: &Did) -> bool {
+        self.identity_recovery_rotation(did).is_some()
+    }
+
+    pub fn identity_recovery_rotation(&self, did: &Did) -> Option<IdentityRotation> {
+        let policy = self.identity_recovery_policy(did)?;
+        let mut by_recovered: HashMap<Did, Vec<&IdentityRecoveryApproval>> = HashMap::new();
+        for approval in self.identity_recovery_approvals(did) {
+            if !policy.guardians.contains(&approval.guardian) {
+                continue;
+            }
+            by_recovered
+                .entry(approval.recovered.clone())
+                .or_default()
+                .push(approval);
+        }
+
+        by_recovered
+            .into_iter()
+            .filter(|(_recovered, approvals)| approvals.len() >= policy.threshold)
+            .filter_map(|(recovered, approvals)| {
+                let approved_at = approvals
+                    .iter()
+                    .map(|approval| approval.approved_at)
+                    .max()?;
+                let reason = approvals
+                    .iter()
+                    .filter_map(|approval| approval.reason.clone())
+                    .next();
+                Some(IdentityRotation {
+                    previous: did.clone(),
+                    next: recovered,
+                    reason,
+                    rotated_at: approved_at,
+                })
+            })
+            .min_by(|a, b| {
+                a.rotated_at
+                    .cmp(&b.rotated_at)
+                    .then_with(|| a.next.to_string().cmp(&b.next.to_string()))
+            })
+    }
+
     pub fn active_identity(&self, did: &Did) -> Did {
         let mut current = did.clone();
         let mut seen = HashSet::new();
         while seen.insert(current.clone()) {
+            if let Some(rotation) = self.identity_recovery_rotation(&current) {
+                current = rotation.next.clone();
+                continue;
+            };
             let Some(rotation) = self.identity_rotation(&current) else {
                 break;
             };
@@ -2180,6 +2331,12 @@ impl Society {
             }
             SocialEventKind::IdentityRotated { rotation } => {
                 self.record_identity_rotation(rotation.clone());
+            }
+            SocialEventKind::IdentityRecoveryPolicy { policy } => {
+                self.record_identity_recovery_policy(policy.clone());
+            }
+            SocialEventKind::IdentityRecoveryApproved { approval } => {
+                self.record_identity_recovery_approval(approval.clone());
             }
             SocialEventKind::WorkspaceJoined { workspace } => {
                 self.join_workspace(event.author.clone(), *workspace);
@@ -4087,6 +4244,78 @@ mod tests {
             society.active_identity(previous.did()),
             previous.did().clone()
         );
+    }
+
+    #[test]
+    fn identity_recovery_policy_recovers_after_guardian_threshold() {
+        let identity = NodeIdentity::generate();
+        let guardian_a = NodeIdentity::generate();
+        let guardian_b = NodeIdentity::generate();
+        let recovered = NodeIdentity::generate();
+        let mut society = Society::new();
+
+        society.apply_event(&SocialEvent::new(
+            identity.did().clone(),
+            1,
+            SocialEventKind::IdentityRecoveryPolicy {
+                policy: IdentityRecoveryPolicy {
+                    identity: identity.did().clone(),
+                    guardians: vec![guardian_a.did().clone(), guardian_b.did().clone()],
+                    threshold: 2,
+                    updated_at: 1,
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            guardian_a.did().clone(),
+            2,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian_a.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("lost old key".into()),
+                    approved_at: 2,
+                },
+            },
+        ));
+
+        assert_eq!(
+            society.active_identity(identity.did()),
+            identity.did().clone()
+        );
+        assert!(!society.identity_recovery_threshold_met(identity.did()));
+
+        society.apply_event(&SocialEvent::new(
+            guardian_b.did().clone(),
+            3,
+            SocialEventKind::IdentityRecoveryApproved {
+                approval: IdentityRecoveryApproval {
+                    identity: identity.did().clone(),
+                    guardian: guardian_b.did().clone(),
+                    recovered: recovered.did().clone(),
+                    reason: Some("second guardian".into()),
+                    approved_at: 3,
+                },
+            },
+        ));
+
+        assert!(society.identity_recovery_threshold_met(identity.did()));
+        assert_eq!(
+            society.active_identity(identity.did()),
+            recovered.did().clone()
+        );
+        assert_eq!(
+            society
+                .identity_recovery_policy(identity.did())
+                .unwrap()
+                .threshold,
+            2
+        );
+        assert_eq!(society.identity_recovery_approvals(identity.did()).len(), 2);
+        let rotation = society.identity_recovery_rotation(identity.did()).unwrap();
+        assert_eq!(rotation.next, *recovered.did());
+        assert_eq!(rotation.rotated_at, 3);
     }
 
     #[test]
