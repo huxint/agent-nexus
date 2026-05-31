@@ -101,11 +101,48 @@ pub fn local_workspace_paths(base: &Path) -> Result<Vec<PathBuf>, Box<dyn std::e
 
 pub fn load_or_create_identity(base: &Path) -> Result<NodeIdentity, Box<dyn std::error::Error>> {
     let id_path = identity_path(base);
+    let passphrase = identity_passphrase()?;
     if id_path.exists() {
-        NodeIdentity::load_from_file(&id_path)
+        Ok(NodeIdentity::load_from_file_with_passphrase(
+            &id_path,
+            &passphrase,
+        )?)
     } else {
         let id = NodeIdentity::generate();
-        id.save_to_file(&id_path)?;
+        id.save_to_file_with_passphrase(&id_path, &passphrase)?;
         Ok(id)
+    }
+}
+
+fn identity_passphrase() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(passphrase) = std::env::var("NEXUS_PASSPHRASE") {
+        if passphrase.is_empty() {
+            return Err("NEXUS_PASSPHRASE must not be empty".into());
+        }
+        return Ok(passphrase);
+    }
+
+    #[cfg(test)]
+    {
+        Ok("nexus-test-passphrase".into())
+    }
+
+    #[cfg(not(test))]
+    {
+        use std::io::{IsTerminal, Write};
+
+        if !std::io::stdin().is_terminal() {
+            return Err("NEXUS_PASSPHRASE is required when stdin is not interactive".into());
+        }
+
+        eprint!("Identity passphrase: ");
+        std::io::stderr().flush()?;
+        let mut passphrase = String::new();
+        std::io::stdin().read_line(&mut passphrase)?;
+        let passphrase = passphrase.trim_end_matches(['\r', '\n']).to_string();
+        if passphrase.is_empty() {
+            return Err("identity passphrase must not be empty".into());
+        }
+        Ok(passphrase)
     }
 }

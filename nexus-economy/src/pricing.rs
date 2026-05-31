@@ -6,16 +6,34 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_wall_time_per_second() -> f64 {
+    0.1
+}
+
 /// Prices for different resource types, set by each agent independently.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResourcePricing {
-    /// Price per CPU-second (in credit units).
+    /// Price per wall-clock execution second (in credit units).
+    ///
+    /// This is the only time dimension currently measured by the native
+    /// executor, so it is the default variable component for short-term
+    /// estimates.
+    #[serde(default = "default_wall_time_per_second")]
+    pub wall_time_per_second: f64,
+
+    /// Experimental price per CPU-second (not charged until CPU usage is
+    /// measured and verified by the runtime).
+    #[serde(default)]
     pub cpu_per_second: f64,
 
-    /// Price per MB-hour of storage (in credit units).
+    /// Experimental price per MB-hour of storage (not charged until storage
+    /// residency is measured and verified).
+    #[serde(default)]
     pub storage_per_mb_hour: f64,
 
-    /// Price per MB of network egress (in credit units).
+    /// Experimental price per MB of network egress (not charged until
+    /// bandwidth usage is measured and verified).
+    #[serde(default)]
     pub bandwidth_per_mb: f64,
 
     /// Base fee per task execution (in credit units).
@@ -25,9 +43,10 @@ pub struct ResourcePricing {
 impl Default for ResourcePricing {
     fn default() -> Self {
         Self {
-            cpu_per_second: 0.1,
-            storage_per_mb_hour: 0.001,
-            bandwidth_per_mb: 0.01,
+            wall_time_per_second: default_wall_time_per_second(),
+            cpu_per_second: 0.0,
+            storage_per_mb_hour: 0.0,
+            bandwidth_per_mb: 0.0,
             base_fee: 1,
         }
     }
@@ -36,11 +55,13 @@ impl Default for ResourcePricing {
 /// Estimated cost of a task.
 #[derive(Clone, Debug)]
 pub struct CostEstimate {
-    /// CPU cost component.
+    /// Wall-clock time cost component.
+    pub wall_time_cost: f64,
+    /// Experimental CPU cost component, currently not charged by estimates.
     pub cpu_cost: f64,
-    /// Storage cost component.
+    /// Experimental storage cost component, currently not charged by estimates.
     pub storage_cost: f64,
-    /// Bandwidth cost component.
+    /// Experimental bandwidth cost component, currently not charged by estimates.
     pub bandwidth_cost: f64,
     /// Base fee.
     pub base_fee: u64,
@@ -51,22 +72,25 @@ pub struct CostEstimate {
 impl ResourcePricing {
     /// Estimate the cost of executing a task.
     ///
-    /// `cpu_seconds` — estimated CPU time.
-    /// `storage_mb_hours` — estimated storage usage.
-    /// `bandwidth_mb` — estimated egress.
+    /// `wall_time_seconds` — estimated wall-clock time.
+    /// `_storage_mb_hours` and `_bandwidth_mb` are accepted for API
+    /// compatibility but are not charged until the runtime records those
+    /// dimensions with verifiable measurements.
     pub fn estimate(
         &self,
-        cpu_seconds: f64,
-        storage_mb_hours: f64,
-        bandwidth_mb: f64,
+        wall_time_seconds: f64,
+        _storage_mb_hours: f64,
+        _bandwidth_mb: f64,
     ) -> CostEstimate {
-        let cpu_cost = self.cpu_per_second * cpu_seconds;
-        let storage_cost = self.storage_per_mb_hour * storage_mb_hours;
-        let bandwidth_cost = self.bandwidth_per_mb * bandwidth_mb;
+        let wall_time_cost = self.wall_time_per_second * wall_time_seconds.max(0.0);
+        let cpu_cost = 0.0;
+        let storage_cost = 0.0;
+        let bandwidth_cost = 0.0;
 
-        let total = (cpu_cost + storage_cost + bandwidth_cost).ceil() as u64 + self.base_fee;
+        let total = wall_time_cost.ceil() as u64 + self.base_fee;
 
         CostEstimate {
+            wall_time_cost,
             cpu_cost,
             storage_cost,
             bandwidth_cost,
@@ -94,7 +118,10 @@ mod tests {
         let pricing = ResourcePricing::default();
         let est = pricing.estimate(10.0, 100.0, 5.0);
         assert!(est.total > 0);
-        assert!(est.cpu_cost > 0.0);
+        assert!(est.wall_time_cost > 0.0);
+        assert_eq!(est.cpu_cost, 0.0);
+        assert_eq!(est.storage_cost, 0.0);
+        assert_eq!(est.bandwidth_cost, 0.0);
     }
 
     #[test]
@@ -110,5 +137,22 @@ mod tests {
         let pricing = ResourcePricing::default();
         let est = pricing.estimate(0.0, 0.0, 0.0);
         assert_eq!(est.total, pricing.base_fee);
+    }
+
+    #[test]
+    fn unmeasured_dimensions_do_not_drive_price() {
+        let pricing = ResourcePricing {
+            wall_time_per_second: 0.0,
+            cpu_per_second: 99.0,
+            storage_per_mb_hour: 99.0,
+            bandwidth_per_mb: 99.0,
+            base_fee: 2,
+        };
+
+        let est = pricing.estimate(0.0, 10_000.0, 10_000.0);
+        assert_eq!(est.total, 2);
+        assert_eq!(est.cpu_cost, 0.0);
+        assert_eq!(est.storage_cost, 0.0);
+        assert_eq!(est.bandwidth_cost, 0.0);
     }
 }

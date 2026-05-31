@@ -129,6 +129,7 @@ impl SocialEventLog {
     pub fn rebuild_index(&mut self) -> Result<(), SocialProtocolError> {
         self.index.clear();
         for (position, event) in self.events.iter().enumerate() {
+            event.validate()?;
             if let Some(existing) = self.index.insert(event.id.clone(), position) {
                 let existing_payload = self.events[existing].signing_payload()?;
                 let event_payload = event.signing_payload()?;
@@ -204,21 +205,38 @@ mod tests {
     fn log_rejects_duplicate_id_with_different_payload() {
         let alice = NodeIdentity::generate();
         let bob = NodeIdentity::generate();
-        let mut first = signed_relation(&alice, &bob, 1);
+        let first = signed_relation(&alice, &bob, 1);
         let mut second = signed_relation(&alice, &bob, 2);
         second.id = first.id.clone();
-        second = second.sign(&alice).unwrap();
 
         let mut log = SocialEventLog::new();
         assert!(log.append(first.clone()).unwrap());
         let err = log.append(second).unwrap_err();
-        assert!(matches!(
-            err,
-            SocialProtocolError::DuplicateEventConflict { .. }
-        ));
+        assert!(matches!(err, SocialProtocolError::EventIdMismatch { .. }));
+    }
 
+    #[test]
+    fn content_hash_id_changes_when_payload_changes() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = signed_relation(&alice, &bob, 1);
+        let second = signed_relation(&alice, &bob, 2);
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.id, first.content_id().unwrap());
+        assert_eq!(second.id, second.content_id().unwrap());
+    }
+
+    #[test]
+    fn tampering_with_signed_content_invalidates_id_and_signature() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let mut first = signed_relation(&alice, &bob, 1);
         first.timestamp = 99;
-        assert!(first.verify_signature().is_err());
+        assert!(matches!(
+            first.verify_signature().unwrap_err(),
+            SocialProtocolError::EventIdMismatch { .. }
+        ));
     }
 
     #[test]
