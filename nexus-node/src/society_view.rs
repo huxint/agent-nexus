@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use nexus_agent::{
-    task_result_claim_id, AgentIntent, CapabilityGrant, Collective, CollectiveProposal,
-    CollectiveVote, ExecutionAttestation, ExecutionReceipt, GovernanceSignal, IntentRecommendation,
-    IntentResponse, Interaction, ProviderRecommendation, ReputationScore, SettlementRecord,
-    SocialEdge, SocialMemory, Task, TaskClaimJudgment, TaskResult, WorkspaceRun,
-    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
+    capability_signature_id, task_result_claim_id, AgentIntent, CapabilityGrant,
+    CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
+    ExecutionReceipt, GovernanceSignal, IntentRecommendation, IntentResponse, Interaction,
+    ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge, SocialMemory, Task,
+    TaskClaimJudgment, TaskResult, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
+    WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -184,7 +185,7 @@ pub(crate) fn society_json_for_base(
                 "capability_grants": society
                     .workspace_capability_grants(&workspace)
                     .into_iter()
-                    .map(capability_grant_json)
+                    .map(|grant| capability_grant_json(society, grant))
                     .collect::<Vec<_>>(),
                 "snapshots": society
                     .workspace_snapshots(&workspace)
@@ -218,7 +219,7 @@ pub(crate) fn society_json_for_base(
         .capability_grants()
         .into_iter()
         .filter(|grant| capability_grant_matches_filters(society, grant, &options))
-        .map(capability_grant_json)
+        .map(|grant| capability_grant_json(society, grant))
         .collect::<Vec<_>>();
     let collectives = society
         .collectives()
@@ -890,11 +891,16 @@ fn task_uses_workspace(
             .any(|receipt| receipt.workspace.as_ref() == Some(workspace))
 }
 
-fn capability_grant_json(grant: &CapabilityGrant) -> serde_json::Value {
+fn capability_grant_json(
+    society: &nexus_agent::Society,
+    grant: &CapabilityGrant,
+) -> serde_json::Value {
+    let revocation = society.capability_revocation(grant);
     serde_json::json!({
         "issuer": grant.capability.issuer.to_string(),
         "subject": grant.capability.subject.to_string(),
         "workspace": grant.capability.workspace.to_string(),
+        "capability_signature_id": capability_signature_id(&grant.capability.signature),
         "permissions": {
             "read": grant.capability.permissions.read,
             "write": grant.capability.permissions.write,
@@ -903,7 +909,18 @@ fn capability_grant_json(grant: &CapabilityGrant) -> serde_json::Value {
         },
         "expires_at": grant.capability.expires_at,
         "issued_at": grant.issued_at,
+        "revoked": revocation.is_some(),
+        "revocation": revocation.map(capability_revocation_json),
         "note": grant.note,
+    })
+}
+
+fn capability_revocation_json(revocation: &CapabilityRevocation) -> serde_json::Value {
+    serde_json::json!({
+        "issuer": revocation.issuer.to_string(),
+        "capability_signature_id": revocation.capability_signature_id,
+        "reason": revocation.reason,
+        "revoked_at": revocation.revoked_at,
     })
 }
 
