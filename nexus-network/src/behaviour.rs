@@ -7,6 +7,7 @@ use libp2p::{
 };
 use libp2p_swarm::behaviour::toggle::Toggle;
 use libp2p_swarm::NetworkBehaviour as NetworkBehaviourDerive;
+use std::num::NonZeroUsize;
 
 use nexus_sync::client::SyncClient;
 use nexus_sync::codec::SyncCodec;
@@ -99,8 +100,17 @@ impl CompositeBehaviour {
         gossipsub_keypair: libp2p::identity::Keypair,
         enable_mdns: bool,
     ) -> Result<Self, String> {
-        let kademlia =
-            kad::Behaviour::new(local_peer_id, kad::store::MemoryStore::new(local_peer_id));
+        let mut kademlia_config = kad::Config::new(
+            StreamProtocol::try_from_owned("/ipfs/kad/1.0.0".to_string())
+                .map_err(|err| format!("kad protocol: {err}"))?,
+        );
+        kademlia_config.disjoint_query_paths(true);
+        kademlia_config.set_parallelism(NonZeroUsize::new(3).expect("non-zero"));
+        let kademlia = kad::Behaviour::with_config(
+            local_peer_id,
+            kad::store::MemoryStore::new(local_peer_id),
+            kademlia_config,
+        );
         let mdns = if enable_mdns {
             match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
                 Ok(behaviour) => Some(behaviour),

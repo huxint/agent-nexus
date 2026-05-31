@@ -994,7 +994,8 @@ async fn refresh_online_discovery(
     let mut events = network.clone();
     let mut contacted = std::collections::HashSet::new();
     let mut inserted = 0;
-    let stop_after_first_match = workspace_filter.is_some() || peer_filter.is_some();
+    let allow_early_stop = workspace_filter.is_some() || peer_filter.is_some();
+    let min_contacted_peers_for_early_stop = if peer_filter.is_some() { 1 } else { 2 };
     let discovery_key = workspace_filter
         .as_ref()
         .map(workspace_discovery_key)
@@ -1044,7 +1045,12 @@ async fn refresh_online_discovery(
                                 base,
                             )
                             .await;
-                            if inserted > 0 && stop_after_first_match {
+                            if should_stop_discovery(
+                                inserted,
+                                contacted.len(),
+                                allow_early_stop,
+                                min_contacted_peers_for_early_stop,
+                            ) {
                                 break;
                             }
                         }
@@ -1053,7 +1059,12 @@ async fn refresh_online_discovery(
                         match record_workspace_announcement_bytes(base, source, &data) {
                             Ok(true) => {
                                 inserted += 1;
-                                if stop_after_first_match {
+                                if should_stop_discovery(
+                                    inserted,
+                                    contacted.len(),
+                                    allow_early_stop,
+                                    min_contacted_peers_for_early_stop,
+                                ) {
                                     break;
                                 }
                             }
@@ -1072,6 +1083,15 @@ async fn refresh_online_discovery(
     }
 
     Ok(inserted)
+}
+
+fn should_stop_discovery(
+    inserted: usize,
+    contacted_peers: usize,
+    allow_early_stop: bool,
+    min_contacted_peers_for_early_stop: usize,
+) -> bool {
+    allow_early_stop && inserted > 0 && contacted_peers >= min_contacted_peers_for_early_stop
 }
 
 async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -4624,6 +4644,77 @@ mod tests {
         ])
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn discovery_only_stops_early_after_multiple_contacted_peers() {
+        assert!(!should_stop_discovery(1, 0, true, 2));
+        assert!(!should_stop_discovery(1, 1, true, 2));
+        assert!(should_stop_discovery(1, 2, true, 2));
+        assert!(!should_stop_discovery(1, 1, false, 2));
+        assert!(!should_stop_discovery(0, 3, true, 2));
+    }
+
+    #[tokio::test]
+    async fn discover_clone_source_prefers_cached_good_peer_over_newer_announcement() {
+        let temp = TempDir::new().unwrap();
+        let workspace_owner = load_or_create_identity(temp.path()).unwrap();
+        let mut workspace = Workspace::create(
+            &workspace_owner,
+            temp.path(),
+            WorkspaceConfig {
+                name: "cached-source".into(),
+                description: "clone discovery prefers known-good peers".into(),
+            },
+        )
+        .await
+        .unwrap();
+        workspace.snapshot().await.unwrap();
+        let workspace_id = workspace.id();
+
+        let cached_identity = NodeIdentity::generate();
+        let cached_peer = nexus_network::to_peer_id(&cached_identity);
+        let cached_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/udp/4801/quic-v1".parse().unwrap();
+        let cached_announcement = workspace_announcement(
+            &cached_identity,
+            cached_peer,
+            vec![cached_addr.clone()],
+            &workspace,
+            10,
+        )
+        .unwrap();
+        assert!(record_workspace_announcement(temp.path(), cached_announcement).unwrap());
+        upsert_peer_cache(
+            temp.path(),
+            &cached_peer.to_string(),
+            &[cached_addr.to_string()],
+            11,
+            Some(12),
+            None,
+        )
+        .unwrap();
+
+        let newer_identity = NodeIdentity::generate();
+        let newer_peer = nexus_network::to_peer_id(&newer_identity);
+        let newer_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/udp/4802/quic-v1".parse().unwrap();
+        let newer_announcement = workspace_announcement(
+            &newer_identity,
+            newer_peer,
+            vec![newer_addr.clone()],
+            &workspace,
+            20,
+        )
+        .unwrap();
+        assert!(record_workspace_announcement(temp.path(), newer_announcement).unwrap());
+
+        let source = discover_clone_source(temp.path(), &workspace_id, None)
+            .unwrap()
+            .expect("cached peer should be selected first");
+        assert_eq!(source.peer, cached_peer);
+        assert_eq!(
+            source.addrs,
+            vec![cached_addr.with(libp2p::multiaddr::Protocol::P2p(cached_peer))]
+        );
     }
 
     #[tokio::test]

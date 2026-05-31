@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -6,6 +8,7 @@ use nexus_core::{Did, WorkspaceId};
 use nexus_crypto::{verify_did_signature, NodeIdentity};
 use nexus_storage::Cid;
 
+use crate::bootstrap::{load_peer_cache, PeerCacheEntry};
 use crate::ids::{parse_cid, parse_workspace_id};
 use crate::state::write_file_atomic;
 
@@ -431,6 +434,15 @@ pub fn discover_clone_source(
     workspace_id: &WorkspaceId,
     preferred_peer: Option<&libp2p::PeerId>,
 ) -> Result<Option<DiscoveredCloneSource>, Box<dyn std::error::Error>> {
+    let peer_cache = load_peer_cache(base)
+        .unwrap_or_else(|err| {
+            tracing::warn!("failed to read peer cache for clone discovery: {err}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|entry| (entry.peer.clone(), entry))
+        .collect::<HashMap<_, _>>();
+
     let mut announcements = load_workspace_discovery(base)?
         .into_iter()
         .filter(|announcement| announcement.workspace == workspace_id.to_string())
@@ -443,8 +455,8 @@ pub fn discover_clone_source(
         .collect::<Vec<_>>();
 
     announcements.sort_by(|a, b| {
-        b.timestamp
-            .cmp(&a.timestamp)
+        clone_source_priority(a, peer_cache.get(&a.peer))
+            .cmp(&clone_source_priority(b, peer_cache.get(&b.peer)))
             .then_with(|| a.peer.cmp(&b.peer))
     });
 
@@ -464,6 +476,31 @@ pub fn discover_clone_source(
     }
 
     Ok(None)
+}
+
+fn clone_source_priority(
+    announcement: &WorkspaceAnnouncement,
+    cache: Option<&PeerCacheEntry>,
+) -> (u8, u32, Reverse<u64>, Reverse<u64>, Reverse<u64>, String) {
+    let cache_rank = match cache {
+        Some(entry) if entry.last_connected.is_some() && entry.failures == 0 => 0,
+        Some(entry) if entry.last_connected.is_some() => 1,
+        Some(entry) if entry.failures == 0 => 2,
+        Some(_) => 3,
+        None => 4,
+    };
+    let failure_rank = cache.map(|entry| entry.failures).unwrap_or(u32::MAX);
+    let last_connected_rank = Reverse(cache.and_then(|entry| entry.last_connected).unwrap_or(0));
+    let last_seen_rank = Reverse(cache.map(|entry| entry.last_seen).unwrap_or(0));
+    let timestamp_rank = Reverse(announcement.timestamp);
+    (
+        cache_rank,
+        failure_rank,
+        last_connected_rank,
+        last_seen_rank,
+        timestamp_rank,
+        announcement.peer.clone(),
+    )
 }
 
 fn push_unique_addr(addrs: &mut Vec<libp2p::Multiaddr>, addr: libp2p::Multiaddr) {
