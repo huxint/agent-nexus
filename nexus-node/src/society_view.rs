@@ -19,6 +19,13 @@ pub(crate) fn print_society_text(base: &Path, memory: &SocialMemory) {
     let society = memory.society();
     println!("AI Society: {}", base.display());
     println!("events: {}", memory.event_count());
+    if memory.compacted_event_count() > 0 {
+        println!(
+            "events_retained: {} compacted: {}",
+            memory.retained_event_count(),
+            memory.compacted_event_count()
+        );
+    }
     println!("agents: {}", society.agent_count());
     println!("manifests: {}", society.manifest_count());
     println!("interactions: {}", society.interaction_count());
@@ -477,6 +484,8 @@ pub(crate) fn society_json_for_base(
 
     serde_json::json!({
         "events": memory.event_count(),
+        "events_retained": memory.retained_event_count(),
+        "events_compacted": memory.compacted_event_count(),
         "policies": society_policies_json(),
         "agents": agents,
         "identity_rotations": society

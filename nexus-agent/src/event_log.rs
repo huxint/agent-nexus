@@ -13,6 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::{IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRotation, Society};
 
+const SOCIAL_EVENT_LOG_COMPACTED_BASE_VERSION: u16 = 1;
+
 /// Accepted clock skew for signed social events.
 ///
 /// Social timestamps are author-provided metadata, not ordering authority, but
@@ -38,6 +40,8 @@ fn identity_recovery_approval_key(approval: &IdentityRecoveryApproval) -> String
 /// Append-only set of signed social events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SocialEventLog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compacted_base: Option<CompactedEventLogBase>,
     events: Vec<SocialEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     observed_at: Vec<u64>,
@@ -65,6 +69,123 @@ pub struct SocialEventLog {
     equivocation_index: HashSet<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactedEventLogBase {
+    version: u16,
+    event_count: usize,
+    equivocation_proof_count: usize,
+    last_observed_at: Option<u64>,
+    society_cbor_hex: String,
+    heads: Vec<CompactedAuthorHead>,
+    rotations: Vec<CompactedIdentityRotation>,
+    recovery_policies: Vec<IdentityRecoveryPolicy>,
+    recovery_approvals: Vec<IdentityRecoveryApproval>,
+    equivocation_proof_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompactedAuthorHead {
+    author: Did,
+    seq: u64,
+    id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompactedIdentityRotation {
+    previous: Did,
+    next: Did,
+}
+
+impl CompactedEventLogBase {
+    fn from_log_state(
+        log: &SocialEventLog,
+        society: &Society,
+        event_count: usize,
+        equivocation_proof_count: usize,
+    ) -> Self {
+        let mut heads = log
+            .heads
+            .iter()
+            .map(|(author, (seq, id))| CompactedAuthorHead {
+                author: author.clone(),
+                seq: *seq,
+                id: id.clone(),
+            })
+            .collect::<Vec<_>>();
+        heads.sort_by(|a, b| a.author.to_string().cmp(&b.author.to_string()));
+
+        let mut rotations = log
+            .rotations
+            .iter()
+            .map(|(previous, next)| CompactedIdentityRotation {
+                previous: previous.clone(),
+                next: next.clone(),
+            })
+            .collect::<Vec<_>>();
+        rotations.sort_by(|a, b| a.previous.to_string().cmp(&b.previous.to_string()));
+
+        let mut recovery_policies = log.recovery_policies.values().cloned().collect::<Vec<_>>();
+        recovery_policies.sort_by(|a, b| a.identity.to_string().cmp(&b.identity.to_string()));
+
+        let mut recovery_approvals = log.recovery_approvals.values().cloned().collect::<Vec<_>>();
+        recovery_approvals.sort_by_key(identity_recovery_approval_key);
+
+        let mut equivocation_proof_keys =
+            log.equivocation_index.iter().cloned().collect::<Vec<_>>();
+        equivocation_proof_keys.sort();
+
+        Self {
+            version: SOCIAL_EVENT_LOG_COMPACTED_BASE_VERSION,
+            event_count,
+            equivocation_proof_count,
+            last_observed_at: log.observed_at.iter().copied().max(),
+            society_cbor_hex: society_cbor_hex(society),
+            heads,
+            rotations,
+            recovery_policies,
+            recovery_approvals,
+            equivocation_proof_keys,
+        }
+    }
+
+    fn normalize(&mut self) -> Result<(), SocialProtocolError> {
+        if self.version != SOCIAL_EVENT_LOG_COMPACTED_BASE_VERSION {
+            return Err(SocialProtocolError::InvalidCompactedLog {
+                reason: format!("unsupported compacted base version {}", self.version),
+            });
+        }
+        if self.society_cbor_hex.is_empty() || self.society().is_none() {
+            return Err(SocialProtocolError::InvalidCompactedLog {
+                reason: "compacted base society snapshot is invalid".into(),
+            });
+        }
+
+        self.heads
+            .sort_by(|a, b| a.author.to_string().cmp(&b.author.to_string()));
+        self.heads.dedup_by(|a, b| a.author == b.author);
+        self.rotations
+            .sort_by(|a, b| a.previous.to_string().cmp(&b.previous.to_string()));
+        self.rotations.dedup_by(|a, b| a.previous == b.previous);
+        self.recovery_policies
+            .sort_by(|a, b| a.identity.to_string().cmp(&b.identity.to_string()));
+        self.recovery_policies
+            .dedup_by(|a, b| a.identity == b.identity);
+        self.recovery_approvals
+            .sort_by_key(identity_recovery_approval_key);
+        self.recovery_approvals.dedup_by(|a, b| {
+            identity_recovery_approval_key(a) == identity_recovery_approval_key(b)
+        });
+        self.equivocation_proof_keys.sort();
+        self.equivocation_proof_keys.dedup();
+        Ok(())
+    }
+
+    fn society(&self) -> Option<Society> {
+        let bytes = hex::decode(&self.society_cbor_hex).ok()?;
+        ciborium::from_reader::<Society, _>(bytes.as_slice()).ok()
+    }
+}
+
 impl<'de> Deserialize<'de> for SocialEventLog {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -72,6 +193,8 @@ impl<'de> Deserialize<'de> for SocialEventLog {
     {
         #[derive(Deserialize)]
         struct StoredLog {
+            #[serde(default)]
+            compacted_base: Option<CompactedEventLogBase>,
             events: Vec<SocialEvent>,
             #[serde(default)]
             observed_at: Vec<u64>,
@@ -85,6 +208,7 @@ impl<'de> Deserialize<'de> for SocialEventLog {
 
         let stored = StoredLog::deserialize(deserializer)?;
         Self::from_parts(
+            stored.compacted_base,
             stored
                 .events
                 .into_iter()
@@ -112,6 +236,7 @@ impl SocialEventLog {
     ) -> Result<Self, SocialProtocolError> {
         let now = unix_now();
         Self::from_parts(
+            None,
             events.into_iter().map(|event| (event, now)),
             std::iter::empty(),
             std::iter::empty(),
@@ -119,11 +244,13 @@ impl SocialEventLog {
     }
 
     fn from_parts(
+        compacted_base: Option<CompactedEventLogBase>,
         events: impl IntoIterator<Item = (SocialEvent, u64)>,
         pending: impl IntoIterator<Item = (SocialEvent, u64)>,
         equivocation_proofs: impl IntoIterator<Item = EquivocationProof>,
     ) -> Result<Self, SocialProtocolError> {
         let mut log = Self::new();
+        log.install_compacted_base(compacted_base)?;
         for (event, observed_at) in events {
             log.append_observed(event, observed_at)?;
         }
@@ -137,11 +264,22 @@ impl SocialEventLog {
     }
 
     pub fn len(&self) -> usize {
+        self.compacted_event_count() + self.events.len()
+    }
+
+    pub fn retained_len(&self) -> usize {
         self.events.len()
     }
 
+    pub fn compacted_event_count(&self) -> usize {
+        self.compacted_base
+            .as_ref()
+            .map(|base| base.event_count)
+            .unwrap_or(0)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.len() == 0
     }
 
     pub fn events(&self) -> &[SocialEvent] {
@@ -158,6 +296,59 @@ impl SocialEventLog {
 
     pub fn equivocation_proofs(&self) -> &[EquivocationProof] {
         &self.equivocation_proofs
+    }
+
+    pub fn compacted_base(&self) -> Option<&CompactedEventLogBase> {
+        self.compacted_base.as_ref()
+    }
+
+    pub fn compact_retaining_recent(
+        &mut self,
+        retain_events: usize,
+    ) -> Result<bool, SocialProtocolError> {
+        if self.events.len() <= retain_events {
+            return Ok(false);
+        }
+        if !self.pending.is_empty() {
+            return Err(SocialProtocolError::InvalidCompactedLog {
+                reason: "cannot compact while author-chain gaps are pending".into(),
+            });
+        }
+
+        let retained_start = self.events.len().saturating_sub(retain_events);
+        let prefix_events = self.events[..retained_start].to_vec();
+        let prefix_observed_at = self.observed_at[..retained_start].to_vec();
+        let retained_events = self.events[retained_start..].to_vec();
+        let retained_observed_at = self.observed_at[retained_start..].to_vec();
+        let base_event_count = self.compacted_event_count().saturating_add(retained_start);
+        let base_proof_count = self
+            .compacted_base
+            .as_ref()
+            .map(|base| base.equivocation_proof_count)
+            .unwrap_or(0)
+            .saturating_add(self.equivocation_proofs.len());
+        let mut base_log = Self::new();
+        base_log.install_compacted_base(self.compacted_base.clone())?;
+        for (event, observed_at) in prefix_events.into_iter().zip(prefix_observed_at) {
+            base_log.append_observed(event, observed_at)?;
+        }
+        for proof in self.equivocation_proofs.clone() {
+            base_log.record_equivocation(proof)?;
+        }
+        let society = base_log.to_society();
+        let compacted_base = CompactedEventLogBase::from_log_state(
+            &base_log,
+            &society,
+            base_event_count,
+            base_proof_count,
+        );
+
+        self.compacted_base = Some(compacted_base);
+        self.events = retained_events;
+        self.observed_at = retained_observed_at;
+        self.equivocation_proofs.clear();
+        self.rebuild_index()?;
+        Ok(true)
     }
 
     pub fn contains(&self, event_id: &str) -> bool {
@@ -360,6 +551,37 @@ impl SocialEventLog {
         Ok(true)
     }
 
+    fn install_compacted_base(
+        &mut self,
+        compacted_base: Option<CompactedEventLogBase>,
+    ) -> Result<(), SocialProtocolError> {
+        let Some(mut base) = compacted_base else {
+            return Ok(());
+        };
+        base.normalize()?;
+        for head in &base.heads {
+            self.heads
+                .insert(head.author.clone(), (head.seq, head.id.clone()));
+        }
+        for rotation in &base.rotations {
+            self.rotations
+                .insert(rotation.previous.clone(), rotation.next.clone());
+        }
+        for policy in &base.recovery_policies {
+            self.recovery_policies
+                .insert(policy.identity.clone(), policy.clone());
+        }
+        for approval in &base.recovery_approvals {
+            self.recovery_approvals
+                .insert(identity_recovery_approval_key(approval), approval.clone());
+        }
+        for key in &base.equivocation_proof_keys {
+            self.equivocation_index.insert(key.clone());
+        }
+        self.compacted_base = Some(base);
+        Ok(())
+    }
+
     /// Replay events in deterministic causal order into a society graph.
     ///
     /// Each author chain is ordered by `seq`/`prev`; author-provided
@@ -367,6 +589,11 @@ impl SocialEventLog {
     /// ties use the content hash id and DID so independently merged logs
     /// converge without trusting one author's clock.
     pub fn replay_into(&self, society: &mut Society) {
+        if let Some(base) = &self.compacted_base {
+            if let Some(base_society) = base.society() {
+                *society = base_society;
+            }
+        }
         self.replay_from(society, 0, 0);
     }
 
@@ -411,6 +638,7 @@ impl SocialEventLog {
 
     /// Rebuild the transient index after deserialization.
     pub fn rebuild_index(&mut self) -> Result<(), SocialProtocolError> {
+        let compacted_base = self.compacted_base.take();
         self.index.clear();
         self.pending_index.clear();
         self.seq_index.clear();
@@ -429,7 +657,7 @@ impl SocialEventLog {
                 &mut self.pending_observed_at,
             )));
         let proofs = std::mem::take(&mut self.equivocation_proofs);
-        *self = Self::from_parts(events, pending, proofs)?;
+        *self = Self::from_parts(compacted_base, events, pending, proofs)?;
         Ok(())
     }
 
@@ -558,6 +786,14 @@ fn fill_observed_times(observed_at: Vec<u64>) -> impl Iterator<Item = u64> {
 
 fn event_replay_key(event: &SocialEvent) -> (u64, &str, String) {
     (event.seq, event.id.as_str(), event.author.to_string())
+}
+
+fn society_cbor_hex(society: &Society) -> String {
+    let mut bytes = Vec::new();
+    if ciborium::into_writer(society, &mut bytes).is_err() {
+        return String::new();
+    }
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
@@ -1039,5 +1275,75 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(!decoded.append(event).unwrap());
         assert_eq!(decoded.len(), 1);
+    }
+
+    #[test]
+    fn compacted_log_replays_base_state_and_allows_chain_continuation() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let first = SocialEvent::new_chained(
+            alice.did().clone(),
+            0,
+            None,
+            1,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([31; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let second = SocialEvent::new_chained(
+            alice.did().clone(),
+            1,
+            Some(first.id.clone()),
+            2,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Collaborator,
+                note: Some("before compaction".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let third = SocialEvent::new_chained(
+            alice.did().clone(),
+            2,
+            Some(second.id.clone()),
+            3,
+            SocialEventKind::RelationDeclared {
+                peer: bob.did().clone(),
+                relation: RelationKind::Blocked,
+                note: Some("retained tail".into()),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        let mut log = SocialEventLog::new();
+        assert_eq!(log.merge([first, second, third]).unwrap(), 3);
+
+        assert!(log.compact_retaining_recent(1).unwrap());
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.retained_len(), 1);
+        assert_eq!(log.compacted_event_count(), 2);
+        assert!(log.compacted_base().is_some());
+        assert_eq!(
+            log.to_society().edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Blocked
+        );
+        assert_eq!(log.next_position(alice.did()).0, 3);
+
+        let next = SocialEvent::new_chained(
+            alice.did().clone(),
+            3,
+            log.next_position(alice.did()).1,
+            4,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([32; 32]),
+            },
+        )
+        .sign(&alice)
+        .unwrap();
+        assert!(log.append(next).unwrap());
+        assert_eq!(log.len(), 4);
     }
 }

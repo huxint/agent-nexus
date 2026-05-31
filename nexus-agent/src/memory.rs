@@ -134,6 +134,14 @@ impl SocialMemory {
         self.log.len()
     }
 
+    pub fn retained_event_count(&self) -> usize {
+        self.log.retained_len()
+    }
+
+    pub fn compacted_event_count(&self) -> usize {
+        self.log.compacted_event_count()
+    }
+
     pub fn agent_count(&self) -> usize {
         self.society.agent_count()
     }
@@ -199,6 +207,18 @@ impl SocialMemory {
         reject_oversized_event_json(data)?;
         let event = SocialEvent::from_json(data).map_err(SocialProtocolError::EventDecode)?;
         self.ingest_event(event)
+    }
+
+    pub fn compact_retaining_recent(
+        &mut self,
+        retain_events: usize,
+    ) -> Result<bool, SocialProtocolError> {
+        let compacted = self.log.compact_retaining_recent(retain_events)?;
+        if compacted {
+            self.society = self.log.to_society();
+            self.checkpoint = Some(checkpoint_for(&self.log, &self.society));
+        }
+        Ok(compacted)
     }
 }
 
@@ -511,5 +531,60 @@ mod tests {
         assert_eq!(memory.event_count(), 2);
         assert!(memory.society().has_agent(alice.did()));
         assert!(memory.society().has_agent(bob.did()));
+    }
+
+    #[test]
+    fn memory_compaction_retains_log_tail_and_checkpointed_society() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let mut memory = SocialMemory::new();
+        let events = memory
+            .sign_event_sequence(
+                &alice,
+                [
+                    (
+                        1,
+                        SocialEventKind::WorkspaceJoined {
+                            workspace: WorkspaceId::from_bytes([41; 32]),
+                        },
+                    ),
+                    (
+                        2,
+                        SocialEventKind::RelationDeclared {
+                            peer: bob.did().clone(),
+                            relation: RelationKind::Collaborator,
+                            note: Some("compacted prefix".into()),
+                        },
+                    ),
+                    (
+                        3,
+                        SocialEventKind::RelationDeclared {
+                            peer: bob.did().clone(),
+                            relation: RelationKind::Blocked,
+                            note: Some("retained tail".into()),
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(memory.ingest_events(events).unwrap(), 3);
+
+        assert!(memory.compact_retaining_recent(1).unwrap());
+        assert_eq!(memory.event_count(), 3);
+        assert_eq!(memory.retained_event_count(), 1);
+        assert_eq!(memory.compacted_event_count(), 2);
+        assert_eq!(
+            memory.society().edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Blocked
+        );
+
+        let json = serde_json::to_vec(&memory).unwrap();
+        let decoded: SocialMemory = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.event_count(), 3);
+        assert_eq!(decoded.retained_event_count(), 1);
+        assert_eq!(
+            decoded.society().edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Blocked
+        );
     }
 }
