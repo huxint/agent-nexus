@@ -11,7 +11,7 @@ use nexus_core::{Capability, Did, WorkspaceId};
 use nexus_economy::{
     AuthorityAnchor, AuthorityKind, ReputationScore, SettlementError, SettlementProof,
 };
-use nexus_runtime::ResourceUsage;
+use nexus_runtime::{ExecIsolation, ResourceUsage};
 use nexus_storage::Cid;
 use serde::{Deserialize, Serialize};
 
@@ -735,6 +735,8 @@ pub struct WorkspaceRunContext {
     pub stdin: Option<WorkspaceRunStdin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
 }
 
 impl WorkspaceRunContext {
@@ -743,6 +745,13 @@ impl WorkspaceRunContext {
             && self.env_keys.is_empty()
             && self.stdin.is_none()
             && self.timeout_ms.is_none()
+            && self.isolation.is_none()
+    }
+}
+
+impl WorkspaceRunContext {
+    pub fn isolation_from_exec_options(isolation: ExecIsolation) -> Option<String> {
+        (isolation != ExecIsolation::Native).then(|| isolation.as_str().to_string())
     }
 }
 
@@ -4492,6 +4501,7 @@ mod tests {
                             cid: nexus_storage::Cid::hash_of(b"{}"),
                         }),
                         timeout_ms: Some(30_000),
+                        isolation: Some("bubblewrap".into()),
                     }),
                     failure: None,
                     started_at: 1,
