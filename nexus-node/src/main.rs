@@ -34,10 +34,11 @@ use local_state::*;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal, CollectiveVote,
-    CollectiveVoteChoice, ExecutionReceipt, IntentActionKind, IntentActionPlan, IntentKind,
-    IntentResponse, IntentResponseKind, Interaction, InteractionOutcome, RelationKind,
-    SettlementRecord, SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceRun,
-    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    CollectiveVoteChoice, ExecutionAttestation, ExecutionReceipt, IntentActionKind,
+    IntentActionPlan, IntentKind, IntentResponse, IntentResponseKind, Interaction,
+    InteractionOutcome, RelationKind, SettlementRecord, SocialEvent, SocialEventKind, SocialMemory,
+    TaskDispute, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
+    WorkspaceSnapshot,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -126,6 +127,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event task-accept --base <DIR> --task <ID> --bidder <DID> --price <N>");
     eprintln!("  {prog} event task-cancel --base <DIR> --task <ID> --reason <TEXT>");
     eprintln!("  {prog} event task-complete --base <DIR> --task <ID> (--success|--failure) [--exit-code <N>] [--stdout <TEXT>] [--stderr <TEXT>] [--actual-cost <N>] [--error <TEXT>] [--receipt --command <CMD> [--arg <ARG>...] [--workspace <HEX>] [--output-root <CID_HEX>] [--started-at <TS>] [--finished-at <TS>]]");
+    eprintln!("  {prog} event task-attest --base <DIR> --task <ID> --executor <DID> --receipt-signature <HEX> [--stdout <TEXT>|--stdout-cid <CID_HEX>] [--stderr <TEXT>|--stderr-cid <CID_HEX>] [--output-root <CID_HEX>] [--observed-at <TS>]");
     eprintln!("  {prog} event task-dispute --base <DIR> --task <ID> --target <DID> --reason <TEXT> [--claim <CLAIM_ID>] [--evidence <TEXT>]");
     eprintln!("  {prog} event settlement --base <DIR> --payee <DID> --amount <N> [--task <ID>] [--claim <CLAIM_ID>] [--id <ID>] [--proof sovereign]");
     eprintln!("  {prog} demo");
@@ -1554,7 +1556,7 @@ fn workspace_run_context_from_exec_options(options: &ExecOptions) -> Option<Work
 fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
         return Err(
-            "event subcommand required: manifest, intent, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-dispute, or settlement"
+            "event subcommand required: manifest, intent, workspace-join, workspace-snapshot, workspace-run, capability, collective, collective-join, collective-workspace, collective-proposal, collective-vote, collective-decision, relation, interaction, task-publish, task-offer, task-accept, task-cancel, task-complete, task-attest, task-dispute, or settlement"
                 .into(),
         );
     }
@@ -1584,6 +1586,7 @@ fn cmd_event(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "task-accept" | "task-accepted" | "accept" => cmd_event_task_accept(args),
         "task-cancel" | "task-cancelled" | "cancel" => cmd_event_task_cancel(args),
         "task-complete" => cmd_event_task_complete(args),
+        "task-attest" | "task-execution-attest" | "attest" => cmd_event_task_attest(args),
         "task-dispute" | "dispute" => cmd_event_task_dispute(args),
         "settlement" | "settle" => cmd_event_settlement(args),
         other => Err(format!("unknown event subcommand: {other}").into()),
@@ -3005,8 +3008,96 @@ fn cmd_event_task_complete(args: &[String]) -> Result<(), Box<dyn std::error::Er
                     actual_cost: actual_cost.unwrap_or(0),
                     error,
                     receipt,
+                    attestations: Vec::new(),
                 },
             })
+        },
+        now,
+    )?;
+    println!("{}", event_summary(&event));
+    Ok(())
+}
+
+fn cmd_event_task_attest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut task_id = None;
+    let mut executor = None;
+    let mut receipt_signature_hex = None;
+    let mut stdout_cid = None;
+    let mut stderr_cid = None;
+    let mut output_root = None;
+    let mut observed_at = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--task" | "--task-id" => {
+                i += 1;
+                task_id = Some(required_arg(args, i, "--task")?.to_string());
+            }
+            "--executor" => {
+                i += 1;
+                executor = Some(Did::new(required_arg(args, i, "--executor")?.to_string()));
+            }
+            "--receipt-signature" | "--receipt-signature-hex" => {
+                i += 1;
+                receipt_signature_hex =
+                    Some(required_arg(args, i, "--receipt-signature")?.to_string());
+            }
+            "--stdout" => {
+                i += 1;
+                stdout_cid = Some(Cid::hash_of(required_arg(args, i, "--stdout")?.as_bytes()));
+            }
+            "--stdout-cid" => {
+                i += 1;
+                stdout_cid = Some(parse_cid(required_arg(args, i, "--stdout-cid")?)?);
+            }
+            "--stderr" => {
+                i += 1;
+                stderr_cid = Some(Cid::hash_of(required_arg(args, i, "--stderr")?.as_bytes()));
+            }
+            "--stderr-cid" => {
+                i += 1;
+                stderr_cid = Some(parse_cid(required_arg(args, i, "--stderr-cid")?)?);
+            }
+            "--output-root" => {
+                i += 1;
+                output_root = Some(parse_cid(required_arg(args, i, "--output-root")?)?);
+            }
+            "--observed-at" => {
+                i += 1;
+                observed_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--observed-at")?,
+                    "--observed-at",
+                )?);
+            }
+            other => return Err(format!("unknown task-attest option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let now = unix_now();
+    let event = signed_local_event(
+        &base,
+        |identity| {
+            let attestation = ExecutionAttestation {
+                task_id: task_id.ok_or("--task required")?,
+                executor: executor.ok_or("--executor required")?,
+                attestor: identity.did().clone(),
+                receipt_signature_hex: receipt_signature_hex
+                    .ok_or("--receipt-signature required")?,
+                stdout_cid: stdout_cid.unwrap_or_else(|| Cid::hash_of(b"")),
+                stderr_cid: stderr_cid.unwrap_or_else(|| Cid::hash_of(b"")),
+                output_root,
+                resources: ResourceUsage::default(),
+                observed_at: observed_at.unwrap_or(now),
+                signature: None,
+            }
+            .sign(identity)?;
+            Ok(SocialEventKind::TaskExecutionAttested { attestation })
         },
         now,
     )?;
@@ -6860,6 +6951,7 @@ mod tests {
                             actual_cost: 10,
                             error: None,
                             receipt: Some(Box::new(receipt)),
+                            attestations: Vec::new(),
                         },
                     },
                 )
@@ -7569,7 +7661,50 @@ mod tests {
         .unwrap();
 
         let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
-        assert_eq!(memory.event_count(), 4);
+        let receipt_signature = memory
+            .society()
+            .task_result(&task_id)
+            .unwrap()
+            .receipt
+            .as_deref()
+            .unwrap()
+            .signature
+            .as_ref()
+            .map(hex::encode)
+            .unwrap();
+        let attestor_base = TempDir::new().unwrap();
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "task-attest".into(),
+            "--base".into(),
+            attestor_base.path().to_string_lossy().to_string(),
+            "--task".into(),
+            task_id.clone(),
+            "--executor".into(),
+            identity.did().to_string(),
+            "--receipt-signature".into(),
+            receipt_signature,
+            "--stdout".into(),
+            "ok".into(),
+            "--stderr".into(),
+            String::new(),
+            "--output-root".into(),
+            hex::encode(output_root.as_bytes()),
+        ])
+        .unwrap();
+        let attestor_event =
+            load_social_memory(&attestor_base.path().join(".nexus-social-memory.json"))
+                .unwrap()
+                .events()
+                .last()
+                .cloned()
+                .unwrap();
+        let mut memory =
+            load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert!(memory.ingest_event(attestor_event).unwrap());
+
+        assert_eq!(memory.event_count(), 5);
         let view = society_json(&memory);
         assert_eq!(view["tasks"][0]["id"], task_id);
         assert_eq!(view["tasks"][0]["state"], "Completed");
@@ -7602,7 +7737,7 @@ mod tests {
         );
         assert_eq!(
             view["tasks"][0]["result"]["resource_evidence"]["measurement_status"],
-            "signed_executor_claim"
+            "independent_reexecution_cross_checked"
         );
         assert_eq!(
             view["tasks"][0]["result"]["resource_evidence"]["source"],
@@ -7621,8 +7756,29 @@ mod tests {
             true
         );
         assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["matching_attestations"],
+            1
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["independent_verification"],
+            "attested_reexecution"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["verified_output"],
+            true
+        );
+        assert_eq!(
             view["tasks"][0]["result"]["resource_evidence"]["verified_measurement"],
             false
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["attestations"][0]["stdout_cid"],
+            hex::encode(Cid::hash_of(b"ok").as_bytes())
+        );
+        assert_eq!(
+            view["tasks"][0]["execution_attestations"][0]["resource_evidence"]
+                ["attestation_signature_valid"],
+            true
         );
         assert_eq!(
             view["tasks"][0]["result"]["receipt"]["resource_evidence"]["measurement_status"],

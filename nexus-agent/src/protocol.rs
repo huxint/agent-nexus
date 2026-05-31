@@ -20,7 +20,8 @@ use crate::society::{
     WorkspaceSnapshot,
 };
 use crate::task::{
-    ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec,
+    ExecutionAttestation, ExecutionReceiptError, TaskAcceptance, TaskCancellation, TaskOffer,
+    TaskResult, TaskSpec,
 };
 
 /// Errors produced while signing or verifying social events.
@@ -186,6 +187,8 @@ pub enum SocialEventKind {
     TaskCancelled { cancellation: TaskCancellation },
     /// Report a task result.
     TaskCompleted { result: TaskResult },
+    /// Publish third-party re-execution evidence for a task result.
+    TaskExecutionAttested { attestation: ExecutionAttestation },
     /// Dispute a task result or execution claim.
     TaskDisputed { dispute: TaskDispute },
     /// Record a verified economic settlement claim.
@@ -376,6 +379,11 @@ impl SocialEvent {
                 result.validate_receipt()?;
                 Ok(())
             }
+            SocialEventKind::TaskExecutionAttested { attestation } => {
+                self.ensure_subject("task execution attestation", &attestation.attestor)?;
+                attestation.verify_signature()?;
+                Ok(())
+            }
             SocialEventKind::TaskDisputed { dispute } => {
                 self.ensure_subject("task dispute", &dispute.disputer)
             }
@@ -499,7 +507,7 @@ mod tests {
         AgentIntent, IntentKind, IntentResponse, IntentResponseKind, InteractionOutcome,
         SettlementRecord, Society,
     };
-    use crate::task::{ExecutionReceipt, TaskResult, TaskSpec};
+    use crate::task::{ExecutionAttestation, ExecutionReceipt, TaskResult, TaskSpec};
 
     fn did(s: &str) -> Did {
         Did::new(format!("did:key:{s}"))
@@ -1041,6 +1049,7 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(receipt)),
+            attestations: Vec::new(),
         };
 
         let event = SocialEvent::new(
@@ -1052,6 +1061,98 @@ mod tests {
         .unwrap();
 
         event.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_accepts_task_execution_attestation_by_attestor() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: b"done".to_vec(),
+            stderr: Vec::new(),
+            resources: ResourceUsage::default(),
+        };
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["done".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            12,
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        let event = SocialEvent::new(
+            attestor.did().clone(),
+            12,
+            SocialEventKind::TaskExecutionAttested { attestation },
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        event.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_task_execution_attestation_for_another_attestor() {
+        let executor = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let author = NodeIdentity::generate();
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: b"done".to_vec(),
+            stderr: Vec::new(),
+            resources: ResourceUsage::default(),
+        };
+        let receipt = ExecutionReceipt::from_process_output(
+            "task-1",
+            executor.did().clone(),
+            None,
+            "echo",
+            vec!["done".into()],
+            &output,
+            None,
+            10,
+            11,
+        )
+        .sign(&executor)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            12,
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        let event = SocialEvent::new(
+            author.did().clone(),
+            12,
+            SocialEventKind::TaskExecutionAttested { attestation },
+        )
+        .sign(&author)
+        .unwrap();
+
+        assert!(matches!(
+            event.validate().unwrap_err(),
+            SocialProtocolError::AuthorSubjectMismatch { .. }
+        ));
     }
 
     #[test]
@@ -1086,6 +1187,7 @@ mod tests {
             actual_cost: 1,
             error: None,
             receipt: Some(Box::new(receipt)),
+            attestations: Vec::new(),
         };
 
         let event = SocialEvent::new(

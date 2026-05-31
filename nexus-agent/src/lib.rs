@@ -31,6 +31,6 @@ pub use society::{
     WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
-    ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid, TaskCancellation,
-    TaskOffer, TaskResult, TaskSpec, TaskState,
+    ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid,
+    TaskCancellation, TaskOffer, TaskResult, TaskSpec, TaskState,
 };

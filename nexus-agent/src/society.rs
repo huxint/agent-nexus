@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{AgentManifest, CapabilityDecl};
 use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind};
-use crate::task::{Task, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskState};
+use crate::task::{
+    ExecutionAttestation, Task, TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskState,
+};
 
 fn acceptance_key(acceptance: &TaskAcceptance) -> String {
     format!(
@@ -58,6 +60,18 @@ fn task_dispute_key(dispute: &TaskDispute) -> String {
         dispute.disputer,
         dispute.target,
         dispute.claim_id.as_deref().unwrap_or_default()
+    )
+}
+
+fn execution_attestation_key(attestation: &ExecutionAttestation) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        attestation.task_id,
+        attestation.executor,
+        attestation.attestor,
+        attestation.receipt_signature_hex,
+        hex::encode(attestation.stdout_cid.as_bytes()),
+        hex::encode(attestation.stderr_cid.as_bytes())
     )
 }
 
@@ -747,6 +761,8 @@ pub struct Society {
     task_results: HashMap<String, TaskResult>,
     #[serde(default)]
     task_result_claims: HashMap<String, HashMap<String, TaskResultClaim>>,
+    #[serde(default)]
+    task_execution_attestations: HashMap<String, HashMap<String, ExecutionAttestation>>,
     #[serde(default)]
     task_disputes: HashMap<String, TaskDispute>,
     #[serde(default)]
@@ -1479,6 +1495,48 @@ impl Society {
         claims.into_iter().map(|claim| &claim.result).collect()
     }
 
+    pub fn task_execution_attestations(&self, task_id: &str) -> Vec<&ExecutionAttestation> {
+        let Some(attestations) = self.task_execution_attestations.get(task_id) else {
+            return Vec::new();
+        };
+
+        let mut attestations: Vec<&ExecutionAttestation> = attestations.values().collect();
+        attestations.sort_by(|a, b| {
+            a.observed_at
+                .cmp(&b.observed_at)
+                .then_with(|| a.executor.to_string().cmp(&b.executor.to_string()))
+                .then_with(|| a.attestor.to_string().cmp(&b.attestor.to_string()))
+                .then_with(|| a.receipt_signature_hex.cmp(&b.receipt_signature_hex))
+        });
+        attestations
+    }
+
+    pub fn task_result_attestations<'a>(
+        &'a self,
+        result: &'a TaskResult,
+    ) -> Vec<&'a ExecutionAttestation> {
+        let Some(receipt) = result.receipt.as_deref() else {
+            return Vec::new();
+        };
+        let mut attestations: Vec<&ExecutionAttestation> = result
+            .attestations
+            .iter()
+            .chain(self.task_execution_attestations(&result.task_id))
+            .filter(|attestation| {
+                attestation.validate_against_receipt(receipt).is_ok()
+                    && attestation.stdout_cid == Cid::hash_of(result.stdout.as_bytes())
+                    && attestation.stderr_cid == Cid::hash_of(result.stderr.as_bytes())
+            })
+            .collect();
+        attestations.sort_by(|a, b| {
+            a.observed_at
+                .cmp(&b.observed_at)
+                .then_with(|| a.attestor.to_string().cmp(&b.attestor.to_string()))
+        });
+        attestations.dedup_by(|a, b| execution_attestation_key(a) == execution_attestation_key(b));
+        attestations
+    }
+
     pub fn agent_task_results(&self, executor: &Did) -> Vec<&TaskResult> {
         let mut results: Vec<&TaskResult> = self
             .task_results
@@ -1790,6 +1848,11 @@ impl Society {
                 self.register_agent(result.executor.clone());
                 self.record_task_result(result.clone(), event.timestamp);
             }
+            SocialEventKind::TaskExecutionAttested { attestation } => {
+                self.register_agent(attestation.executor.clone());
+                self.register_agent(attestation.attestor.clone());
+                self.record_task_execution_attestation(attestation.clone());
+            }
             SocialEventKind::TaskDisputed { dispute } => {
                 self.record_task_dispute(dispute.clone());
             }
@@ -2023,6 +2086,19 @@ impl Society {
             note: Some(format!("task {} result", result.task_id)),
             timestamp: receipt.finished_at,
         });
+    }
+
+    fn record_task_execution_attestation(&mut self, attestation: ExecutionAttestation) {
+        if attestation.verify_signature().is_err() {
+            return;
+        }
+
+        let task_id = attestation.task_id.clone();
+        self.task_execution_attestations
+            .entry(task_id)
+            .or_default()
+            .entry(execution_attestation_key(&attestation))
+            .or_insert(attestation);
     }
 
     fn record_task_dispute(&mut self, dispute: TaskDispute) {
@@ -2911,7 +2987,9 @@ mod tests {
     use super::*;
     use crate::manifest::{AgentManifest, CapabilityDecl};
     use crate::protocol::SocialEventKind;
-    use crate::task::{ExecutionReceipt, TaskOffer, TaskResult, TaskSpec, TaskState};
+    use crate::task::{
+        ExecutionAttestation, ExecutionReceipt, TaskOffer, TaskResult, TaskSpec, TaskState,
+    };
     use nexus_core::PermissionSet;
     use nexus_crypto::capability::sign_capability;
     use nexus_crypto::NodeIdentity;
@@ -4269,6 +4347,7 @@ mod tests {
                     actual_cost: 20,
                     error: None,
                     receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4295,6 +4374,121 @@ mod tests {
         assert_eq!(reputation.successes, 1);
         assert_eq!(reputation.failures, 0);
         assert!(reputation.composite() > 0.5);
+    }
+
+    #[test]
+    fn independent_execution_attestation_matches_task_result_claim() {
+        let publisher = did("publisher");
+        let worker = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let worker_did = worker.did().clone();
+        let mut society = Society::new();
+        let task = TaskSpec::new(
+            publisher.clone(),
+            "audit shared workspace",
+            "python-exec",
+            "python",
+            vec!["audit.py".into()],
+            100,
+            999,
+            1,
+        );
+        let task_id = task.id.clone();
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+            resources: ResourceUsage::default(),
+        };
+        let receipt = ExecutionReceipt::from_process_output(
+            task_id.clone(),
+            worker_did.clone(),
+            None,
+            "python",
+            vec!["audit.py".into()],
+            &output,
+            None,
+            2,
+            3,
+        )
+        .sign(&worker)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            4,
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        society.apply_event(&SocialEvent::new(
+            publisher.clone(),
+            1,
+            SocialEventKind::TaskPublished { task },
+        ));
+        society.apply_event(&SocialEvent::new(
+            worker_did.clone(),
+            2,
+            SocialEventKind::TaskOffered {
+                offer: TaskOffer {
+                    task_id: task_id.clone(),
+                    bidder: worker_did.clone(),
+                    price: 25,
+                    estimated_time_secs: 10,
+                    rationale: "ready".into(),
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            publisher.clone(),
+            3,
+            SocialEventKind::TaskAccepted {
+                acceptance: TaskAcceptance {
+                    task_id: task_id.clone(),
+                    publisher: publisher.clone(),
+                    bidder: worker_did.clone(),
+                    price: 25,
+                    accepted_at: 3,
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            worker_did.clone(),
+            4,
+            SocialEventKind::TaskCompleted {
+                result: TaskResult {
+                    task_id: task_id.clone(),
+                    executor: worker_did.clone(),
+                    success: true,
+                    exit_code: 0,
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                    actual_cost: 20,
+                    error: None,
+                    receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            attestor.did().clone(),
+            5,
+            SocialEventKind::TaskExecutionAttested {
+                attestation: attestation.clone(),
+            },
+        ));
+
+        assert_eq!(society.task_execution_attestations(&task_id).len(), 1);
+        let result = society.task_result(&task_id).unwrap();
+        let attestations = society.task_result_attestations(result);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations[0].attestor, *attestor.did());
+        assert_eq!(
+            attestations[0].receipt_signature_hex,
+            attestation.receipt_signature_hex
+        );
     }
 
     #[test]
@@ -4380,6 +4574,7 @@ mod tests {
                     actual_cost: 10,
                     error: None,
                     receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4609,6 +4804,7 @@ mod tests {
             actual_cost: 20,
             error: None,
             receipt: None,
+            attestations: Vec::new(),
         };
 
         society.apply_event(&SocialEvent::new(
@@ -4695,6 +4891,7 @@ mod tests {
                     actual_cost: 20,
                     error: None,
                     receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4712,6 +4909,7 @@ mod tests {
                     actual_cost: 0,
                     error: Some("failed".into()),
                     receipt: None,
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4779,6 +4977,7 @@ mod tests {
                     actual_cost: 20,
                     error: None,
                     receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4914,6 +5113,7 @@ mod tests {
                     actual_cost: 20,
                     error: None,
                     receipt: Some(Box::new(wrong_receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -4937,6 +5137,7 @@ mod tests {
                     actual_cost: 20,
                     error: None,
                     receipt: Some(Box::new(correct_receipt)),
+                    attestations: Vec::new(),
                 },
             },
         ));
@@ -5022,6 +5223,7 @@ mod tests {
                     actual_cost: 0,
                     error: Some("failed".into()),
                     receipt: None,
+                    attestations: Vec::new(),
                 },
             },
         ));
