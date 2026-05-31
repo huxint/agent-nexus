@@ -6254,6 +6254,14 @@ mod tests {
         assert_eq!(view["events"], 2);
         assert_eq!(view["agents"][0]["did"], identity.did().to_string());
         assert_eq!(view["agents"][0]["manifest"]["name"], "social-node");
+        assert_eq!(
+            view["agents"][0]["declared_capabilities"][0]["name"],
+            "native-workspace"
+        );
+        assert!(view["agents"][0]["verified_capabilities"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(view["agents"][0]["workspaces"][0], workspace.to_string());
         assert_eq!(view["workspaces"][0]["id"], workspace.to_string());
         assert_eq!(
@@ -7588,6 +7596,11 @@ mod tests {
             claim_id
         );
         assert_eq!(
+            target_agent["provider_recommendations"][0]["capability_claim_status"],
+            "declared"
+        );
+        assert!(target_agent["provider_recommendations"][0]["verified_capability"].is_null());
+        assert_eq!(
             target_agent["provider_recommendations"][0]["governance_signals"][0]["outcome"],
             "Disputed"
         );
@@ -7992,6 +8005,13 @@ mod tests {
             .iter()
             .find(|agent| agent["did"] == identity.did().to_string())
             .unwrap();
+        assert_eq!(agent["verified_capabilities"][0]["name"], "python-exec");
+        assert_eq!(agent["verified_capabilities"][0]["successful_tasks"], 1);
+        assert_eq!(
+            agent["verified_capabilities"][0]["independently_attested_tasks"],
+            1
+        );
+        assert_eq!(agent["verified_capabilities"][0]["latest_task_id"], task_id);
         assert_eq!(agent["activity"]["task_results"][0]["task_id"], task_id);
         assert_eq!(
             agent["activity"]["task_result_claims"][0]["task_id"],

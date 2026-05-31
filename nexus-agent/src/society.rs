@@ -484,8 +484,19 @@ pub struct ProviderRecommendation {
     pub governance_score: f64,
     /// Recent collective judgments that explain the governance score.
     pub governance_signals: Vec<GovernanceSignal>,
+    pub verified_capability: Option<VerifiedCapability>,
     pub price_per_unit: u64,
     pub ranking_score: f64,
+}
+
+/// Evidence that an agent has successfully performed a declared capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedCapability {
+    pub name: String,
+    pub successful_tasks: usize,
+    pub independently_attested_tasks: usize,
+    pub latest_task_id: String,
+    pub latest_observed_at: u64,
 }
 
 /// An intent that appears useful for an agent to notice or answer.
@@ -978,6 +989,63 @@ impl Society {
 
     pub fn manifests(&self) -> impl Iterator<Item = &AgentManifest> {
         self.manifests.values()
+    }
+
+    pub fn agent_verified_capabilities(&self, agent: &Did) -> Vec<VerifiedCapability> {
+        let mut capabilities: HashMap<String, VerifiedCapability> = HashMap::new();
+
+        for result in self.task_results.values() {
+            if result.executor != *agent || !result.success {
+                continue;
+            }
+            let Some(task) = self.tasks.get(&result.task_id) else {
+                continue;
+            };
+            if task.assigned_to.as_ref() != Some(agent) {
+                continue;
+            }
+            let Some(receipt) = result.receipt.as_deref() else {
+                continue;
+            };
+            if receipt.verify_signature().is_err()
+                || !task_result_matches_task_commitment(result, task)
+            {
+                continue;
+            }
+
+            let matching_attestations = self.task_result_attestations(result).len();
+            let evidence = capabilities
+                .entry(task.required_capability.clone())
+                .or_insert_with(|| VerifiedCapability {
+                    name: task.required_capability.clone(),
+                    successful_tasks: 0,
+                    independently_attested_tasks: 0,
+                    latest_task_id: result.task_id.clone(),
+                    latest_observed_at: receipt.finished_at,
+                });
+
+            evidence.successful_tasks += 1;
+            if matching_attestations > 0 {
+                evidence.independently_attested_tasks += 1;
+            }
+            if receipt.finished_at > evidence.latest_observed_at
+                || (receipt.finished_at == evidence.latest_observed_at
+                    && result.task_id < evidence.latest_task_id)
+            {
+                evidence.latest_task_id = result.task_id.clone();
+                evidence.latest_observed_at = receipt.finished_at;
+            }
+        }
+
+        let mut capabilities: Vec<VerifiedCapability> = capabilities.into_values().collect();
+        capabilities.sort_by(|a, b| a.name.cmp(&b.name));
+        capabilities
+    }
+
+    pub fn verified_capability(&self, agent: &Did, capability: &str) -> Option<VerifiedCapability> {
+        self.agent_verified_capabilities(agent)
+            .into_iter()
+            .find(|verified| verified.name == capability)
     }
 
     pub fn relate(&mut self, from: Did, to: Did, kind: RelationKind, now: u64) {
@@ -2522,6 +2590,8 @@ impl Society {
                     .unwrap_or(0.5);
                 let governance_signals = self.governance_signals_for(&manifest.did, 5);
                 let governance_score = governance_score_from_signals(&governance_signals);
+                let verified_capability =
+                    self.verified_capability(&manifest.did, &capability_decl.name);
                 let has_anchored_witness = governance_signals.iter().any(|signal| {
                     signal.truth_status == FactTruthStatus::Anchored
                         && signal.outcome == CollectiveDecisionOutcome::Accepted
@@ -2552,6 +2622,7 @@ impl Society {
                     sybil_cluster_score,
                     governance_score,
                     governance_signals,
+                    verified_capability,
                     price_per_unit: capability_decl.price_per_unit,
                     ranking_score,
                 }
@@ -4378,6 +4449,128 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].did, alice);
         assert_eq!(providers[0].capability.name, "python-exec");
+    }
+
+    #[test]
+    fn completed_receipted_task_marks_capability_verified() {
+        let publisher = did("publisher");
+        let worker = NodeIdentity::generate();
+        let attestor = NodeIdentity::generate();
+        let worker_did = worker.did().clone();
+        let mut society = Society::new();
+        let task = TaskSpec::new(
+            publisher.clone(),
+            "verify python execution",
+            "python-exec",
+            "python",
+            vec!["verify.py".into()],
+            100,
+            999,
+            1,
+        );
+        let task_id = task.id.clone();
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+            resources: ResourceUsage::default(),
+        };
+        let receipt = ExecutionReceipt::from_process_output(
+            task_id.clone(),
+            worker_did.clone(),
+            None,
+            "python",
+            vec!["verify.py".into()],
+            &output,
+            None,
+            4,
+            5,
+        )
+        .sign(&worker)
+        .unwrap();
+        let attestation = ExecutionAttestation::from_process_output(
+            &receipt,
+            attestor.did().clone(),
+            &output,
+            None,
+            6,
+        )
+        .sign(&attestor)
+        .unwrap();
+
+        society.apply_event(&SocialEvent::new(
+            worker_did.clone(),
+            1,
+            SocialEventKind::ManifestPublished {
+                manifest: provider_manifest(worker_did.clone(), "Worker", "python-exec", 10),
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            publisher.clone(),
+            2,
+            SocialEventKind::TaskPublished { task },
+        ));
+        society.apply_event(&SocialEvent::new(
+            worker_did.clone(),
+            3,
+            SocialEventKind::TaskOffered {
+                offer: TaskOffer {
+                    task_id: task_id.clone(),
+                    bidder: worker_did.clone(),
+                    price: 10,
+                    estimated_time_secs: 1,
+                    rationale: "ready".into(),
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            publisher.clone(),
+            4,
+            SocialEventKind::TaskAccepted {
+                acceptance: TaskAcceptance {
+                    task_id: task_id.clone(),
+                    publisher: publisher.clone(),
+                    bidder: worker_did.clone(),
+                    price: 10,
+                    accepted_at: 4,
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            worker_did.clone(),
+            5,
+            SocialEventKind::TaskCompleted {
+                result: TaskResult {
+                    task_id: task_id.clone(),
+                    executor: worker_did.clone(),
+                    success: true,
+                    exit_code: 0,
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                    actual_cost: 10,
+                    error: None,
+                    receipt: Some(Box::new(receipt)),
+                    attestations: Vec::new(),
+                },
+            },
+        ));
+        society.apply_event(&SocialEvent::new(
+            attestor.did().clone(),
+            6,
+            SocialEventKind::TaskExecutionAttested { attestation },
+        ));
+
+        let verified = society.agent_verified_capabilities(&worker_did);
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].name, "python-exec");
+        assert_eq!(verified[0].successful_tasks, 1);
+        assert_eq!(verified[0].independently_attested_tasks, 1);
+        assert_eq!(verified[0].latest_task_id, task_id);
+        assert_eq!(verified[0].latest_observed_at, 5);
+
+        let providers = society.find_providers("python-exec");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].verified_capability, Some(verified[0].clone()));
     }
 
     #[test]

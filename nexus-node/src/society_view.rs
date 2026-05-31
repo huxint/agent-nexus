@@ -5,8 +5,8 @@ use nexus_agent::{
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
     ExecutionReceipt, GovernanceSignal, IdentityRevocation, IntentRecommendation, IntentResponse,
     Interaction, ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge,
-    SocialMemory, Task, TaskClaimJudgment, TaskResult, WorkspaceRun, WorkspaceRunContext,
-    WorkspaceRunFailure, WorkspaceSnapshot,
+    SocialMemory, Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WorkspaceRun,
+    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -138,6 +138,14 @@ pub(crate) fn society_json_for_base(
                 "revoked": revocation.is_some(),
                 "revocation": revocation.map(identity_revocation_json),
                 "manifest": manifest,
+                "declared_capabilities": manifest
+                    .map(|manifest| manifest.provides.clone())
+                    .unwrap_or_default(),
+                "verified_capabilities": society
+                    .agent_verified_capabilities(did)
+                    .into_iter()
+                    .map(verified_capability_json)
+                    .collect::<Vec<_>>(),
                 "provider_recommendations": provider_recommendations,
                 "activity": agent_activity_json(society, did, &options),
                 "intents": society
@@ -940,6 +948,12 @@ fn provider_recommendation_json(recommendation: ProviderRecommendation) -> serde
         "did": recommendation.did.to_string(),
         "name": recommendation.name,
         "capability": recommendation.capability,
+        "capability_claim_status": if recommendation.verified_capability.is_some() {
+            "verified"
+        } else {
+            "declared"
+        },
+        "verified_capability": recommendation.verified_capability.map(verified_capability_json),
         "social_score": recommendation.social_score,
         "reputation_score": recommendation.reputation_score,
         "reachability_score": recommendation.reachability_score,
@@ -953,6 +967,16 @@ fn provider_recommendation_json(recommendation: ProviderRecommendation) -> serde
             .collect::<Vec<_>>(),
         "price_per_unit": recommendation.price_per_unit,
         "ranking_score": recommendation.ranking_score,
+    })
+}
+
+fn verified_capability_json(verified: VerifiedCapability) -> serde_json::Value {
+    serde_json::json!({
+        "name": verified.name,
+        "successful_tasks": verified.successful_tasks,
+        "independently_attested_tasks": verified.independently_attested_tasks,
+        "latest_task_id": verified.latest_task_id,
+        "latest_observed_at": verified.latest_observed_at,
     })
 }
 

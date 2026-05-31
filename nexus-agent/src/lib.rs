@@ -28,7 +28,8 @@ pub use society::{
     IdentityRevocation, IntentActionKind, IntentActionPlan, IntentKind, IntentRecommendation,
     IntentResponse, IntentResponseKind, Interaction, InteractionOutcome, ProviderRecommendation,
     RelationKind, SettlementRecord, SocialEdge, Society, TaskClaimJudgment, TaskDispute,
-    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
+    VerifiedCapability, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin,
+    WorkspaceSnapshot,
 };
 pub use task::{
     ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid,
