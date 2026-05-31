@@ -33,6 +33,6 @@ pub use society::{
     WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
 };
 pub use task::{
-    ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError, Task, TaskAcceptance, TaskBid,
-    TaskCancellation, TaskOffer, TaskResult, TaskSpec, TaskState,
+    DeterministicReplayProfile, ExecutionAttestation, ExecutionReceipt, ExecutionReceiptError,
+    Task, TaskAcceptance, TaskBid, TaskCancellation, TaskOffer, TaskResult, TaskSpec, TaskState,
 };
