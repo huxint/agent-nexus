@@ -174,9 +174,9 @@ impl Network {
             if let Some((peer, kad_addr)) = peer_and_kad_addr(addr) {
                 behaviour_add_address(swarm.behaviour_mut(), &peer, kad_addr);
             }
-            swarm
-                .dial(addr.clone())
-                .map_err(|e| nexus_core::NexusError::Network(format!("dial: {e}")))?;
+            if let Err(err) = swarm.dial(addr.clone()) {
+                warn!("failed to dial bootstrap peer {addr}: {err}");
+            }
         }
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
