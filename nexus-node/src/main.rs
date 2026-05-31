@@ -5510,6 +5510,22 @@ mod tests {
             workspace["runs"][0]["output_root"],
             workspace["latest_snapshot"]["root"]
         );
+        assert_eq!(
+            workspace["runs"][0]["resource_evidence"]["measurement_status"],
+            "self_reported"
+        );
+        assert_eq!(
+            workspace["runs"][0]["resource_evidence"]["source"],
+            "workspace_run.resources"
+        );
+        assert_eq!(
+            workspace["runs"][0]["resource_evidence"]["signed_by"],
+            identity.did().to_string()
+        );
+        assert_eq!(
+            workspace["runs"][0]["resource_evidence"]["verified_measurement"],
+            false
+        );
         assert!(workspace["runs"][0]["context"].is_null());
         assert_eq!(workspace["latest_snapshot"]["label"], "after:sh");
     }
@@ -7584,6 +7600,34 @@ mod tests {
             view["tasks"][0]["result"]["receipt"]["stderr_cid"],
             hex::encode(Cid::hash_of(b"").as_bytes())
         );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["measurement_status"],
+            "signed_executor_claim"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["source"],
+            "receipt.resources"
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["signed_by"],
+            identity.did().to_string()
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["receipt_signature_valid"],
+            true
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["output_cids_match_result"],
+            true
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["resource_evidence"]["verified_measurement"],
+            false
+        );
+        assert_eq!(
+            view["tasks"][0]["result"]["receipt"]["resource_evidence"]["measurement_status"],
+            "signed_executor_claim"
+        );
         let task_workspace = view["workspaces"]
             .as_array()
             .unwrap()
@@ -7858,6 +7902,14 @@ mod tests {
         assert_eq!(claim_id.len(), 64);
         assert_eq!(view["tasks"][0]["result_claims"][0]["success"], true);
         assert!(view["tasks"][0]["result_claims"][0]["receipt"].is_null());
+        assert_eq!(
+            view["tasks"][0]["result_claims"][0]["resource_evidence"]["measurement_status"],
+            "self_reported"
+        );
+        assert_eq!(
+            view["tasks"][0]["result_claims"][0]["resource_evidence"]["verified_measurement"],
+            false
+        );
         assert_eq!(view["relations"].as_array().unwrap().len(), 0);
         assert_eq!(view["reputations"].as_array().unwrap().len(), 0);
     }

@@ -8,6 +8,7 @@ use nexus_agent::{
     WorkspaceRunFailure, WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
+use nexus_storage::Cid;
 
 use crate::discovery::{discovered_workspace_views, load_workspace_discovery, DiscoveryFilter};
 use crate::unix_now;
@@ -1097,11 +1098,23 @@ fn workspace_run_json(run: &WorkspaceRun) -> serde_json::Value {
         "stderr": hex::encode(run.stderr.as_bytes()),
         "output_root": run.output_root.map(|root| hex::encode(root.as_bytes())),
         "resources": run.resources,
+        "resource_evidence": workspace_run_resource_evidence_json(run),
         "context": run.context.as_ref().map(workspace_run_context_json),
         "failure": run.failure.as_ref().map(workspace_run_failure_json),
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "note": run.note,
+    })
+}
+
+fn workspace_run_resource_evidence_json(run: &WorkspaceRun) -> serde_json::Value {
+    serde_json::json!({
+        "measurement_status": "self_reported",
+        "source": "workspace_run.resources",
+        "signed_by": run.actor.to_string(),
+        "signature_scope": "social_event",
+        "independent_verification": "not_performed",
+        "verified_measurement": false,
     })
 }
 
@@ -1164,8 +1177,35 @@ fn task_result_json(result: &TaskResult) -> serde_json::Value {
         "stderr": result.stderr,
         "actual_cost": result.actual_cost,
         "error": result.error,
+        "resource_evidence": task_result_resource_evidence_json(result),
         "receipt": result.receipt.as_deref().map(execution_receipt_json),
     })
+}
+
+fn task_result_resource_evidence_json(result: &TaskResult) -> serde_json::Value {
+    match result.receipt.as_deref() {
+        Some(receipt) => serde_json::json!({
+            "measurement_status": "signed_executor_claim",
+            "source": "receipt.resources",
+            "signed_by": receipt.executor.to_string(),
+            "signature_scope": "execution_receipt",
+            "receipt_signature_valid": receipt.verify_signature().is_ok(),
+            "output_cids_match_result": receipt.stdout_cid == Cid::hash_of(result.stdout.as_bytes())
+                && receipt.stderr_cid == Cid::hash_of(result.stderr.as_bytes()),
+            "independent_verification": "not_performed",
+            "verified_measurement": false,
+        }),
+        None => serde_json::json!({
+            "measurement_status": "self_reported",
+            "source": null,
+            "signed_by": result.executor.to_string(),
+            "signature_scope": "social_event",
+            "receipt_signature_valid": null,
+            "output_cids_match_result": null,
+            "independent_verification": "not_performed",
+            "verified_measurement": false,
+        }),
+    }
 }
 
 fn settlement_json(
@@ -1239,8 +1279,21 @@ fn execution_receipt_json(receipt: &ExecutionReceipt) -> serde_json::Value {
         "stderr_cid": hex::encode(receipt.stderr_cid.as_bytes()),
         "output_root": receipt.output_root.map(|root| hex::encode(root.as_bytes())),
         "resources": receipt.resources,
+        "resource_evidence": execution_receipt_resource_evidence_json(receipt),
         "started_at": receipt.started_at,
         "finished_at": receipt.finished_at,
         "signature": receipt.signature.as_ref().map(hex::encode),
+    })
+}
+
+fn execution_receipt_resource_evidence_json(receipt: &ExecutionReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "measurement_status": "signed_executor_claim",
+        "source": "receipt.resources",
+        "signed_by": receipt.executor.to_string(),
+        "signature_scope": "execution_receipt",
+        "receipt_signature_valid": receipt.verify_signature().is_ok(),
+        "independent_verification": "not_performed",
+        "verified_measurement": false,
     })
 }
