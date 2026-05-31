@@ -29,6 +29,7 @@ pub struct BootstrapStatus {
     pub public_defaults_enabled: bool,
     pub env_configured: bool,
     pub env_peers: Vec<String>,
+    pub invite_peers: Vec<String>,
     pub config_peers: Vec<String>,
     pub peer_cache: Vec<PeerCacheEntry>,
     pub peer_cache_peers: Vec<String>,
@@ -50,6 +51,16 @@ pub fn parse_bootstrap_list(
     Ok(addrs)
 }
 
+pub fn extend_bootstrap_peers(
+    peers: &mut Vec<libp2p::Multiaddr>,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for addr in parse_bootstrap_list(value)? {
+        push_unique_bootstrap_addr(peers, addr);
+    }
+    Ok(())
+}
+
 pub fn default_bootstrap_peers(
     base: &Path,
     use_public_defaults: bool,
@@ -60,8 +71,11 @@ pub fn default_bootstrap_peers(
         Err(err) => return Err(format!("read NEXUS_BOOTSTRAP: {err}").into()),
     }
 
-    let mut addrs = load_bootstrap_config_peers(base)?;
+    let mut addrs = Vec::new();
     for addr in peer_cache_bootstrap_peers(base) {
+        push_unique_bootstrap_addr(&mut addrs, addr);
+    }
+    for addr in load_bootstrap_config_peers(base)? {
         push_unique_bootstrap_addr(&mut addrs, addr);
     }
     for addr in cached_workspace_bootstrap_peers(base) {
@@ -79,6 +93,7 @@ pub fn default_bootstrap_peers(
 pub fn bootstrap_status(
     base: &Path,
     use_public_defaults: bool,
+    invite_peers: &[libp2p::Multiaddr],
 ) -> Result<BootstrapStatus, Box<dyn std::error::Error>> {
     let (env_configured, env_peers) = match std::env::var("NEXUS_BOOTSTRAP") {
         Ok(value) => (true, parse_bootstrap_list(&value)?),
@@ -101,9 +116,12 @@ pub fn bootstrap_status(
             push_unique_bootstrap_addr(&mut effective_peers, addr.clone());
         }
     } else {
+        for addr in invite_peers {
+            push_unique_bootstrap_addr(&mut effective_peers, addr.clone());
+        }
         for source in [
-            config_peers.as_slice(),
             peer_cache_peers.as_slice(),
+            config_peers.as_slice(),
             discovery_cache_peers.as_slice(),
             public_default_peers.as_slice(),
         ] {
@@ -118,6 +136,7 @@ pub fn bootstrap_status(
         public_defaults_enabled: use_public_defaults,
         env_configured,
         env_peers: stringify_multiaddrs(&env_peers),
+        invite_peers: stringify_multiaddrs(invite_peers),
         config_peers: stringify_multiaddrs(&config_peers),
         peer_cache,
         peer_cache_peers: stringify_multiaddrs(&peer_cache_peers),

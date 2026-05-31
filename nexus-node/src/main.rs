@@ -2,13 +2,13 @@
 //!
 //! Usage:
 //!   nexus-node create --name <name> [--base <dir>]
-//!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>] [--no-public-bootstrap]
+//!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
-//!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
+//!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
-//!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
-//!   nexus-node bootstrap status --base <dir> [--json] [--no-public-bootstrap]
+//!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node event manifest|intent|intent-response|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
 //!   nexus-node demo   (runs a self-contained two-node demo)
@@ -98,11 +98,13 @@ fn print_usage(prog: &str) {
     eprintln!("nexus-node — AI workspace node");
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
-    eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>] [--no-public-bootstrap] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
+    eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
     eprintln!("  {prog} exec --base <DIR> --workspace <PATH> [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] -- <CMD> [ARG...]");
-    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>] [--no-public-bootstrap]");
-    eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>] [--no-public-bootstrap] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
-    eprintln!("  {prog} bootstrap status --base <DIR> [--json] [--no-public-bootstrap]");
+    eprintln!("  {prog} serve  --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap]");
+    eprintln!("  {prog} discover --base <DIR> [--global|--lan] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--listen <ADDR>] [--timeout-ms <N>] [--sort <relevance|clone-ready|name|owner|latest>] [--json] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]");
+    eprintln!(
+        "  {prog} bootstrap status --base <DIR> [--json] [--invite <ADDR>] [--no-public-bootstrap]"
+    );
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
@@ -258,6 +260,11 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--bootstrap" => {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
+                online = true;
+            }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(&mut bootstrap, required_arg(args, i, "--invite")?)?;
                 online = true;
             }
             "--no-public-bootstrap" => {
@@ -708,6 +715,10 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
             }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(&mut bootstrap, required_arg(args, i, "--invite")?)?;
+            }
             "--no-public-bootstrap" => {
                 use_public_bootstrap = false;
             }
@@ -1093,6 +1104,11 @@ async fn cmd_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
                 online = true;
             }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(&mut bootstrap, required_arg(args, i, "--invite")?)?;
+                online = true;
+            }
             "--no-public-bootstrap" => {
                 use_public_bootstrap = false;
             }
@@ -1209,6 +1225,7 @@ fn cmd_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut json = false;
     let mut use_public_bootstrap = true;
+    let mut invite_peers = Vec::new();
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -1219,6 +1236,10 @@ fn cmd_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--json" => {
                 json = true;
             }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(&mut invite_peers, required_arg(args, i, "--invite")?)?;
+            }
             "--no-public-bootstrap" => {
                 use_public_bootstrap = false;
             }
@@ -1227,7 +1248,7 @@ fn cmd_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let status = bootstrap_status(&base, use_public_bootstrap)?;
+    let status = bootstrap_status(&base, use_public_bootstrap, &invite_peers)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -1256,6 +1277,7 @@ fn print_bootstrap_status_text(status: &BootstrapStatus) {
         }
     );
     println!("config_peers: {}", status.config_peers.len());
+    println!("invite_peers: {}", status.invite_peers.len());
     println!("peer_cache_entries: {}", status.peer_cache.len());
     println!("peer_cache_peers: {}", status.peer_cache_peers.len());
     println!(
@@ -4330,12 +4352,60 @@ mod tests {
         assert_eq!(entries[0].failures, 0);
 
         if std::env::var("NEXUS_BOOTSTRAP").is_err() {
-            let status = bootstrap_status(temp.path(), false).unwrap();
+            let status = bootstrap_status(temp.path(), false, &[]).unwrap();
             assert!(status.effective_peers.contains(&config_peer.to_string()));
             assert!(status
                 .effective_peers
                 .contains(&peer_cache_peer.to_string()));
+            assert!(
+                status
+                    .effective_peers
+                    .iter()
+                    .position(|peer| peer == &peer_cache_peer.to_string())
+                    < status
+                        .effective_peers
+                        .iter()
+                        .position(|peer| peer == &config_peer.to_string()),
+                "peer cache should be preferred over static config"
+            );
         }
+    }
+
+    #[test]
+    fn invite_bootstrap_peers_are_first_class_entrypoints() {
+        let temp = TempDir::new().unwrap();
+        let (invite_addr, invite_peer) = test_bootstrap_addr(4031);
+        let (cache_addr, cache_peer) = test_bootstrap_addr(4032);
+        let (config_addr, config_peer) = test_bootstrap_addr(4033);
+
+        std::fs::write(
+            bootstrap_config_path(temp.path()),
+            serde_json::to_vec_pretty(&serde_json::json!({ "peers": [config_addr] })).unwrap(),
+        )
+        .unwrap();
+        upsert_peer_cache(
+            temp.path(),
+            &multiaddr_peer_id(&cache_peer).unwrap().to_string(),
+            &[cache_addr],
+            2,
+            Some(3),
+            None,
+        )
+        .unwrap();
+
+        let mut invite_peers = Vec::new();
+        extend_bootstrap_peers(&mut invite_peers, &invite_addr).unwrap();
+        let status = bootstrap_status(temp.path(), false, &invite_peers).unwrap();
+
+        assert_eq!(status.invite_peers, vec![invite_peer.to_string()]);
+        assert_eq!(
+            status.effective_peers,
+            vec![
+                invite_peer.to_string(),
+                cache_peer.to_string(),
+                config_peer.to_string()
+            ]
+        );
     }
 
     #[test]
