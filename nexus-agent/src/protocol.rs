@@ -161,6 +161,10 @@ pub enum SocialEventKind {
     IdentityRevoked { revocation: IdentityRevocation },
     /// Join a workspace as a social presence event.
     WorkspaceJoined { workspace: WorkspaceId },
+    /// Claim ownership of a workspace as signed social truth metadata.
+    WorkspaceOwnershipClaimed {
+        claim: crate::society::WorkspaceOwnershipClaim,
+    },
     /// Declare or update a subjective relation to another agent.
     RelationDeclared {
         peer: Did,
@@ -534,6 +538,9 @@ impl SocialEvent {
             }
             SocialEventKind::WorkspaceSnapshotted { snapshot } => {
                 self.ensure_subject("workspace snapshot", &snapshot.actor)
+            }
+            SocialEventKind::WorkspaceOwnershipClaimed { claim } => {
+                self.ensure_subject("workspace ownership claim", &claim.owner)
             }
             SocialEventKind::WorkspaceRunRecorded { run } => {
                 self.ensure_subject("workspace run", &run.actor)
