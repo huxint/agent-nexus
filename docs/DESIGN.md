@@ -94,7 +94,7 @@
 
 ## 3. 分层架构
 
-> **实现状态**：部分实现。已落地的主干是身份/DID、内容寻址存储、workspace 快照、原生执行、libp2p QUIC/Kademlia/Gossipsub/Request-Response、签名社会事件、任务市场投影、治理/信誉/settlement 记录、机密社会事件信封和私有社会视图。规划中能力包括更完整的 NAT 穿透（`N1`）和 Kademlia eclipse 加固进阶约束（`N3`）。
+> **实现状态**：部分实现。已落地的主干是身份/DID、内容寻址存储、workspace 快照、原生执行、libp2p QUIC/Kademlia/Gossipsub/Request-Response、AutoNAT/DCUtR/relay client、签名社会事件、任务市场投影、治理/信誉/settlement 记录、机密社会事件信封和私有社会视图。浏览器 WebRTC 传输仍是规划项。
 
 ```
 ┌───────────────────────────────────────────────────┐
@@ -124,7 +124,7 @@
 
 ## 4. Layer 1: P2P 网络层
 
-> **实现状态**：部分实现。当前网络层已经支持 QUIC、Kademlia、mDNS、Gossipsub、Request/Response、Identify、workspace announcement、社会事件传播、clone/sync 和 peer cache。WebRTC、AutoNAT、DCUtR、relay、严格 gossipsub peer scoring、Kademlia eclipse 加固和协议版本协商仍在规划中，见 `N1`、`N2`、`N3`、`N7`。
+> **实现状态**：部分实现。当前网络层已经支持 QUIC、Kademlia、mDNS、Gossipsub、Request/Response、Identify、workspace announcement、社会事件传播、clone/sync、peer cache、严格 gossipsub peer scoring、Kademlia 多路径查询/PeerId 绑定校验、AutoNAT、DCUtR 和 relay client。WebRTC 浏览器节点传输仍在规划中。
 
 ### 4.1 技术选型
 
@@ -133,12 +133,12 @@
 | Behaviour | 用途 | crate |
 |---|---|---|
 | **QUIC** | 主要传输层，低延迟、多路复用、内置 TLS 1.3 | `libp2p-quic` |
-| **WebRTC** | 浏览器穿透 + NAT 后备（规划中，见 `N1`） | `libp2p-webrtc` |
+| **WebRTC** | 浏览器节点传输（规划中；当前 native 节点走 QUIC/relay） | `libp2p-webrtc` |
 | **Kademlia** | 节点发现与 DHT 路由 | `libp2p-kad` |
 | **Gossipsub** | 消息广播（workspace 公告、AI 社会事件、任务发布） | `libp2p-gossipsub` |
 | **Request/Response** | 点对点 RPC（文件拉取、权能验证） | `libp2p-request-response` |
-| **AutoNAT + DCUtR** | NAT 类型探测 + 中继打洞（规划中，见 `N1`） | `libp2p-autonat` / `libp2p-dcutr` |
-| **Relay** | 为 NAT 后节点提供中继（规划中，见 `N1`） | `libp2p-relay` |
+| **AutoNAT + DCUtR** | NAT 类型探测 + 经 relay 协调的直连升级 | `libp2p-autonat` / `libp2p-dcutr` |
+| **Relay client** | 支持 `/p2p-circuit` 中继地址拨号，作为 NAT 后备路径 | `libp2p-relay` |
 
 ### 4.1.1 全球发现
 
@@ -148,10 +148,10 @@
 - 服务 workspace 的节点同时发布 `/nexus/workspace/1/<workspace-id>`，让 clone/discover 可以在不知道 PeerId 和 IP 的情况下按 workspace 查找 provider。
 - `nexus-node discover --global` 和 `nexus-node clone --global` 通过 bootstrap/rendezvous 节点进入 DHT，找到 provider 后用 request/response 拉取签名 workspace announcement，再验证 DID 签名、workspace root 和 owner。
 - `nexus-node discover --lan` / `clone --lan` 使用 mDNS 做同一局域网零配置发现，不要求手动填写 `--bootstrap`。
-- 公网发现仍需要至少一个可达 bootstrap/rendezvous 入口，但用户不必每次手写：解析顺序是 `--bootstrap <ADDR>`、`NEXUS_BOOTSTRAP`、`<base>/.nexus-bootstrap.json`、`<base>/.nexus-peer-cache.json`、本地已验证 discovery cache 中的可拨地址、编译期/内置 public seed list。`--no-public-bootstrap` 可关闭内置 public seed list；正式网络可通过 DNS multiaddr 或发布的种子节点列表提供这个入口。
+- 公网发现仍需要至少一个可达 bootstrap/rendezvous 入口，但用户不必每次手写：解析顺序是 `--bootstrap <ADDR>`、`NEXUS_BOOTSTRAP`、`<base>/.nexus-peer-cache.json`、`<base>/.nexus-bootstrap.json`、本地已验证 discovery cache 中的可拨地址、显式启用的 public rendezvous profile、编译期/内置 public seed list。`--no-public-bootstrap` 可关闭 public fallback；`NEXUS_PUBLIC_RENDEZVOUS=ipfs` 可把 `/dnsaddr/bootstrap.libp2p.io` 作为无主冷启动跳板。
 - workspace announcement 包含 name、description、owner、root、peer 和 addrs，发现列表默认按“可验证、可 clone、可连接”的相关性排序，也可用 `--sort latest|name|owner|clone-ready|relevance` 切换。
 
-`<base>/.nexus-bootstrap.json` 的稳定形态是 `{ "peers": ["<MULTIADDR>", ...] }`，其中 multiaddr 可以是 `/ip4/.../udp/.../quic-v1/p2p/<PEER_ID>`，也可以是 `/dns4/<HOST>/udp/.../quic-v1/p2p/<PEER_ID>` 这类 DNS-backed seed 地址。节点还会把已验证 announcement 中的 peer 地址和连接健康度写入 `<base>/.nexus-peer-cache.json`，后续公网发现会优先复用历史可达 peer。`nexus-node bootstrap status --base <DIR> [--json]` 可查看每个 bootstrap 来源和最终 effective peers。内置 public seed list 是连接入口，不是可信来源；即使通过 seed 找到 peer，workspace announcement、owner、root 和 block 仍按签名/CID 验证。
+`<base>/.nexus-bootstrap.json` 的稳定形态是 `{ "peers": ["<MULTIADDR>", ...] }`，其中 multiaddr 可以是 `/ip4/.../udp/.../quic-v1/p2p/<PEER_ID>`，也可以是 `/dns4/<HOST>/udp/.../quic-v1/p2p/<PEER_ID>` 或 `/dnsaddr/<HOST>` 这类 DNS-backed seed/rendezvous 地址。节点还会把已验证 announcement 中的 peer 地址和连接健康度写入 `<base>/.nexus-peer-cache.json`，后续公网发现会优先复用历史可达 peer。`nexus-node bootstrap status --base <DIR> [--json]` 可查看每个 bootstrap 来源和最终 effective peers。public seed/rendezvous 只是连接入口，不是可信来源；即使通过它找到 peer，workspace announcement、owner、root 和 block 仍按签名/CID 验证。
 
 这仍然保持自我主权身份：bootstrap 节点只负责让节点进入 DHT，不签发身份、不决定可信度，也不替代签名公告和社会层验证。
 
@@ -1170,7 +1170,7 @@ pub struct ResourcePricing {
 
 ## 10. 社会治理与风险模型
 
-> **实现状态**：部分实现。已实现 append-only 社会日志、每作者哈希链、equivocation proof、对抗性测试、治理裁决、争议、reputation 降权、执行隔离边界、secret 边界、私有社会事件、网络 spam 验证和日志 checkpoint。尚未完成的风险控制包括 NAT 穿透和 Kademlia eclipse 加固进阶约束，见 `N1`、`N3`。
+> **实现状态**：部分实现。已实现 append-only 社会日志、每作者哈希链、equivocation proof、对抗性测试、治理裁决、争议、reputation 降权、执行隔离边界、secret 边界、私有社会事件、网络 spam 验证、Kademlia 多路径/eclipsing 加固、NAT relay fallback 和日志 checkpoint。浏览器 WebRTC 节点传输仍在规划中。
 
 ### 10.1 风险模型
 

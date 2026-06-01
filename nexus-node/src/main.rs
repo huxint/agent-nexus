@@ -1417,6 +1417,10 @@ fn print_bootstrap_status_text(status: &BootstrapStatus) {
         status.discovery_cache_peers.len()
     );
     println!(
+        "public_rendezvous_peers: {}",
+        status.public_rendezvous_peers.len()
+    );
+    println!(
         "public_default_peers: {}",
         status.public_default_peers.len()
     );
@@ -5215,6 +5219,22 @@ mod tests {
                 config_peer.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn public_rendezvous_profile_expands_to_ipfs_dnsaddr_peers() {
+        let peers = public_rendezvous_bootstrap_peers_from_value("ipfs").unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].to_string(), "/dnsaddr/bootstrap.libp2p.io");
+    }
+
+    #[test]
+    fn public_rendezvous_accepts_explicit_multiaddr_hints() {
+        let (_addr, peer) = test_bootstrap_addr(4041);
+        let peers = public_rendezvous_bootstrap_peers_from_value(&peer.to_string()).unwrap();
+
+        assert_eq!(peers, vec![peer]);
     }
 
     #[test]

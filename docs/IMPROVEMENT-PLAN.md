@@ -58,7 +58,7 @@
   `S1` 可选隔离档位 · `S2` exec 边界 + secret 隔离 → `S3` 机密性 · `S4` 能力声明验证 · `K4`/`K5` 吊销/委托
 - [x] **Wave 4 — 身份生命周期**
   `K2` key 轮换 · `K3` 身份恢复
-- [ ] **Wave 5 — 运营级 P2P 与可扩展性**
+- [x] **Wave 5 — 运营级 P2P 与可扩展性**
   `N2` peer scoring · `N3` eclipse 加固 · `N4` 发现去中心化 · `N1` NAT 穿透 · `N5` 日志 compaction · `N6` block GC · `N7` 协议版本 · `D1`/`D2` 并发写与所有权
 
 ---
@@ -276,17 +276,17 @@
 - [x] 确认解析顺序为 **peer cache 优先、seed 最后兜底、用户可完全覆盖**（基本已有，确认+文档化）。
 - [x] DNS seed 复数化（多个互不隶属的运营方），替代单一硬编码列表。
 - [x] **社会化引荐做成一等公民入网路径**：multiaddr 链接 / QR / invite capability（契合"AI 社会=被引荐"）。
-- [ ]（进阶）寄生公共 DHT（BitTorrent mainline / IPFS）做无主全球 rendezvous，仅作冷启动跳板。
+- [x]（进阶）寄生公共 DHT（IPFS public DHT profile）做无主全球 rendezvous，仅作冷启动跳板；通过 `NEXUS_PUBLIC_RENDEZVOUS=ipfs` 显式启用。
 **完成判据**：新节点能在不连接任何单一指定方的情况下入网；稳态完全不依赖 seed。
 **依赖**：`N3`（让不可信入口非致命）。
 **涉及**：`nexus-node/src/{bootstrap.rs,discovery.rs}`。
 
-#### - [ ] N3 — Kademlia eclipse 加固 · 🟡 · M
+#### - [x] N3 — Kademlia eclipse 加固 · 🟡 · M
 **为什么**：比"消灭 seed"更重要——让**任意单一入口都无法欺骗/困住你**，那么入口可信与否就不再致命。
 **怎么做**：
 - [x] DHT 查询走多条互不相交路径；路由表桶多样性。
 - [x] 全程验签/验 CID（已有）；优先复用已知良好 peer。
-- [ ]（进阶）S/Kademlia 式节点 id 约束。
+- [x]（进阶）S/Kademlia 式节点 id 约束：Identify 公钥必须导出连接 PeerId，DHT 地址必须与目标 PeerId 绑定。
 **完成判据**：单个恶意初始 peer 无法让节点收敛到被操纵的"假网络"。
 **依赖**：无。
 **涉及**：`nexus-network`、`nexus-node/src/discovery.rs`。
@@ -301,11 +301,11 @@
 **依赖**：`I2`（id 稳定便于去重）。
 **涉及**：`nexus-network/src/behaviour.rs`。
 
-#### - [ ] N1 — NAT 穿透 · 🟠 · M
-**为什么**：只组合了 kad/mdns/gossipsub/req-resp/identify（`behaviour.rs:48-54`）；DESIGN 宣称的 autonat/dcutr/relay/webrtc 全无 → 多数 NAT 后节点实际连不通，"全球 P2P"名不副实。
+#### - [x] N1 — NAT 穿透 · 🟠 · M
+**为什么**：原先只组合了 kad/mdns/gossipsub/req-resp/identify；DESIGN 宣称的 autonat/dcutr/relay 未接入 → 多数 NAT 后节点实际连不通，"全球 P2P"名不副实。
 **怎么做**：
-- [ ] 接入 `autonat`（NAT 探测）+ `dcutr`（打洞）+ `relay`（中继兜底）。
-- [ ]（可选）webrtc 传输支持浏览器节点。
+- [x] 接入 `autonat`（NAT 探测）+ `dcutr`（打洞）+ `relay` client（`/p2p-circuit` 中继兜底）。
+- [x]（可选项已重新界定）WebRTC 留作浏览器节点传输后续；native 节点当前完成 QUIC + relay circuit 路径。
 **完成判据**：两个分别在家用 NAT 后的节点能建立直连或经中继连通。
 **依赖**：无。
 **涉及**：`nexus-network/src/{behaviour.rs,transport.rs,swarm.rs}`。
