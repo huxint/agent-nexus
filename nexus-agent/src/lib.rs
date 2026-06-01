@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod registry;
 pub mod society;
 pub mod task;
+mod task_market;
 
 pub use confidential::{ConfidentialEnvelopeError, EncryptedSocialEnvelope};
 pub use event_log::SocialEventLog;

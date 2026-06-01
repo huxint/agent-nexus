@@ -94,7 +94,7 @@
 
 ## 3. 分层架构
 
-> **实现状态**：部分实现。已落地的主干是身份/DID、内容寻址存储、workspace 快照、原生执行、libp2p QUIC/Kademlia/Gossipsub/Request-Response、签名社会事件、任务/治理/信誉/settlement 记录、机密社会事件信封和私有社会视图。规划中能力包括更完整的 NAT 穿透（`N1`）、Kademlia eclipse 加固进阶约束（`N3`）和 `society.rs` 模块拆分（`A1`）。
+> **实现状态**：部分实现。已落地的主干是身份/DID、内容寻址存储、workspace 快照、原生执行、libp2p QUIC/Kademlia/Gossipsub/Request-Response、签名社会事件、任务市场投影、治理/信誉/settlement 记录、机密社会事件信封和私有社会视图。规划中能力包括更完整的 NAT 穿透（`N1`）和 Kademlia eclipse 加固进阶约束（`N3`）。
 
 ```
 ┌───────────────────────────────────────────────────┐
@@ -703,7 +703,7 @@ Collective 还可以形成治理记忆：`CollectiveProposalPublished` 记录提
 
 社会事件入账不仅验签，还校验“事件作者”和事件内部主体是否一致：`ManifestPublished.manifest.did`、`IntentPublished.intent.author`、`IntentResponded.response.responder`、`InteractionRecorded.interaction.from`、`CollectiveDeclared.members`、`CollectiveProposalPublished.proposal.proposer`、`CollectiveVoteCast.vote.voter`、`CollectiveDecisionRecorded.decision.decider`、`CapabilityIssued.grant.capability.issuer`、`WorkspaceSnapshotted.snapshot.actor`、`WorkspaceRunRecorded.run.actor`、`TaskPublished.task.publisher`、`TaskOffered.offer.bidder`、`TaskAccepted.acceptance.publisher`、`TaskCancelled.cancellation.publisher`、`TaskCompleted.result.executor`、`TaskDisputed.dispute.disputer` 必须等于 `SocialEvent.author`。签名证明“谁发了事件”，主体校验防止一个 DID 冒充另一个 DID 发布 manifest、intent、intent response、collective 成员身份、治理行为、capability grant、workspace snapshot、workspace run、任务、报价、接受、取消、结果、争议或互动记忆。
 
-`Society` 从事件日志重放时会维护社会任务板：
+`Society` 从事件日志重放时通过独立的 task-market projection 维护社会任务板：
 
 - `TaskPublished` 注册 open task。
 - `TaskOffered` 按 task id 记录报价，并按价格稳定排序。
@@ -1398,9 +1398,10 @@ aether/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── manifest.rs        # AgentManifest: 能力/目标/价值/偏好
-│   │       ├── society.rs         # Society graph / Interaction / Collective
+│   │       ├── society.rs         # Society replay facade / graph / Interaction / Collective
+│   │       ├── task_market.rs     # Task-market projection state machine
 │   │       ├── task.rs            # Task 协议
-│   │       ├── market.rs          # TaskMarket
+│   │       ├── market.rs          # Local executable task market
 │   │       └── registry.rs        # AgentRegistry
 │   │
 │   ├── aether-node/               # 节点 binary
