@@ -39,4 +39,7 @@ fn sync_parent_dir(path: &Path) {
             let _ = dir.sync_all();
         }
     }
+
+    #[cfg(not(unix))]
+    let _ = path;
 }
