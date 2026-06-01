@@ -38,12 +38,21 @@ pub struct DiscoveredWorkspaceView {
     pub description: String,
     pub owner: Did,
     pub root: Option<String>,
+    pub concurrency_model: WorkspaceConcurrencyModel,
+    pub forked: bool,
+    pub fork_roots: Vec<String>,
     pub latest_timestamp: u64,
     pub verified: bool,
     pub clone_ready: bool,
     pub peers: Vec<String>,
     pub addrs: Vec<String>,
     pub announcements: Vec<WorkspaceAnnouncement>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceConcurrencyModel {
+    SnapshotForks,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -337,6 +346,8 @@ pub fn discovered_workspace_views(
         addrs.sort();
         addrs.dedup();
         let clone_ready = verified && !addrs.is_empty();
+        let fork_roots = workspace_fork_roots(authoritative_announcements);
+        let forked = fork_roots.len() > 1;
         if filter.verified_only && !verified {
             continue;
         }
@@ -349,6 +360,9 @@ pub fn discovered_workspace_views(
             description: latest.description.clone(),
             owner: latest.owner.clone(),
             root: latest.root.clone(),
+            concurrency_model: WorkspaceConcurrencyModel::SnapshotForks,
+            forked,
+            fork_roots,
             latest_timestamp: latest.timestamp,
             verified,
             clone_ready,
@@ -360,6 +374,16 @@ pub fn discovered_workspace_views(
 
     sort_discovered_workspace_views(&mut views, filter.sort);
     views
+}
+
+fn workspace_fork_roots(announcements: &[WorkspaceAnnouncement]) -> Vec<String> {
+    let mut roots = announcements
+        .iter()
+        .filter_map(|announcement| announcement.root.clone())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn sort_discovered_workspace_views(views: &mut [DiscoveredWorkspaceView], sort: DiscoverySort) {
