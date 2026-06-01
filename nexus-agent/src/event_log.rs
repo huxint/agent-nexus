@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nexus_core::Did;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Digest;
 
 use crate::protocol::{EquivocationProof, SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::{IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRotation, Society};
@@ -241,6 +242,48 @@ impl SocialEventLog {
             std::iter::empty(),
             std::iter::empty(),
         )
+    }
+
+    pub fn from_migrated_legacy_base(
+        society: &Society,
+        authors: impl IntoIterator<Item = Did>,
+        event_count: usize,
+    ) -> Result<Self, SocialProtocolError> {
+        let mut log = Self::new();
+        let mut heads = authors
+            .into_iter()
+            .map(|author| (author.clone(), (0, migration_anchor_id(&author))))
+            .collect::<HashMap<_, _>>();
+        let mut rotations = HashMap::new();
+        for rotation in society.identity_rotations() {
+            rotations.insert(rotation.previous.clone(), rotation.next.clone());
+        }
+        let mut recovery_policies = HashMap::new();
+        for policy in society.identity_recovery_policies() {
+            recovery_policies.insert(policy.identity.clone(), policy.clone());
+        }
+        let mut recovery_approvals = HashMap::new();
+        for author in society.agents() {
+            for approval in society.identity_recovery_approvals(author) {
+                recovery_approvals
+                    .insert(identity_recovery_approval_key(approval), approval.clone());
+                heads
+                    .entry(approval.guardian.clone())
+                    .or_insert_with(|| (0, migration_anchor_id(&approval.guardian)));
+            }
+        }
+        log.heads = heads;
+        log.rotations = rotations;
+        log.recovery_policies = recovery_policies;
+        log.recovery_approvals = recovery_approvals;
+        log.compacted_base = Some(CompactedEventLogBase::from_log_state(
+            &log,
+            society,
+            event_count,
+            0,
+        ));
+        log.rebuild_index()?;
+        Ok(log)
     }
 
     fn from_parts(
@@ -786,6 +829,13 @@ fn fill_observed_times(observed_at: Vec<u64>) -> impl Iterator<Item = u64> {
 
 fn event_replay_key(event: &SocialEvent) -> (u64, &str, String) {
     (event.seq, event.id.as_str(), event.author.to_string())
+}
+
+fn migration_anchor_id(author: &Did) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"nexus:social-event:legacy-migration-anchor:v1");
+    hasher.update(author.as_str().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn society_cbor_hex(society: &Society) -> String {

@@ -32,6 +32,7 @@ use cli_args::*;
 use discovery::*;
 use ids::{parse_cid, parse_workspace_id};
 use local_state::*;
+use nexus_agent::migrate_legacy_social_memory_json;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
@@ -138,6 +139,9 @@ fn print_usage(prog: &str) {
         "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
     eprintln!("  {prog} social-memory compact --base <DIR> --retain-events <N>");
+    eprintln!(
+        "  {prog} social-memory migrate-wire --base <DIR> --input <OLD_JSON> [--output <NEW_JSON>] [--force]"
+    );
     eprintln!("  {prog} act --base <DIR> --intent <ID> --kind <respond-intent|offer-task|join-workspace|propose-collective> [--body <TEXT>] [--price <N>] [--eta <SECS>] [--collective <ID>] [--proposal <ID>] [--deadline <TS>]");
     eprintln!("  {prog} event manifest --base <DIR> [--name <NAME>] [--description <TEXT>] [--provide <NAME>] [--goal <TEXT>] [--value <TEXT>] [--preference <TEXT>] [--role <TEXT>]");
     eprintln!("  {prog} event intent --base <DIR> --kind <goal|need|offer|proposal|status> --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>]");
@@ -1459,10 +1463,11 @@ fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_social_memory(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 3 {
-        return Err("social-memory subcommand required: compact".into());
+        return Err("social-memory subcommand required: compact or migrate-wire".into());
     }
     match args[2].as_str() {
         "compact" => cmd_social_memory_compact(args),
+        "migrate-wire" => cmd_social_memory_migrate_wire(args),
         other => Err(format!("unknown social-memory subcommand: {other}").into()),
     }
 }
@@ -1510,6 +1515,67 @@ fn cmd_social_memory_compact(args: &[String]) -> Result<(), Box<dyn std::error::
     if before_total != memory.event_count() {
         return Err("social memory compaction changed logical event count".into());
     }
+    Ok(())
+}
+
+fn cmd_social_memory_migrate_wire(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut input = None;
+    let mut output = None;
+    let mut force = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--input" => {
+                i += 1;
+                input = Some(PathBuf::from(required_arg(args, i, "--input")?));
+            }
+            "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(required_arg(args, i, "--output")?));
+            }
+            "--force" => {
+                force = true;
+            }
+            other => {
+                return Err(format!("unknown social-memory migrate-wire option: {other}").into())
+            }
+        }
+        i += 1;
+    }
+
+    let input = input.unwrap_or_else(|| base.join(".nexus-social-memory.json"));
+    let output = output.unwrap_or_else(|| base.join(".nexus-social-memory.json"));
+    if output.exists() && !force && output != input {
+        return Err(format!(
+            "refusing to overwrite existing {}; pass --force",
+            output.display()
+        )
+        .into());
+    }
+    if output.exists() && output == input && !force {
+        return Err(format!(
+            "refusing to rewrite {}; pass --force or use --output",
+            output.display()
+        )
+        .into());
+    }
+
+    let data = std::fs::read(&input)?;
+    let (memory, report) = migrate_legacy_social_memory_json(&data)?;
+    save_social_memory(&output, &memory)?;
+    println!(
+        "Social memory wire migrated: legacy_events={} migrated_events={} duplicate_events={} unsupported_events={} output={}",
+        report.legacy_events,
+        report.migrated_events,
+        report.duplicate_events,
+        report.unsupported_events,
+        output.display()
+    );
     Ok(())
 }
 
@@ -7154,6 +7220,52 @@ mod tests {
                 .unwrap();
         assert_eq!(raw["log"]["events"].as_array().unwrap().len(), 1);
         assert!(raw["log"]["compacted_base"].is_object());
+    }
+
+    #[test]
+    fn social_memory_migrate_wire_command_writes_current_memory() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let legacy_path = temp.path().join("legacy-social-memory.json");
+        let migrated_path = temp.path().join("migrated-social-memory.json");
+        let event = nexus_agent::legacy_social_event_json(
+            identity.did().clone(),
+            91,
+            SocialEventKind::WorkspaceJoined {
+                workspace: WorkspaceId::from_bytes([91; 32]),
+            },
+            &identity,
+        )
+        .unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "log": {
+                    "events": [serde_json::from_slice::<serde_json::Value>(&event).unwrap()]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        cmd_social_memory(&[
+            "nexus-node".into(),
+            "social-memory".into(),
+            "migrate-wire".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--input".into(),
+            legacy_path.to_string_lossy().to_string(),
+            "--output".into(),
+            migrated_path.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        let migrated = load_social_memory(&migrated_path).unwrap();
+        assert_eq!(migrated.event_count(), 1);
+        assert_eq!(migrated.retained_event_count(), 0);
+        assert_eq!(migrated.compacted_event_count(), 1);
+        assert!(migrated.society().has_agent(identity.did()));
     }
 
     #[test]
