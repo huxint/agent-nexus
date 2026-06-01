@@ -6,6 +6,7 @@
 //! settle payments through the credit ledger.
 
 pub mod event_log;
+pub mod legacy;
 pub mod manifest;
 pub mod market;
 pub mod memory;
@@ -15,6 +16,9 @@ pub mod society;
 pub mod task;
 
 pub use event_log::SocialEventLog;
+pub use legacy::{
+    legacy_social_event_json, migrate_legacy_social_memory_json, LegacySocialMemoryMigration,
+};
 pub use manifest::{AgentManifest, CapabilityDecl};
 pub use market::TaskMarket;
 pub use memory::{SocialMemory, MAX_SOCIAL_EVENT_JSON_BYTES};
