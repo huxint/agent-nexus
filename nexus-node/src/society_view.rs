@@ -207,8 +207,12 @@ pub(crate) fn society_json_for_base(
         .into_iter()
         .filter(|workspace| workspace_matches_filters(society, workspace, &options))
         .map(|workspace| {
+            let fork_roots = workspace_snapshot_fork_roots(society, &workspace);
             serde_json::json!({
                 "id": workspace.to_string(),
+                "concurrency_model": "snapshot_forks",
+                "forked": fork_roots.len() > 1,
+                "fork_roots": fork_roots,
                 "members": society
                     .workspace_members(&workspace)
                     .into_iter()
@@ -1281,6 +1285,20 @@ fn workspace_snapshot_json(snapshot: &WorkspaceSnapshot) -> serde_json::Value {
         "note": snapshot.note,
         "timestamp": snapshot.timestamp,
     })
+}
+
+fn workspace_snapshot_fork_roots(
+    society: &nexus_agent::Society,
+    workspace: &WorkspaceId,
+) -> Vec<String> {
+    let mut roots = society
+        .workspace_snapshots(workspace)
+        .into_iter()
+        .map(|snapshot| hex::encode(snapshot.root.as_bytes()))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn workspace_ownership_fact_json(fact: WorkspaceOwnershipFact) -> serde_json::Value {

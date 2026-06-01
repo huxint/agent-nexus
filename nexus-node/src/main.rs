@@ -370,9 +370,11 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut discovered_source = None;
+    let mut discovered_fork_roots = Vec::new();
     let mut peer_ready = false;
     if peer.is_none() || bootstrap.is_empty() {
         if let Some(discovered) = discover_clone_source(&base, &workspace_id, peer.as_ref())? {
+            discovered_fork_roots = discovered_workspace_fork_roots(&base, &workspace_id);
             if peer.is_none() {
                 peer = Some(discovered.peer);
             }
@@ -399,6 +401,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         if let Some(discovered) = discover_clone_source(&base, &workspace_id, None)? {
+            discovered_fork_roots = discovered_workspace_fork_roots(&base, &workspace_id);
             let discovered_peer = discovered.peer;
             peer = Some(discovered_peer);
             if bootstrap.is_empty() {
@@ -533,7 +536,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         actor: identity.did().clone(),
                         root: cloned_root,
                         label: Some("cloned".into()),
-                        note: Some(format!("cloned from peer {peer}")),
+                        note: Some(clone_snapshot_note(peer, &discovered_fork_roots)),
                         timestamp: now,
                     },
                 },
@@ -557,6 +560,36 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         hex::encode(cloned_root.as_bytes())
     );
     Ok(())
+}
+
+fn discovered_workspace_fork_roots(base: &Path, workspace_id: &WorkspaceId) -> Vec<String> {
+    load_workspace_discovery(base)
+        .map(|announcements| {
+            discovered_workspace_views(
+                &announcements,
+                &DiscoveryFilter {
+                    workspace: Some(workspace_id.to_string()),
+                    verified_only: true,
+                    ..Default::default()
+                },
+            )
+            .into_iter()
+            .next()
+            .map(|view| view.fork_roots)
+            .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+fn clone_snapshot_note(peer: libp2p::PeerId, fork_roots: &[String]) -> String {
+    if fork_roots.len() <= 1 {
+        return format!("cloned from peer {peer}");
+    }
+
+    format!(
+        "cloned from peer {peer}; snapshot-forks observed roots={}",
+        fork_roots.join(",")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4806,6 +4839,12 @@ mod tests {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
 
+    fn sorted_strings<const N: usize>(items: [String; N]) -> Vec<String> {
+        let mut items = items.into_iter().collect::<Vec<_>>();
+        items.sort();
+        items
+    }
+
     fn signed_workspace_event(identity: &NodeIdentity, byte: u8, timestamp: u64) -> SocialEvent {
         SocialEvent::new(
             identity.did().clone(),
@@ -5211,6 +5250,62 @@ mod tests {
         );
         assert_eq!(views[0].announcements.len(), 2);
         assert_eq!(views[0].announcements[0].peer, "peer-b");
+    }
+
+    #[test]
+    fn discovered_workspace_views_expose_snapshot_forks() {
+        let owner = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([91; 32]).to_string();
+        let root_a = hex::encode(Cid::hash_of(b"branch-a").as_bytes());
+        let root_b = hex::encode(Cid::hash_of(b"branch-b").as_bytes());
+        let peer_a = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let peer_b = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let announcements = [
+            sign_workspace_announcement(
+                WorkspaceAnnouncement {
+                    version: WORKSPACE_ANNOUNCEMENT_VERSION,
+                    peer: peer_a.to_string(),
+                    addrs: vec![format!("/ip4/127.0.0.1/udp/4101/quic-v1/p2p/{peer_a}")],
+                    author: owner.did().clone(),
+                    workspace: workspace.clone(),
+                    name: "forked-lab".into(),
+                    description: "first branch".into(),
+                    owner: owner.did().clone(),
+                    root: Some(root_a.clone()),
+                    timestamp: 10,
+                    signature: None,
+                },
+                &owner,
+            )
+            .unwrap(),
+            sign_workspace_announcement(
+                WorkspaceAnnouncement {
+                    version: WORKSPACE_ANNOUNCEMENT_VERSION,
+                    peer: peer_b.to_string(),
+                    addrs: vec![format!("/ip4/127.0.0.1/udp/4102/quic-v1/p2p/{peer_b}")],
+                    author: owner.did().clone(),
+                    workspace: workspace.clone(),
+                    name: "forked-lab".into(),
+                    description: "second branch".into(),
+                    owner: owner.did().clone(),
+                    root: Some(root_b.clone()),
+                    timestamp: 11,
+                    signature: None,
+                },
+                &owner,
+            )
+            .unwrap(),
+        ];
+
+        let views = discovered_workspace_views(&announcements, &DiscoveryFilter::default());
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].concurrency_model,
+            WorkspaceConcurrencyModel::SnapshotForks
+        );
+        assert!(views[0].forked);
+        assert_eq!(views[0].fork_roots, sorted_strings([root_a, root_b]));
     }
 
     #[tokio::test]
@@ -7266,6 +7361,62 @@ mod tests {
         assert_eq!(migrated.retained_event_count(), 0);
         assert_eq!(migrated.compacted_event_count(), 1);
         assert!(migrated.society().has_agent(identity.did()));
+    }
+
+    #[test]
+    fn society_json_marks_workspace_snapshot_forks() {
+        let identity = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([42; 32]);
+        let root_a = Cid::hash_of(b"society-branch-a");
+        let root_b = Cid::hash_of(b"society-branch-b");
+        let mut memory = SocialMemory::new();
+        let events = memory
+            .sign_event_sequence(
+                &identity,
+                [
+                    (1, SocialEventKind::WorkspaceJoined { workspace }),
+                    (
+                        2,
+                        SocialEventKind::WorkspaceSnapshotted {
+                            snapshot: WorkspaceSnapshot {
+                                workspace,
+                                actor: identity.did().clone(),
+                                root: root_a,
+                                label: Some("branch-a".into()),
+                                note: None,
+                                timestamp: 2,
+                            },
+                        },
+                    ),
+                    (
+                        3,
+                        SocialEventKind::WorkspaceSnapshotted {
+                            snapshot: WorkspaceSnapshot {
+                                workspace,
+                                actor: identity.did().clone(),
+                                root: root_b,
+                                label: Some("branch-b".into()),
+                                note: None,
+                                timestamp: 3,
+                            },
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(memory.ingest_events(events).unwrap(), 3);
+
+        let view = society_json(&memory);
+
+        assert_eq!(view["workspaces"][0]["concurrency_model"], "snapshot_forks");
+        assert_eq!(view["workspaces"][0]["forked"], true);
+        assert_eq!(
+            view["workspaces"][0]["fork_roots"],
+            serde_json::json!(sorted_strings([
+                hex::encode(root_a.as_bytes()),
+                hex::encode(root_b.as_bytes())
+            ]))
+        );
     }
 
     #[test]
