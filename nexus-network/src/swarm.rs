@@ -13,6 +13,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder,
 };
+use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -59,6 +60,20 @@ pub type SocialEventValidator = Arc<dyn Fn(&[u8]) -> gossipsub::MessageAcceptanc
 
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
+    AutonatStatusChanged {
+        old: String,
+        new: String,
+    },
+    AutonatEvent {
+        event: String,
+    },
+    DcutrEvent {
+        remote_peer_id: PeerId,
+        result: String,
+    },
+    RelayEvent {
+        event: String,
+    },
     PeerDiscovered {
         peer_id: PeerId,
     },
@@ -86,6 +101,14 @@ pub enum NetworkEvent {
         request_id: InboundRequestId,
         request: SyncRequest,
     },
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct NetworkDiagnostics {
+    pub local_peer_id: String,
+    pub listen_addrs: Vec<String>,
+    pub connected_peers: Vec<String>,
+    pub connected_peer_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +345,30 @@ impl Network {
             .map(|addrs| addrs.clone())
             .unwrap_or_default()
     }
+    pub fn diagnostics(&self) -> NetworkDiagnostics {
+        let mut listen_addrs = self
+            .listen_addrs()
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>();
+        listen_addrs.sort();
+        listen_addrs.dedup();
+
+        let mut connected_peers = self
+            .connected_peers
+            .lock()
+            .map(|peers| peers.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        connected_peers.sort();
+        connected_peers.dedup();
+
+        NetworkDiagnostics {
+            local_peer_id: self.local_peer_id.to_string(),
+            connected_peer_count: connected_peers.len(),
+            listen_addrs,
+            connected_peers,
+        }
+    }
     pub fn is_connected(&self, peer: PeerId) -> bool {
         self.connected_peers
             .lock()
@@ -420,9 +467,16 @@ fn handle_swarm_event(event: SwarmEvent<ToSwarm>, ctx: SwarmEventContext<'_>) {
     match event {
         SwarmEvent::Behaviour(ToSwarm::Autonat(autonat::Event::StatusChanged { old, new })) => {
             debug!("autonat status changed: {old:?} -> {new:?}");
+            let _ = ctx.event_tx.send(NetworkEvent::AutonatStatusChanged {
+                old: format!("{old:?}"),
+                new: format!("{new:?}"),
+            });
         }
         SwarmEvent::Behaviour(ToSwarm::Autonat(event)) => {
             debug!("autonat event: {event:?}");
+            let _ = ctx.event_tx.send(NetworkEvent::AutonatEvent {
+                event: format!("{event:?}"),
+            });
         }
         SwarmEvent::Behaviour(ToSwarm::Dcutr(dcutr::Event {
             remote_peer_id,
@@ -432,13 +486,24 @@ fn handle_swarm_event(event: SwarmEvent<ToSwarm>, ctx: SwarmEventContext<'_>) {
                 debug!(
                         "direct connection upgrade succeeded with {remote_peer_id} on {connection_id:?}"
                     );
+                let _ = ctx.event_tx.send(NetworkEvent::DcutrEvent {
+                    remote_peer_id,
+                    result: format!("ok:{connection_id:?}"),
+                });
             }
             Err(err) => {
                 debug!("direct connection upgrade failed with {remote_peer_id}: {err:?}");
+                let _ = ctx.event_tx.send(NetworkEvent::DcutrEvent {
+                    remote_peer_id,
+                    result: format!("err:{err:?}"),
+                });
             }
         },
         SwarmEvent::Behaviour(ToSwarm::Relay(event)) => {
             debug!("relay event: {event:?}");
+            let _ = ctx.event_tx.send(NetworkEvent::RelayEvent {
+                event: format!("{event:?}"),
+            });
         }
         SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::RoutingUpdated {
             peer,

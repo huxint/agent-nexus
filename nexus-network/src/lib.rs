@@ -21,6 +21,7 @@ pub mod swarm;
 pub mod transport;
 
 pub use swarm::{
-    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkEvent,
+    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkDiagnostics,
+    NetworkEvent,
 };
 pub use transport::{to_libp2p_keypair, to_peer_id};
