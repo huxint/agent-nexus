@@ -9,6 +9,7 @@
 //!   nexus-node exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
+//!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -17,6 +18,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
 
 mod bootstrap;
 mod cli_args;
@@ -50,7 +53,8 @@ use nexus_crypto::capability::sign_capability;
 use nexus_crypto::NodeIdentity;
 use nexus_economy::SettlementProof;
 use nexus_network::{
-    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkEvent,
+    global_discovery_key, workspace_discovery_key, Network, NetworkConfig, NetworkDiagnostics,
+    NetworkEvent,
 };
 use nexus_runtime::{ExecError, ExecIsolation, ExecOptions, ProcessOutput, ResourceUsage};
 use nexus_storage::{BlockStore, Cid, DiskBlockStore};
@@ -73,6 +77,8 @@ use state::write_file_atomic;
 const WORKSPACE_OBSERVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_WORKSPACE_ANNOUNCEMENTS_PER_RESPONSE: usize = 256;
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_NETWORK_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
+const NETWORK_STATUS_RECENT_EVENT_LIMIT: usize = 16;
 
 fn strict_social_event_validator(data: &[u8]) -> libp2p::gossipsub::MessageAcceptance {
     if data.len() > MAX_SOCIAL_EVENT_JSON_BYTES {
@@ -114,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "serve" => cmd_serve(&args).await?,
         "discover" => cmd_discover(&args).await?,
         "bootstrap" => cmd_bootstrap(&args)?,
+        "network" => cmd_network(&args).await?,
         "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
         "social-memory" | "memory" => cmd_social_memory(&args)?,
@@ -136,6 +143,7 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} bootstrap status --base <DIR> [--json] [--invite <ADDR>] [--no-public-bootstrap]"
     );
+    eprintln!("  {prog} network status --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--timeout-ms <N>]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
@@ -1427,6 +1435,289 @@ fn print_bootstrap_status_text(status: &BootstrapStatus) {
     println!("effective_peers: {}", status.effective_peers.len());
     for peer in &status.effective_peers {
         println!("  {peer}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// network
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct NetworkStatusReport {
+    base: String,
+    public_defaults_enabled: bool,
+    bootstrap_peers: Vec<String>,
+    observed_for_ms: u64,
+    diagnostics: NetworkDiagnostics,
+    autonat: AutonatStatusReport,
+    dcutr_events: Vec<DcutrStatusEvent>,
+    relay_events: Vec<String>,
+    recent_events: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+struct AutonatStatusReport {
+    current_status: Option<String>,
+    status_changes: Vec<AutonatStatusChange>,
+    events: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AutonatStatusChange {
+    old: String,
+    new: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct DcutrStatusEvent {
+    remote_peer_id: String,
+    result: String,
+}
+
+async fn cmd_network(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.get(2).map(String::as_str) != Some("status") {
+        return Err("network subcommand required: status".into());
+    }
+
+    let mut base = PathBuf::from(".");
+    let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
+    let mut bootstrap = Vec::new();
+    let mut use_public_bootstrap = true;
+    let mut timeout = DEFAULT_NETWORK_STATUS_TIMEOUT;
+    let mut json = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--json" => {
+                json = true;
+            }
+            "--listen" => {
+                i += 1;
+                listen = required_arg(args, i, "--listen")?.to_string();
+            }
+            "--bootstrap" => {
+                i += 1;
+                bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
+            }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(&mut bootstrap, required_arg(args, i, "--invite")?)?;
+            }
+            "--no-public-bootstrap" => {
+                use_public_bootstrap = false;
+            }
+            "--timeout-ms" => {
+                i += 1;
+                let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
+                timeout = Duration::from_millis(millis);
+            }
+            other => return Err(format!("unknown network status option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if bootstrap.is_empty() {
+        bootstrap = default_bootstrap_peers(&base, use_public_bootstrap)?;
+    }
+
+    let identity = load_or_create_identity(&base)?;
+    let network = Network::new(
+        &identity,
+        network_config(listen.parse()?, bootstrap.clone()),
+    )
+    .await?;
+    let report =
+        collect_network_status(&base, &network, &bootstrap, use_public_bootstrap, timeout).await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_network_status_text(&report);
+    }
+    Ok(())
+}
+
+async fn collect_network_status(
+    base: &Path,
+    network: &Network,
+    bootstrap_peers: &[libp2p::Multiaddr],
+    public_defaults_enabled: bool,
+    timeout: Duration,
+) -> NetworkStatusReport {
+    let started_at = Instant::now();
+    let mut events = network.clone();
+    let mut autonat = AutonatStatusReport::default();
+    let mut dcutr_events = Vec::new();
+    let mut relay_events = Vec::new();
+    let mut recent_events = Vec::new();
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            event = events.next_event() => {
+                let Some(event) = event else {
+                    break;
+                };
+                record_network_status_event(
+                    event,
+                    &mut autonat,
+                    &mut dcutr_events,
+                    &mut relay_events,
+                    &mut recent_events,
+                );
+            }
+        }
+    }
+
+    NetworkStatusReport {
+        base: base.display().to_string(),
+        public_defaults_enabled,
+        bootstrap_peers: stringify_status_multiaddrs(bootstrap_peers),
+        observed_for_ms: duration_millis(started_at.elapsed()),
+        diagnostics: network.diagnostics(),
+        autonat,
+        dcutr_events,
+        relay_events,
+        recent_events,
+    }
+}
+
+fn record_network_status_event(
+    event: NetworkEvent,
+    autonat: &mut AutonatStatusReport,
+    dcutr_events: &mut Vec<DcutrStatusEvent>,
+    relay_events: &mut Vec<String>,
+    recent_events: &mut Vec<String>,
+) {
+    match &event {
+        NetworkEvent::AutonatStatusChanged { old, new } => {
+            autonat.current_status = Some(new.clone());
+            autonat.status_changes.push(AutonatStatusChange {
+                old: old.clone(),
+                new: new.clone(),
+            });
+        }
+        NetworkEvent::AutonatEvent { event } => {
+            autonat.events.push(event.clone());
+        }
+        NetworkEvent::DcutrEvent {
+            remote_peer_id,
+            result,
+        } => {
+            dcutr_events.push(DcutrStatusEvent {
+                remote_peer_id: remote_peer_id.to_string(),
+                result: result.clone(),
+            });
+        }
+        NetworkEvent::RelayEvent { event } => {
+            relay_events.push(event.clone());
+        }
+        _ => {}
+    }
+
+    if let Some(summary) = network_status_event_summary(&event) {
+        push_recent_network_event(recent_events, summary);
+    }
+}
+
+fn network_status_event_summary(event: &NetworkEvent) -> Option<String> {
+    match event {
+        NetworkEvent::AutonatStatusChanged { old, new } => {
+            Some(format!("autonat_status_changed {old} -> {new}"))
+        }
+        NetworkEvent::AutonatEvent { event } => Some(format!("autonat_event {event}")),
+        NetworkEvent::DcutrEvent {
+            remote_peer_id,
+            result,
+        } => Some(format!("dcutr_event peer={remote_peer_id} result={result}")),
+        NetworkEvent::RelayEvent { event } => Some(format!("relay_event {event}")),
+        NetworkEvent::PeerDiscovered { peer_id } => Some(format!("peer_discovered {peer_id}")),
+        NetworkEvent::ProvidersFound { key, providers } => Some(format!(
+            "providers_found key={} providers={}",
+            String::from_utf8_lossy(key),
+            providers.len()
+        )),
+        NetworkEvent::RoutingUpdated { peer_id, is_new } => {
+            Some(format!("routing_updated peer={peer_id} is_new={is_new}"))
+        }
+        NetworkEvent::PeerConnected(peer) => Some(format!("peer_connected {peer}")),
+        NetworkEvent::PeerDisconnected(peer) => Some(format!("peer_disconnected {peer}")),
+        NetworkEvent::Listening(addr) => Some(format!("listening {addr}")),
+        NetworkEvent::WorkspaceAnnounce { source, .. } => {
+            Some(format!("workspace_announce source={source:?}"))
+        }
+        NetworkEvent::SocialEvent { source, .. } => Some(format!("social_event source={source:?}")),
+        NetworkEvent::SyncRequest { peer, .. } => Some(format!("sync_request peer={peer}")),
+    }
+}
+
+fn push_recent_network_event(events: &mut Vec<String>, event: String) {
+    events.push(event);
+    if events.len() > NETWORK_STATUS_RECENT_EVENT_LIMIT {
+        let excess = events.len() - NETWORK_STATUS_RECENT_EVENT_LIMIT;
+        events.drain(0..excess);
+    }
+}
+
+fn stringify_status_multiaddrs(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
+    let mut addrs = addrs.iter().map(ToString::to_string).collect::<Vec<_>>();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn print_network_status_text(report: &NetworkStatusReport) {
+    println!("Network status: {}", report.base);
+    println!("peer: {}", report.diagnostics.local_peer_id);
+    println!("observed_for_ms: {}", report.observed_for_ms);
+    println!(
+        "public_default_peers: {}",
+        if report.public_defaults_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("bootstrap_peers: {}", report.bootstrap_peers.len());
+    for peer in &report.bootstrap_peers {
+        println!("  {peer}");
+    }
+    println!("listen_addrs: {}", report.diagnostics.listen_addrs.len());
+    for addr in &report.diagnostics.listen_addrs {
+        println!("  {addr}");
+    }
+    println!(
+        "connected_peers: {}",
+        report.diagnostics.connected_peer_count
+    );
+    for peer in &report.diagnostics.connected_peers {
+        println!("  {peer}");
+    }
+    println!(
+        "autonat_status: {}",
+        report
+            .autonat
+            .current_status
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!("autonat_events: {}", report.autonat.events.len());
+    println!("dcutr_events: {}", report.dcutr_events.len());
+    println!("relay_events: {}", report.relay_events.len());
+    println!("recent_events: {}", report.recent_events.len());
+    for event in &report.recent_events {
+        println!("  {event}");
     }
 }
 
@@ -5069,9 +5360,96 @@ mod tests {
             .expect_err("missing serve value should be an error");
         assert!(serve_err.to_string().contains("--listen requires a value"));
 
+        let network_err = cmd_network(&args(&["nexus-node", "network", "status", "--listen"]))
+            .await
+            .expect_err("missing network status value should be an error");
+        assert!(network_err
+            .to_string()
+            .contains("--listen requires a value"));
+
         let society_err = cmd_society(&args(&["nexus-node", "society", "--base"]))
             .expect_err("missing society value should be an error");
         assert!(society_err.to_string().contains("--base requires a value"));
+    }
+
+    #[test]
+    fn network_status_event_recorder_tracks_connectivity_events() {
+        let peer = nexus_network::to_peer_id(&NodeIdentity::generate());
+        let mut autonat = AutonatStatusReport::default();
+        let mut dcutr_events = Vec::new();
+        let mut relay_events = Vec::new();
+        let mut recent_events = Vec::new();
+
+        record_network_status_event(
+            NetworkEvent::AutonatStatusChanged {
+                old: "Unknown".into(),
+                new: "Public".into(),
+            },
+            &mut autonat,
+            &mut dcutr_events,
+            &mut relay_events,
+            &mut recent_events,
+        );
+        record_network_status_event(
+            NetworkEvent::DcutrEvent {
+                remote_peer_id: peer,
+                result: "ok:ConnectionId(1)".into(),
+            },
+            &mut autonat,
+            &mut dcutr_events,
+            &mut relay_events,
+            &mut recent_events,
+        );
+        record_network_status_event(
+            NetworkEvent::RelayEvent {
+                event: "ReservationReqAccepted".into(),
+            },
+            &mut autonat,
+            &mut dcutr_events,
+            &mut relay_events,
+            &mut recent_events,
+        );
+
+        assert_eq!(autonat.current_status.as_deref(), Some("Public"));
+        assert_eq!(
+            autonat.status_changes,
+            vec![AutonatStatusChange {
+                old: "Unknown".into(),
+                new: "Public".into(),
+            }]
+        );
+        assert_eq!(
+            dcutr_events,
+            vec![DcutrStatusEvent {
+                remote_peer_id: peer.to_string(),
+                result: "ok:ConnectionId(1)".into(),
+            }]
+        );
+        assert_eq!(relay_events, vec!["ReservationReqAccepted"]);
+        assert_eq!(recent_events.len(), 3);
+        assert!(recent_events[0].contains("autonat_status_changed"));
+        assert!(recent_events[1].contains("dcutr_event"));
+        assert!(recent_events[2].contains("relay_event"));
+    }
+
+    #[tokio::test]
+    async fn network_status_command_runs_short_loopback_probe() {
+        let temp = TempDir::new().unwrap();
+        cmd_network(&[
+            "nexus-node".into(),
+            "network".into(),
+            "status".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--listen".into(),
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "--no-public-bootstrap".into(),
+            "--timeout-ms".into(),
+            "20".into(),
+            "--json".into(),
+        ])
+        .await
+        .unwrap();
     }
 
     #[test]
