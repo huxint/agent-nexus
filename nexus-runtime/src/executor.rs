@@ -161,6 +161,7 @@ struct LaunchPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchEnvironment {
     Direct,
+    #[cfg(target_os = "linux")]
     Wrapper,
 }
 
@@ -485,6 +486,9 @@ fn launch_plan(
     args: &[&str],
     options: &ExecOptions,
 ) -> Result<LaunchPlan, Box<ExecError>> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = workspace_dir;
+
     match options.isolation {
         ExecIsolation::Native => Ok(LaunchPlan {
             program: PathBuf::from(program),
@@ -610,6 +614,7 @@ fn configure_launch_environment<C: ChildEnvironment>(
         LaunchEnvironment::Direct => {
             configure_child_environment(cmd, workspace_dir, working_dir, options)
         }
+        #[cfg(target_os = "linux")]
         LaunchEnvironment::Wrapper => {
             cmd.clear_env();
             cmd.set_env("PATH", DEFAULT_EXEC_PATH);
