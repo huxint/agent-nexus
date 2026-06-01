@@ -21,13 +21,14 @@ seeded paths:
 - explicit CLI bootstrap,
 - environment/config bootstrap,
 - peer cache and discovery cache,
+- opt-in public rendezvous profiles such as `NEXUS_PUBLIC_RENDEZVOUS=ipfs`,
 - public seed list as fallback,
-- social introduction links or invites as first-class future inputs.
+- social introduction links or invites.
 
 ## Consequences
 
 - Users can disable public seeds.
 - Workspace announcements, owner signatures, roots, and block CIDs must still be
   verified after discovery.
-- N4 work should add more independent seed options and social invitation flows
-  without making any seed authoritative.
+- Public rendezvous and invitation flows must stay non-authoritative. They can
+  introduce peers, but every discovered workspace claim still has to verify.

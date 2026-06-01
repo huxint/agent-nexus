@@ -1,7 +1,7 @@
-//! Composite [`NetworkBehaviour`] — Kademlia + Identify + Gossipsub + WorkspaceSync.
+//! Composite [`NetworkBehaviour`] — Kademlia + Identify + Gossipsub + WorkspaceSync + NAT traversal.
 
 use libp2p::{
-    gossipsub, identify, kad, mdns,
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
     PeerId, StreamProtocol,
 };
@@ -24,6 +24,9 @@ const GOSSIP_MAX_TRANSMIT_SIZE: usize = 1_048_576;
 /// Unified event emitted by our composite behaviour.
 #[derive(Debug)]
 pub enum BehaviourEvent {
+    Autonat(autonat::Event),
+    Dcutr(dcutr::Event),
+    Relay(relay::client::Event),
     Kad(kad::Event),
     Mdns(mdns::Event),
     Identify(Box<identify::Event>),
@@ -49,6 +52,9 @@ pub enum BehaviourEvent {
 #[derive(NetworkBehaviourDerive)]
 #[behaviour(to_swarm = "ToSwarm")]
 pub struct CompositeBehaviour {
+    pub autonat: autonat::Behaviour,
+    pub dcutr: dcutr::Behaviour,
+    pub relay: relay::client::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub gossipsub: gossipsub::Behaviour,
@@ -59,6 +65,9 @@ pub struct CompositeBehaviour {
 /// Unified event we convert to in `ToSwarm`.
 #[derive(Debug)]
 pub enum ToSwarm {
+    Autonat(autonat::Event),
+    Dcutr(dcutr::Event),
+    Relay(relay::client::Event),
     Kad(kad::Event),
     Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
@@ -66,6 +75,21 @@ pub enum ToSwarm {
     Identify(identify::Event),
 }
 
+impl From<autonat::Event> for ToSwarm {
+    fn from(e: autonat::Event) -> Self {
+        Self::Autonat(e)
+    }
+}
+impl From<dcutr::Event> for ToSwarm {
+    fn from(e: dcutr::Event) -> Self {
+        Self::Dcutr(e)
+    }
+}
+impl From<relay::client::Event> for ToSwarm {
+    fn from(e: relay::client::Event) -> Self {
+        Self::Relay(e)
+    }
+}
 impl From<kad::Event> for ToSwarm {
     fn from(e: kad::Event) -> Self {
         Self::Kad(e)
@@ -99,7 +123,10 @@ impl CompositeBehaviour {
         public_key: libp2p::identity::PublicKey,
         gossipsub_keypair: libp2p::identity::Keypair,
         enable_mdns: bool,
+        relay_behaviour: relay::client::Behaviour,
     ) -> Result<Self, String> {
+        let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
+        let dcutr = dcutr::Behaviour::new(local_peer_id);
         let mut kademlia_config = kad::Config::new(
             StreamProtocol::try_from_owned("/ipfs/kad/1.0.0".to_string())
                 .map_err(|err| format!("kad protocol: {err}"))?,
@@ -160,6 +187,9 @@ impl CompositeBehaviour {
         let identify = identify::Behaviour::new(identify_config);
 
         Ok(Self {
+            autonat,
+            dcutr,
+            relay: relay_behaviour,
             kademlia,
             mdns,
             gossipsub,
@@ -195,6 +225,9 @@ fn gossip_topic_score_params() -> gossipsub::TopicScoreParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_crypto::NodeIdentity;
+
+    use crate::transport;
 
     #[test]
     fn default_gossip_peer_score_covers_social_and_announcement_topics() {
@@ -212,5 +245,27 @@ mod tests {
             .topics
             .values()
             .all(|topic| topic.invalid_message_deliveries_weight < 0.0));
+    }
+
+    #[test]
+    fn composite_behaviour_includes_nat_traversal_stack() {
+        let node = NodeIdentity::generate();
+        let keypair = transport::to_libp2p_keypair(&node);
+        let local_peer_id = keypair.public().to_peer_id();
+        let (_relay_transport, relay_behaviour) = relay::client::new(local_peer_id);
+
+        let mut behaviour = CompositeBehaviour::new(
+            local_peer_id,
+            keypair.public(),
+            keypair.clone(),
+            false,
+            relay_behaviour,
+        )
+        .expect("construct composite behaviour");
+
+        behaviour.kademlia.set_mode(Some(kad::Mode::Client));
+        let _ = &behaviour.autonat;
+        let _ = &behaviour.dcutr;
+        let _ = &behaviour.relay;
     }
 }

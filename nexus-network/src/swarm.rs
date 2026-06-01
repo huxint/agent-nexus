@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify,
+    autonat, dcutr, gossipsub, identify,
     kad::{self, QueryResult},
     multiaddr::Protocol,
     request_response::{self, InboundRequestId, OutboundRequestId, ResponseChannel},
     swarm::SwarmEvent,
-    Multiaddr, PeerId, SwarmBuilder, Transport,
+    Multiaddr, PeerId, SwarmBuilder,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -153,30 +153,33 @@ impl Network {
         let local_peer_id = libp2p_keypair.public().to_peer_id();
         let gs_kp = libp2p_keypair.clone();
         let enable_mdns = config.enable_mdns && !is_loopback_addr(&config.listen_addr);
-        let mut behaviour = CompositeBehaviour::new(
-            local_peer_id,
-            libp2p_keypair.public(),
-            gs_kp.clone(),
-            enable_mdns,
-        )
-        .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?;
-        behaviour.kademlia.set_mode(Some(config.kademlia_mode));
-
         let mut swarm = SwarmBuilder::with_existing_identity(libp2p_keypair.clone())
             .with_tokio()
-            .with_other_transport(|keypair| {
-                let qc = libp2p::quic::Config::new(keypair);
-                libp2p::quic::tokio::Transport::new(qc)
-                    .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
-                    .boxed()
-            })
-            .map_err(|err| NexusError::Network(format!("transport: {err}")))?
+            .with_quic()
             .with_dns()
             .map_err(|err| NexusError::Network(format!("dns transport: {err}")))?
-            .with_behaviour(|_key| behaviour)
+            .with_relay_client(libp2p::tls::Config::new, libp2p::yamux::Config::default)
+            .map_err(|err| NexusError::Network(format!("relay transport: {err}")))?
+            .with_behaviour(|_key, relay_behaviour| {
+                CompositeBehaviour::new(
+                    local_peer_id,
+                    libp2p_keypair.public(),
+                    gs_kp.clone(),
+                    enable_mdns,
+                    relay_behaviour,
+                )
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                    std::io::Error::other(err).into()
+                })
+            })
             .map_err(|err| NexusError::Network(format!("behaviour: {err}")))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
+
+        swarm
+            .behaviour_mut()
+            .kademlia
+            .set_mode(Some(config.kademlia_mode));
 
         swarm
             .listen_on(config.listen_addr.clone())
@@ -415,6 +418,28 @@ impl SocialEventRateState {
 
 fn handle_swarm_event(event: SwarmEvent<ToSwarm>, ctx: SwarmEventContext<'_>) {
     match event {
+        SwarmEvent::Behaviour(ToSwarm::Autonat(autonat::Event::StatusChanged { old, new })) => {
+            debug!("autonat status changed: {old:?} -> {new:?}");
+        }
+        SwarmEvent::Behaviour(ToSwarm::Autonat(event)) => {
+            debug!("autonat event: {event:?}");
+        }
+        SwarmEvent::Behaviour(ToSwarm::Dcutr(dcutr::Event {
+            remote_peer_id,
+            result,
+        })) => match result {
+            Ok(connection_id) => {
+                debug!(
+                        "direct connection upgrade succeeded with {remote_peer_id} on {connection_id:?}"
+                    );
+            }
+            Err(err) => {
+                debug!("direct connection upgrade failed with {remote_peer_id}: {err:?}");
+            }
+        },
+        SwarmEvent::Behaviour(ToSwarm::Relay(event)) => {
+            debug!("relay event: {event:?}");
+        }
         SwarmEvent::Behaviour(ToSwarm::Kad(kad::Event::RoutingUpdated {
             peer,
             is_new_peer,
@@ -506,6 +531,14 @@ fn handle_swarm_event(event: SwarmEvent<ToSwarm>, ctx: SwarmEventContext<'_>) {
             info,
             ..
         })) => {
+            if !identify_public_key_matches_peer(&peer_id, &info.public_key) {
+                let advertised_peer = info.public_key.to_peer_id();
+                warn!(
+                    "rejected identify record from {peer_id}: public key maps to {advertised_peer}"
+                );
+                let _ = ctx.swarm.disconnect_peer_id(peer_id);
+                return;
+            }
             for addr in info.listen_addrs {
                 behaviour_add_address(ctx.swarm.behaviour_mut(), &peer_id, addr);
             }
@@ -708,7 +741,29 @@ fn is_loopback_addr(addr: &Multiaddr) -> bool {
 }
 
 fn behaviour_add_address(behaviour: &mut CompositeBehaviour, peer: &PeerId, addr: Multiaddr) {
+    let Some(addr) = peer_scoped_kad_addr(peer, addr) else {
+        warn!("ignored peer address whose /p2p suffix does not match {peer}");
+        return;
+    };
     let _ = behaviour.kademlia.add_address(peer, addr);
+}
+
+fn peer_scoped_kad_addr(peer: &PeerId, mut addr: Multiaddr) -> Option<Multiaddr> {
+    match addr.clone().pop() {
+        Some(Protocol::P2p(addr_peer)) if &addr_peer == peer => {
+            let _ = addr.pop();
+            Some(addr)
+        }
+        Some(Protocol::P2p(_)) => None,
+        _ => Some(addr),
+    }
+}
+
+fn identify_public_key_matches_peer(
+    peer: &PeerId,
+    public_key: &libp2p::identity::PublicKey,
+) -> bool {
+    public_key.to_peer_id() == *peer
 }
 
 fn discovery_key_label(key: &[u8]) -> String {
@@ -718,6 +773,9 @@ fn discovery_key_label(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_crypto::NodeIdentity;
+
+    use crate::transport;
 
     #[test]
     fn social_event_rate_limit_rejects_after_window_budget() {
@@ -733,6 +791,60 @@ mod tests {
         assert!(matches!(
             social_event_rate_acceptance(&mut rate_limits, peer),
             gossipsub::MessageAcceptance::Reject
+        ));
+    }
+
+    #[test]
+    fn peer_scoped_kad_addr_strips_matching_peer_suffix() {
+        let peer = transport::to_peer_id(&NodeIdentity::generate());
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/1234/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+
+        let scoped = peer_scoped_kad_addr(&peer, addr).expect("matching peer suffix");
+
+        assert_eq!(scoped.to_string(), "/ip4/127.0.0.1/udp/1234/quic-v1");
+    }
+
+    #[test]
+    fn peer_scoped_kad_addr_rejects_mismatched_peer_suffix() {
+        let peer = transport::to_peer_id(&NodeIdentity::generate());
+        let other = transport::to_peer_id(&NodeIdentity::generate());
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/udp/1234/quic-v1/p2p/{other}")
+            .parse()
+            .unwrap();
+
+        assert!(peer_scoped_kad_addr(&peer, addr).is_none());
+    }
+
+    #[test]
+    fn peer_scoped_kad_addr_preserves_relay_path_and_strips_target_suffix() {
+        let relay = transport::to_peer_id(&NodeIdentity::generate());
+        let peer = transport::to_peer_id(&NodeIdentity::generate());
+        let addr: Multiaddr =
+            format!("/ip4/127.0.0.1/udp/1234/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+
+        let scoped = peer_scoped_kad_addr(&peer, addr).expect("matching relayed peer suffix");
+
+        assert_eq!(
+            scoped.to_string(),
+            format!("/ip4/127.0.0.1/udp/1234/quic-v1/p2p/{relay}/p2p-circuit")
+        );
+    }
+
+    #[test]
+    fn identify_public_key_must_derive_connected_peer_id() {
+        let node = NodeIdentity::generate();
+        let keypair = transport::to_libp2p_keypair(&node);
+        let peer = keypair.public().to_peer_id();
+        let other_keypair = transport::to_libp2p_keypair(&NodeIdentity::generate());
+
+        assert!(identify_public_key_matches_peer(&peer, &keypair.public()));
+        assert!(!identify_public_key_matches_peer(
+            &peer,
+            &other_keypair.public()
         ));
     }
 }

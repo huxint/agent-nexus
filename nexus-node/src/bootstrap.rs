@@ -9,6 +9,8 @@ use crate::discovery::{
 use crate::state::write_file_atomic;
 
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[];
+const PUBLIC_RENDEZVOUS_ENV: &str = "NEXUS_PUBLIC_RENDEZVOUS";
+const IPFS_PUBLIC_RENDEZVOUS_DNSADDR: &str = "/dnsaddr/bootstrap.libp2p.io";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerCacheEntry {
@@ -34,6 +36,7 @@ pub struct BootstrapStatus {
     pub peer_cache: Vec<PeerCacheEntry>,
     pub peer_cache_peers: Vec<String>,
     pub discovery_cache_peers: Vec<String>,
+    pub public_rendezvous_peers: Vec<String>,
     pub public_default_peers: Vec<String>,
     pub effective_peers: Vec<String>,
 }
@@ -82,6 +85,9 @@ pub fn default_bootstrap_peers(
         push_unique_bootstrap_addr(&mut addrs, addr);
     }
     if use_public_defaults {
+        for addr in public_rendezvous_bootstrap_peers()? {
+            push_unique_bootstrap_addr(&mut addrs, addr);
+        }
         for addr in public_default_bootstrap_peers()? {
             push_unique_bootstrap_addr(&mut addrs, addr);
         }
@@ -104,10 +110,13 @@ pub fn bootstrap_status(
     let peer_cache = load_peer_cache(base)?;
     let peer_cache_peers = peer_cache_bootstrap_peers_from_entries(&peer_cache);
     let discovery_cache_peers = cached_workspace_bootstrap_peers(base);
-    let public_default_peers = if use_public_defaults {
-        public_default_bootstrap_peers()?
+    let (public_rendezvous_peers, public_default_peers) = if use_public_defaults {
+        (
+            public_rendezvous_bootstrap_peers()?,
+            public_default_bootstrap_peers()?,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let mut effective_peers = Vec::new();
@@ -123,6 +132,7 @@ pub fn bootstrap_status(
             peer_cache_peers.as_slice(),
             config_peers.as_slice(),
             discovery_cache_peers.as_slice(),
+            public_rendezvous_peers.as_slice(),
             public_default_peers.as_slice(),
         ] {
             for addr in source {
@@ -141,9 +151,38 @@ pub fn bootstrap_status(
         peer_cache,
         peer_cache_peers: stringify_multiaddrs(&peer_cache_peers),
         discovery_cache_peers: stringify_multiaddrs(&discovery_cache_peers),
+        public_rendezvous_peers: stringify_multiaddrs(&public_rendezvous_peers),
         public_default_peers: stringify_multiaddrs(&public_default_peers),
         effective_peers: stringify_multiaddrs(&effective_peers),
     })
+}
+
+pub fn public_rendezvous_bootstrap_peers(
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    match std::env::var(PUBLIC_RENDEZVOUS_ENV) {
+        Ok(value) => public_rendezvous_bootstrap_peers_from_value(&value),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(err) => Err(format!("read {PUBLIC_RENDEZVOUS_ENV}: {err}").into()),
+    }
+}
+
+pub fn public_rendezvous_bootstrap_peers_from_value(
+    value: &str,
+) -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
+    let mut addrs = Vec::new();
+    for item in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter(|item| !item.is_empty())
+    {
+        match item {
+            "off" | "none" | "disabled" => {}
+            "ipfs" | "ipfs-dht" | "ipfs-mainnet" => {
+                push_unique_bootstrap_addr(&mut addrs, IPFS_PUBLIC_RENDEZVOUS_DNSADDR.parse()?);
+            }
+            addr => push_unique_bootstrap_addr(&mut addrs, addr.parse()?),
+        }
+    }
+    Ok(addrs)
 }
 
 fn public_default_bootstrap_peers() -> Result<Vec<libp2p::Multiaddr>, Box<dyn std::error::Error>> {
