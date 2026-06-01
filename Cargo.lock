@@ -1734,6 +1734,7 @@ dependencies = [
  "nexus-runtime",
  "nexus-storage",
  "rand 0.8.6",
+ "ring 0.17.14",
  "serde",
  "serde_json",
  "sha2",

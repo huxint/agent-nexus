@@ -14,6 +14,7 @@ use nexus_economy::SettlementError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::confidential::EncryptedSocialEnvelope;
 use crate::manifest::AgentManifest;
 use crate::society::{
     AgentIntent, CapabilityGrant, CapabilityRevocation, CollectiveDecision, CollectiveProposal,
@@ -87,6 +88,9 @@ pub enum SocialProtocolError {
 
     #[error("task result receipt does not match result")]
     TaskResultReceiptMismatch,
+
+    #[error("invalid confidential envelope: {reason}")]
+    InvalidConfidentialEnvelope { reason: String },
 
     #[error("duplicate social event id with divergent payload: {event_id}")]
     DuplicateEventConflict { event_id: String },
@@ -168,6 +172,8 @@ pub struct EquivocationProof {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum SocialEventKind {
+    /// Carry an encrypted private social event for listed recipients.
+    ConfidentialEnvelope { envelope: EncryptedSocialEnvelope },
     /// Publish a verifiable proof that an author forked their own event chain.
     EquivocationObserved { proof: Box<EquivocationProof> },
     /// Publish or refresh an agent's public profile.
@@ -655,6 +661,11 @@ impl SocialEvent {
                 settlement.validate()?;
                 Ok(())
             }
+            SocialEventKind::ConfidentialEnvelope { envelope } => envelope
+                .validate_metadata()
+                .map_err(|err| SocialProtocolError::InvalidConfidentialEnvelope {
+                    reason: err.to_string(),
+                }),
             SocialEventKind::EquivocationObserved { proof } => proof.verify(),
             SocialEventKind::CollectiveDeclared { members, .. } => {
                 for member in members {

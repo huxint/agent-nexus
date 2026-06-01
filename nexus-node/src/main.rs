@@ -3,7 +3,7 @@
 //! Usage:
 //!   nexus-node create --name <name> [--base <dir>]
 //!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap]
-//!   nexus-node society --base <dir> [--json] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
+//!   nexus-node society --base <dir> [--json] [--private --shared-secret <text>] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
 //!   nexus-node join --base <dir> --workspace <path>
 //!   nexus-node clone --base <dir> [--global|--lan] [--peer <peer-id>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] --workspace <hex> --name <name>
 //!   nexus-node exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] -- <command> [args...]
@@ -36,13 +36,13 @@ use nexus_agent::migrate_legacy_social_memory_json;
 use nexus_agent::{
     random_social_id, AgentIntent, AgentManifest, CapabilityDecl, CapabilityGrant,
     CapabilityRevocation, CollectiveDecision, CollectiveDecisionOutcome, CollectiveProposal,
-    CollectiveVote, CollectiveVoteChoice, DeterministicReplayProfile, ExecutionAttestation,
-    ExecutionReceipt, IdentityRecoveryApproval, IdentityRecoveryPolicy, IdentityRevocation,
-    IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind, IntentResponse,
-    IntentResponseKind, Interaction, InteractionOutcome, RelationKind, SettlementRecord,
-    SocialEvent, SocialEventKind, SocialMemory, TaskDispute, WorkspaceOwnershipClaim, WorkspaceRun,
-    WorkspaceRunContext, WorkspaceRunFailure, WorkspaceRunStdin, WorkspaceSnapshot,
-    MAX_SOCIAL_EVENT_JSON_BYTES,
+    CollectiveVote, CollectiveVoteChoice, DeterministicReplayProfile, EncryptedSocialEnvelope,
+    ExecutionAttestation, ExecutionReceipt, IdentityRecoveryApproval, IdentityRecoveryPolicy,
+    IdentityRevocation, IdentityRotation, IntentActionKind, IntentActionPlan, IntentKind,
+    IntentResponse, IntentResponseKind, Interaction, InteractionOutcome, RelationKind,
+    SettlementRecord, SocialEvent, SocialEventKind, SocialMemory, TaskDispute,
+    WorkspaceOwnershipClaim, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
+    WorkspaceRunStdin, WorkspaceSnapshot, MAX_SOCIAL_EVENT_JSON_BYTES,
 };
 use nexus_agent::{TaskAcceptance, TaskCancellation, TaskOffer, TaskResult, TaskSpec};
 use nexus_core::{Did, PermissionSet, WorkspaceId};
@@ -62,7 +62,9 @@ use nexus_workspace::{
     Workspace, WorkspaceConfig, WorkspaceError, WorkspaceServer, WorkspaceState,
 };
 use social_sync::*;
-use society_view::{print_society_json, print_society_text, SocietyJsonOptions};
+use society_view::{
+    print_society_json, print_society_text, society_json_for_base_with_society, SocietyJsonOptions,
+};
 #[cfg(test)]
 use society_view::{society_json, society_json_for_base};
 #[cfg(test)]
@@ -136,7 +138,7 @@ fn print_usage(prog: &str) {
     );
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
-        "  {prog} society --base <DIR> [--json] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
+        "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
     );
     eprintln!("  {prog} social-memory compact --base <DIR> --retain-events <N>");
     eprintln!(
@@ -163,9 +165,9 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} event collective-proposal --base <DIR> --collective <ID> --proposal <ID> --title <TEXT> --body <TEXT> [--workspace <HEX>] [--deadline <TS>]");
     eprintln!("  {prog} event collective-vote --base <DIR> --collective <ID> --proposal <ID> --choice <CHOICE> [--rationale <TEXT>]");
     eprintln!("  {prog} event collective-decision --base <DIR> --collective <ID> --proposal <ID> --outcome <OUTCOME> [--reason <TEXT>] [--task <ID>] [--claim <CLAIM_ID>] [--target <DID>]");
-    eprintln!("  {prog} event relation --base <DIR> --peer <DID> --kind <KIND> [--note <TEXT>]");
+    eprintln!("  {prog} event relation --base <DIR> --peer <DID> --kind <KIND> [--note <TEXT>] [--private --shared-secret <TEXT>]");
     eprintln!("  {prog} event interaction --base <DIR> --peer <DID> --topic <TEXT> --outcome <OUTCOME> [--workspace <HEX>] [--evidence <TEXT>]");
-    eprintln!("  {prog} event task-publish --base <DIR> --description <TEXT> --capability <NAME> --command <CMD> [--arg <ARG>...] --max-budget <N> [--deadline <TS>]");
+    eprintln!("  {prog} event task-publish --base <DIR> --description <TEXT> --capability <NAME> --command <CMD> [--arg <ARG>...] --max-budget <N> [--deadline <TS>] [--private --recipient <DID> --shared-secret <TEXT>]");
     eprintln!("  {prog} event task-offer --base <DIR> --task <ID> --price <N> [--eta <SECS>] [--rationale <TEXT>]");
     eprintln!("  {prog} event task-accept --base <DIR> --task <ID> --bidder <DID> --price <N>");
     eprintln!("  {prog} event task-cancel --base <DIR> --task <ID> --reason <TEXT>");
@@ -1431,6 +1433,8 @@ fn print_bootstrap_status_text(status: &BootstrapStatus) {
 fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut json = false;
+    let mut private = false;
+    let mut shared_secret = None;
     let mut options = SocietyJsonOptions::default();
     let mut i = 2;
     while i < args.len() {
@@ -1441,6 +1445,13 @@ fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--json" => {
                 json = true;
+            }
+            "--private" => {
+                private = true;
+            }
+            "--shared-secret" => {
+                i += 1;
+                shared_secret = Some(required_arg(args, i, "--shared-secret")?.to_string());
             }
             "--activity-limit" => {
                 i += 1;
@@ -1486,9 +1497,33 @@ fn cmd_society(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let memory = load_social_memory(&base.join(".nexus-social-memory.json"))?;
-    if json {
-        print_society_json(&base, &memory, options)?;
+    let private_society = if private {
+        let identity = load_or_create_identity(&base)?;
+        let secret = shared_secret
+            .as_deref()
+            .ok_or("--shared-secret required when --private is set")?;
+        Some(memory.private_society_for(identity.did(), secret.as_bytes())?)
     } else {
+        None
+    };
+    if json {
+        if let Some(private_society) = private_society.as_ref() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&society_json_for_base_with_society(
+                    &base,
+                    &memory,
+                    private_society,
+                    options
+                ))?
+            );
+        } else {
+            print_society_json(&base, &memory, options)?;
+        }
+    } else {
+        if private_society.is_some() {
+            return Err("--private society view currently requires --json".into());
+        }
         print_society_text(&base, &memory);
     }
     Ok(())
@@ -3273,6 +3308,8 @@ fn cmd_event_relation(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     let mut peer = None;
     let mut relation = None;
     let mut note = None;
+    let mut private = false;
+    let mut shared_secret = None;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -3292,6 +3329,13 @@ fn cmd_event_relation(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 i += 1;
                 note = Some(required_arg(args, i, "--note")?.to_string());
             }
+            "--private" => {
+                private = true;
+            }
+            "--shared-secret" => {
+                i += 1;
+                shared_secret = Some(required_arg(args, i, "--shared-secret")?.to_string());
+            }
             other => return Err(format!("unknown relation option: {other}").into()),
         }
         i += 1;
@@ -3299,12 +3343,26 @@ fn cmd_event_relation(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 
     let event = signed_local_event(
         &base,
-        |_identity| {
-            Ok(SocialEventKind::RelationDeclared {
-                peer: peer.ok_or("--peer required")?,
+        |identity| {
+            let peer = peer.ok_or("--peer required")?;
+            let kind = SocialEventKind::RelationDeclared {
+                peer: peer.clone(),
                 relation: relation.ok_or("--kind required")?,
                 note,
-            })
+            };
+            if private {
+                let secret = shared_secret
+                    .as_deref()
+                    .ok_or("--shared-secret required when --private is set")?;
+                let envelope = EncryptedSocialEnvelope::encrypt(
+                    vec![identity.did().clone(), peer],
+                    secret.as_bytes(),
+                    &kind,
+                )?;
+                Ok(SocialEventKind::ConfidentialEnvelope { envelope })
+            } else {
+                Ok(kind)
+            }
         },
         unix_now(),
     )?;
@@ -3383,6 +3441,9 @@ fn cmd_event_task_publish(args: &[String]) -> Result<(), Box<dyn std::error::Err
     let mut task_args = Vec::new();
     let mut max_budget = None;
     let mut deadline = None;
+    let mut private = false;
+    let mut recipients = Vec::new();
+    let mut shared_secret = None;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -3420,6 +3481,17 @@ fn cmd_event_task_publish(args: &[String]) -> Result<(), Box<dyn std::error::Err
                     "--deadline",
                 )?);
             }
+            "--private" => {
+                private = true;
+            }
+            "--recipient" => {
+                i += 1;
+                recipients.push(Did::new(required_arg(args, i, "--recipient")?.to_string()));
+            }
+            "--shared-secret" => {
+                i += 1;
+                shared_secret = Some(required_arg(args, i, "--shared-secret")?.to_string());
+            }
             other => return Err(format!("unknown task-publish option: {other}").into()),
         }
         i += 1;
@@ -3429,7 +3501,7 @@ fn cmd_event_task_publish(args: &[String]) -> Result<(), Box<dyn std::error::Err
     let event = signed_local_event(
         &base,
         |identity| {
-            Ok(SocialEventKind::TaskPublished {
+            let kind = SocialEventKind::TaskPublished {
                 task: TaskSpec::new(
                     identity.did().clone(),
                     description.ok_or("--description required")?,
@@ -3440,7 +3512,19 @@ fn cmd_event_task_publish(args: &[String]) -> Result<(), Box<dyn std::error::Err
                     deadline.unwrap_or(0),
                     now,
                 ),
-            })
+            };
+            if private {
+                let secret = shared_secret
+                    .as_deref()
+                    .ok_or("--shared-secret required when --private is set")?;
+                let mut recipients = recipients;
+                recipients.push(identity.did().clone());
+                let envelope =
+                    EncryptedSocialEnvelope::encrypt(recipients, secret.as_bytes(), &kind)?;
+                Ok(SocialEventKind::ConfidentialEnvelope { envelope })
+            } else {
+                Ok(kind)
+            }
         },
         now,
     )?;
@@ -9284,6 +9368,150 @@ mod tests {
         for event in memory.events() {
             event.verify_signature().unwrap();
         }
+    }
+
+    #[test]
+    fn event_relation_can_publish_private_envelope() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let peer = NodeIdentity::generate();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "relation".into(),
+            "--base".into(),
+            base,
+            "--peer".into(),
+            peer.did().to_string(),
+            "--kind".into(),
+            "collaborator".into(),
+            "--note".into(),
+            "private task history".into(),
+            "--private".into(),
+            "--shared-secret".into(),
+            "shared relation secret".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 1);
+        assert!(memory.society().edge(identity.did(), peer.did()).is_none());
+        let event = &memory.events()[0];
+        let envelope = match &event.kind {
+            SocialEventKind::ConfidentialEnvelope { envelope } => envelope,
+            other => panic!("expected private relation envelope, got {other:?}"),
+        };
+        assert!(!envelope.ciphertext_hex.contains("private"));
+        assert!(envelope.recipients.contains(identity.did()));
+        assert!(envelope.recipients.contains(peer.did()));
+        match envelope
+            .decrypt_for(peer.did(), b"shared relation secret")
+            .unwrap()
+        {
+            SocialEventKind::RelationDeclared {
+                peer: decrypted_peer,
+                relation,
+                note,
+            } => {
+                assert_eq!(decrypted_peer, *peer.did());
+                assert_eq!(relation, RelationKind::Collaborator);
+                assert_eq!(note.as_deref(), Some("private task history"));
+            }
+            other => panic!("unexpected private payload: {other:?}"),
+        }
+
+        let private_society = memory
+            .private_society_for(peer.did(), b"shared relation secret")
+            .unwrap();
+        assert_eq!(
+            private_society
+                .edge(identity.did(), peer.did())
+                .unwrap()
+                .kind,
+            RelationKind::Collaborator
+        );
+        let private_view = society_json_for_base_with_society(
+            temp.path(),
+            &memory,
+            &private_society,
+            SocietyJsonOptions::default(),
+        );
+        assert_eq!(private_view["relations"][0]["kind"], "Collaborator");
+    }
+
+    #[test]
+    fn event_task_publish_can_publish_private_envelope() {
+        let temp = TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let peer = NodeIdentity::generate();
+        let base = temp.path().to_string_lossy().to_string();
+
+        cmd_event(&[
+            "nexus-node".into(),
+            "event".into(),
+            "task-publish".into(),
+            "--base".into(),
+            base.clone(),
+            "--description".into(),
+            "private workspace audit".into(),
+            "--capability".into(),
+            "audit".into(),
+            "--command".into(),
+            "audit-tool".into(),
+            "--arg".into(),
+            "--redacted".into(),
+            "--max-budget".into(),
+            "7".into(),
+            "--private".into(),
+            "--recipient".into(),
+            peer.did().to_string(),
+            "--shared-secret".into(),
+            "shared task secret".into(),
+        ])
+        .unwrap();
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 1);
+        assert_eq!(memory.society().task_count(), 0);
+        let public_json = serde_json::to_string(memory.events()).unwrap();
+        assert!(!public_json.contains("private workspace audit"));
+        assert!(!public_json.contains("audit-tool"));
+
+        let private_society = memory
+            .private_society_for(peer.did(), b"shared task secret")
+            .unwrap();
+        assert_eq!(private_society.task_count(), 1);
+        let task = private_society.tasks()[0];
+        assert_eq!(task.publisher, *identity.did());
+        assert_eq!(task.description, "private workspace audit");
+        assert_eq!(task.command, "audit-tool");
+        assert_eq!(task.args, vec!["--redacted".to_string()]);
+
+        let private_view = society_json_for_base_with_society(
+            temp.path(),
+            &memory,
+            &private_society,
+            SocietyJsonOptions::default(),
+        );
+        assert_eq!(
+            private_view["tasks"][0]["description"],
+            "private workspace audit"
+        );
+        assert_eq!(private_view["tasks"][0]["command"], "audit-tool");
+
+        cmd_society(&[
+            "nexus-node".into(),
+            "society".into(),
+            "--base".into(),
+            base,
+            "--json".into(),
+            "--private".into(),
+            "--shared-secret".into(),
+            "shared task secret".into(),
+        ])
+        .unwrap();
     }
 
     #[test]

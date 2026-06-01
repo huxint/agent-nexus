@@ -2327,6 +2327,11 @@ impl Society {
         self.register_agent(event.author.clone());
 
         match &event.kind {
+            SocialEventKind::ConfidentialEnvelope { envelope } => {
+                for recipient in &envelope.recipients {
+                    self.register_agent(recipient.clone());
+                }
+            }
             SocialEventKind::EquivocationObserved { proof } => {
                 self.record_equivocation_proof(proof.as_ref().clone());
             }

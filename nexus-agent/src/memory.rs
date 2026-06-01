@@ -7,6 +7,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::confidential::ConfidentialEnvelopeError;
 use crate::event_log::SocialEventLog;
 use crate::protocol::{SocialEvent, SocialEventKind, SocialProtocolError};
 use crate::society::Society;
@@ -128,6 +129,38 @@ impl SocialMemory {
 
     pub fn society(&self) -> &Society {
         &self.society
+    }
+
+    pub fn private_society_for(
+        &self,
+        recipient: &nexus_core::Did,
+        shared_secret: &[u8],
+    ) -> Result<Society, ConfidentialEnvelopeError> {
+        let mut society = self.society.clone();
+        for event in self.events() {
+            let SocialEventKind::ConfidentialEnvelope { envelope } = &event.kind else {
+                continue;
+            };
+            if !envelope.includes_recipient(recipient) {
+                continue;
+            }
+            if !envelope.matches_shared_secret(shared_secret)? {
+                continue;
+            }
+            let kind = envelope.decrypt_for(recipient, shared_secret)?;
+            let decrypted_event = SocialEvent::new_chained(
+                event.author.clone(),
+                event.seq,
+                event.prev.clone(),
+                event.timestamp,
+                kind,
+            );
+            if decrypted_event.validate_author_claims().is_err() {
+                continue;
+            }
+            society.apply_event(&decrypted_event);
+        }
+        Ok(society)
     }
 
     pub fn event_count(&self) -> usize {
@@ -298,6 +331,7 @@ mod tests {
     use nexus_core::WorkspaceId;
     use nexus_crypto::NodeIdentity;
 
+    use crate::confidential::EncryptedSocialEnvelope;
     use crate::protocol::{SocialEventKind, SocialProtocolError};
     use crate::society::RelationKind;
 
@@ -327,6 +361,70 @@ mod tests {
             memory.society().edge(alice.did(), bob.did()).unwrap().kind,
             RelationKind::Collaborator
         );
+    }
+
+    #[test]
+    fn encrypted_social_event_keeps_private_payload_out_of_public_society() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let private_kind = SocialEventKind::RelationDeclared {
+            peer: bob.did().clone(),
+            relation: RelationKind::Collaborator,
+            note: Some("private relation".into()),
+        };
+        let envelope = EncryptedSocialEnvelope::encrypt(
+            vec![alice.did().clone(), bob.did().clone()],
+            b"shared secret",
+            &private_kind,
+        )
+        .unwrap();
+        let event = SocialEvent::new(
+            alice.did().clone(),
+            1,
+            SocialEventKind::ConfidentialEnvelope { envelope },
+        )
+        .sign(&alice)
+        .unwrap();
+
+        let mut public_memory = SocialMemory::new();
+        assert!(public_memory.ingest_event(event.clone()).unwrap());
+        assert!(public_memory
+            .society()
+            .edge(alice.did(), bob.did())
+            .is_none());
+        assert!(public_memory.society().has_agent(alice.did()));
+        assert!(public_memory.society().has_agent(bob.did()));
+
+        let decrypted = match &event.kind {
+            SocialEventKind::ConfidentialEnvelope { envelope } => {
+                envelope.decrypt_for(bob.did(), b"shared secret").unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let private_event = public_memory.sign_event(&alice, 2, decrypted).unwrap();
+        let mut private_memory = public_memory.clone();
+        assert!(private_memory.ingest_event(private_event).unwrap());
+        assert_eq!(
+            private_memory
+                .society()
+                .edge(alice.did(), bob.did())
+                .unwrap()
+                .kind,
+            RelationKind::Collaborator
+        );
+
+        let private_society = public_memory
+            .private_society_for(bob.did(), b"shared secret")
+            .unwrap();
+        assert_eq!(
+            private_society.edge(alice.did(), bob.did()).unwrap().kind,
+            RelationKind::Collaborator
+        );
+        assert!(public_memory
+            .private_society_for(bob.did(), b"wrong secret")
+            .unwrap()
+            .edge(alice.did(), bob.did())
+            .is_none());
     }
 
     #[test]
