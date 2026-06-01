@@ -13,6 +13,10 @@ settle.
   local state, and social memory about membership and execution.
 - **SocialEvent**: A signed, per-author chained fact. It proves who authored a
   claim and makes forks detectable through equivocation proofs.
+- **ConfidentialEnvelope**: An encrypted social-event payload for listed
+  recipients. Public replay verifies the outer event and registers only the
+  envelope participants; a local recipient can derive a private society view
+  with the shared secret.
 - **Society**: The replayed local projection of social events: agents,
   relationships, collectives, tasks, settlements, capability grants,
   revocations, recommendations, and reputation.
@@ -37,6 +41,8 @@ settle.
   an independently verifiable equivocation proof.
 - Most social facts remain subjective local memory. A small set of facts can be
   marked anchored when an accepted authority witness validates them.
+- Private social facts stay out of the public society projection until a
+  listed recipient decrypts the envelope locally.
 - Runtime execution is not blocked by society state. Bad behavior is recorded,
   disputed, weighted, or ignored locally.
 - Capability grants can expire, be revoked by issuer, and be delegated only

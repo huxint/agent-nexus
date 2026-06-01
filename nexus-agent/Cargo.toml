@@ -18,4 +18,5 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 rand.workspace = true
+ring.workspace = true
 sha2.workspace = true

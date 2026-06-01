@@ -5,9 +5,10 @@ use nexus_agent::{
     CapabilityRevocation, Collective, CollectiveProposal, CollectiveVote, ExecutionAttestation,
     ExecutionReceipt, GovernanceSignal, IdentityRecoveryApproval, IdentityRecoveryPolicy,
     IdentityRevocation, IdentityRotation, IntentRecommendation, IntentResponse, Interaction,
-    ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge, SocialMemory, Task,
-    TaskClaimJudgment, TaskResult, VerifiedCapability, WitnessedFactKind, WorkspaceOwnershipFact,
-    WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure, WorkspaceSnapshot,
+    ProviderRecommendation, ReputationScore, SettlementRecord, SocialEdge, SocialMemory, Society,
+    Task, TaskClaimJudgment, TaskResult, VerifiedCapability, WitnessedFactKind,
+    WorkspaceOwnershipFact, WorkspaceRun, WorkspaceRunContext, WorkspaceRunFailure,
+    WorkspaceSnapshot,
 };
 use nexus_core::{Did, WorkspaceId};
 use nexus_storage::Cid;
@@ -118,7 +119,15 @@ pub(crate) fn society_json_for_base(
     memory: &SocialMemory,
     options: SocietyJsonOptions,
 ) -> serde_json::Value {
-    let society = memory.society();
+    society_json_for_base_with_society(base, memory, memory.society(), options)
+}
+
+pub(crate) fn society_json_for_base_with_society(
+    base: &Path,
+    memory: &SocialMemory,
+    society: &Society,
+    options: SocietyJsonOptions,
+) -> serde_json::Value {
     let agents = society
         .agents()
         .into_iter()

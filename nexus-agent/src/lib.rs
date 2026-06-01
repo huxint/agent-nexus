@@ -5,6 +5,7 @@
 //! memory. The task market allows agents to publish tasks, bid on them, and
 //! settle payments through the credit ledger.
 
+pub mod confidential;
 pub mod event_log;
 pub mod legacy;
 pub mod manifest;
@@ -15,6 +16,7 @@ pub mod registry;
 pub mod society;
 pub mod task;
 
+pub use confidential::{ConfidentialEnvelopeError, EncryptedSocialEnvelope};
 pub use event_log::SocialEventLog;
 pub use legacy::{
     legacy_social_event_json, migrate_legacy_social_memory_json, LegacySocialMemoryMigration,
