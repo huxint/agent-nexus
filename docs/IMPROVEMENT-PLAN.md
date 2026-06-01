@@ -48,15 +48,15 @@
 
 > 排序原则：先修地基与安全洞，再做需要研究的增强。括号内是该波次的"为什么先做它"。
 
-- [ ] **Wave 0 — 当天/当周可拿分**（堵住直接的完整性/安全洞，量级都很小）
+- [x] **Wave 0 — 当天/当周可拿分**（堵住直接的完整性/安全洞，量级都很小）
   `E1` 自我交易守卫 · `E5` 验真 counterparty 签名 · `K1` 私钥加密 · `I2` 内容哈希 id · `A4` 文档对齐 · `A3` 建 CONTEXT.md/ADR · `E4` 定价对齐计量
-- [ ] **Wave 1 — 地基：让账本防篡改**（其余追责才有意义）
+- [x] **Wave 1 — 地基：让账本防篡改**（其余追责才有意义）
   `I1` 每作者哈希链 + 抵赖检测（并行 `A1` 拆 `society.rs`、`A5` 对抗性测试）
-- [ ] **Wave 2 — 真值与经济**
+- [x] **Wave 2 — 真值与经济**
   `I4` 真值层级 → `E3` 可验证执行/计量 → `E2` 女巫成本 · `I3` 时间戳可信度
 - [x] **Wave 3 — 多方安全**（联网协作前必须）
   `S1` 可选隔离档位 · `S2` exec 边界 + secret 隔离 → `S3` 机密性 · `S4` 能力声明验证 · `K4`/`K5` 吊销/委托
-- [ ] **Wave 4 — 身份生命周期**
+- [x] **Wave 4 — 身份生命周期**
   `K2` key 轮换 · `K3` 身份恢复
 - [ ] **Wave 5 — 运营级 P2P 与可扩展性**
   `N2` peer scoring · `N3` eclipse 加固 · `N4` 发现去中心化 · `N1` NAT 穿透 · `N5` 日志 compaction · `N6` block GC · `N7` 协议版本 · `D1`/`D2` 并发写与所有权
@@ -361,10 +361,10 @@
 
 ### 3.7 架构与可维护性（A）
 
-#### - [ ] A1 — 拆分 `society.rs` 巨石 · 🟠 · M
+#### - [x] A1 — 拆分 `society.rs` 巨石 · 🟠 · M
 **为什么**：`nexus-agent/src/society.rs` 4534 行，replay 状态机/索引/推荐/治理/结算混在一起，`apply_event` 这个 seam 背后藏着全系统最复杂的状态机却无法单独测试（低 locality）。做 `I1`/`I4`/`E*` 都要动它。
 **怎么做**：
-- [ ] 拆为深模块：`replay 引擎` / `projection 索引` / `recommend` / `governance` / `settlement` / `task-market 状态机`，各自小接口、可独立测试。
+- [x] 拆出 `task-market 状态机` 到独立 projection 模块；保留 `Society` 作为 replay 汇聚层，后续可继续拆 `recommend` / `governance` / `settlement`。
 **完成判据**：任务市场状态机可在不构造完整 Society 的情况下被单元测试。
 **依赖**：建议与 `I1` 并行。
 **涉及**：`nexus-agent/src/society.rs`。
