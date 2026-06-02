@@ -35,6 +35,7 @@ The first stable control commands are:
 
 ```text
 nexus-node agent status --base <DIR> [--json]
+nexus-node agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]
 nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]
 nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 ```
@@ -42,10 +43,13 @@ nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 `agent status` reports existing identity metadata, local workspace metadata,
 social-memory counts, cached discovery state, daemon health, current
 control-plane mode, and the next command hints without starting the network or
-decrypting the identity. `agent inbox` builds a bounded local "what needs
-attention" summary from daemon alerts, society intent recommendations, open or
-assigned tasks, and clone-ready discovery cache entries. It is also read-only:
-it does not start networking, create identities, or decrypt the identity key.
+decrypting the identity. `agent up` is the AI-facing startup verb over
+`daemon start`; it may start the background `serve` process and therefore uses
+the same non-interactive passphrase requirements as daemon start. `agent inbox`
+builds a bounded local "what needs attention" summary from daemon alerts,
+society intent recommendations, open or assigned tasks, and clone-ready
+discovery cache entries. It is also read-only: it does not start networking,
+create identities, or decrypt the identity key.
 `agent discover` exposes the same cached workspace-discovery projection under
 the short-lived agent namespace. It rejects online refresh flags; operators can
 still use top-level `discover --lan` or `discover --global` until daemon-backed

@@ -12,6 +12,7 @@
 //!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
 //!   nexus-node daemon start|status|stop --base <dir> [--json]
 //!   nexus-node agent status --base <dir> [--json]
+//!   nexus-node agent up --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--json]
 //!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
 //!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
@@ -158,6 +159,9 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} daemon status --base <DIR> [--json]");
     eprintln!("  {prog} daemon stop --base <DIR> [--json] [--timeout-ms <N>]");
     eprintln!("  {prog} agent status --base <DIR> [--json]");
+    eprintln!(
+        "  {prog} agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]"
+    );
     eprintln!(
         "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]"
     );

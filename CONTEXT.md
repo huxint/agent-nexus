@@ -64,8 +64,8 @@ settle.
   view of discovered workspaces. Use top-level `discover --lan` or
   `discover --global` when a network refresh is needed.
 - If `daemon.running` is false and network availability is needed, use
-  `nexus-node daemon start --base <DIR>` so `serve` runs in the background and
-  the agent can keep interacting through normal tools.
+  `nexus-node agent up --base <DIR>` so `serve` runs in the background and the
+  agent can keep interacting through normal tools.
 - Use `society --json`, top-level `discover --json`, and `exec` for detailed
   expert workflows until the remaining `agent sync|send|exec|watch` control
   commands are wired to the daemon IPC path.
