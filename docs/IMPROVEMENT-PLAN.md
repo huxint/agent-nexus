@@ -434,7 +434,8 @@
 **为什么**：现在 `discover`/`clone`/`network status` 会各自启动短时网络实例，命令多且状态割裂。daemon 存在时，短命令应复用已连 peer 和缓存。
 **怎么做**：
 - [ ] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
-- [ ] daemon 不存在时，读状态命令退化为本地缓存，显式联网命令给出可执行提示。
+- [x] daemon 不存在时，`agent discover` 读 discovery cache 并给出显式联网刷新提示；不启动网络、不创建身份、不解密私钥。
+- [ ] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。
 - [ ] 输出 JSON schema 稳定，错误包含 `kind`、`message`、`suggested_command`。
 **完成判据**：常用 agent 流程不需要手写 `--listen`、`--bootstrap`、`--invite`，除非用户要覆盖默认网络策略。
 **依赖**：`UX2`。

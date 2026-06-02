@@ -9,7 +9,11 @@ use nexus_core::Did;
 
 use crate::cli_args::{parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{daemon_status_report, DaemonStatusReport};
-use crate::discovery::{discovered_workspace_views, load_workspace_discovery, DiscoveryFilter};
+use crate::discovery::{
+    discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
+    DiscoverySort,
+};
+use crate::ids::parse_workspace_id;
 use crate::local_state::{identity_path, local_workspace_paths};
 use crate::social_sync::load_social_memory;
 use crate::unix_now;
@@ -137,6 +141,26 @@ struct AgentInboxItem {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct AgentDiscoverReport {
+    schema: &'static str,
+    base: String,
+    mode: &'static str,
+    daemon: DaemonStatusReport,
+    summary: AgentDiscoverSummary,
+    workspaces: Vec<DiscoveredWorkspaceView>,
+    error: Option<String>,
+    recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+struct AgentDiscoverSummary {
+    cached_announcements: usize,
+    workspaces: usize,
+    verified: usize,
+    clone_ready: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct AgentInboxAction {
     kind: String,
     event_hint: String,
@@ -148,8 +172,9 @@ pub(crate) fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error
     match args.get(2).map(String::as_str) {
         Some("status") | Some("context") => cmd_agent_status(args),
         Some("inbox") => cmd_agent_inbox(args),
+        Some("discover") => cmd_agent_discover(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status or inbox".into()),
+        None => Err("agent subcommand required: status, inbox, or discover".into()),
     }
 }
 
@@ -222,6 +247,75 @@ fn cmd_agent_inbox(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn cmd_agent_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut json = false;
+    let mut filter = DiscoveryFilter::default();
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--json" => {
+                json = true;
+            }
+            "--sort" => {
+                i += 1;
+                filter.sort = parse_agent_discovery_sort(required_arg(args, i, "--sort")?)?;
+            }
+            "--verified" => {
+                filter.verified_only = true;
+            }
+            "--clone-ready" => {
+                filter.clone_ready_only = true;
+            }
+            "--workspace" => {
+                i += 1;
+                filter.workspace =
+                    Some(parse_workspace_id(required_arg(args, i, "--workspace")?)?.to_string());
+            }
+            "--peer" => {
+                i += 1;
+                filter.peer = Some(required_arg(args, i, "--peer")?.to_string());
+            }
+            "--owner" => {
+                i += 1;
+                filter.owner = Some(Did::new(required_arg(args, i, "--owner")?.to_string()));
+            }
+            "--name" => {
+                i += 1;
+                filter.name = Some(required_arg(args, i, "--name")?.to_string());
+            }
+            "--global"
+            | "--online"
+            | "--lan"
+            | "--bootstrap"
+            | "--invite"
+            | "--listen"
+            | "--timeout-ms"
+            | "--no-public-bootstrap" => {
+                return Err(format!(
+                    "agent discover is cache-only; use `nexus-node discover {}` for network refresh",
+                    args[i]
+                )
+                .into());
+            }
+            other => return Err(format!("unknown agent discover option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let report = agent_discover_report(&base, filter);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_discover_text(&report);
+    }
+    Ok(())
+}
+
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
     let daemon = daemon_status_report(base);
     let control_plane = control_plane_status(&daemon);
@@ -235,6 +329,51 @@ pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
         daemon,
         control_plane,
         recommended_commands: recommended_commands(base),
+    }
+}
+
+pub(crate) fn agent_discover_report(base: &Path, filter: DiscoveryFilter) -> AgentDiscoverReport {
+    let daemon = daemon_status_report(base);
+    let mode = if daemon.running {
+        if daemon.ipc_available {
+            "daemon_running_cache"
+        } else {
+            "daemon_running_no_ipc_cache"
+        }
+    } else {
+        "local_cache"
+    };
+
+    let (cached_announcements, workspaces, error) = match load_workspace_discovery(base) {
+        Ok(announcements) => {
+            let cached_announcements = announcements.len();
+            let workspaces = discovered_workspace_views(&announcements, &filter);
+            (cached_announcements, workspaces, None)
+        }
+        Err(error) => (0, Vec::new(), Some(error.to_string())),
+    };
+    let summary = AgentDiscoverSummary {
+        cached_announcements,
+        workspaces: workspaces.len(),
+        verified: workspaces
+            .iter()
+            .filter(|workspace| workspace.verified)
+            .count(),
+        clone_ready: workspaces
+            .iter()
+            .filter(|workspace| workspace.clone_ready)
+            .count(),
+    };
+
+    AgentDiscoverReport {
+        schema: "nexus.agent_discover.v1",
+        base: base.display().to_string(),
+        mode,
+        daemon,
+        summary,
+        workspaces,
+        error,
+        recommended_commands: discover_recommended_commands(base),
     }
 }
 
@@ -324,6 +463,20 @@ fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
             issue: "daemon is not running, so network serving still requires an explicit foreground or daemon start command",
             next_design: "start daemon for background network availability, then add request-response IPC routing",
         }
+    }
+}
+
+fn parse_agent_discovery_sort(value: &str) -> Result<DiscoverySort, Box<dyn std::error::Error>> {
+    match value {
+        "relevance" | "relevant" => Ok(DiscoverySort::Relevance),
+        "clone-ready" | "clone_ready" | "ready" => Ok(DiscoverySort::CloneReady),
+        "name" => Ok(DiscoverySort::Name),
+        "owner" => Ok(DiscoverySort::Owner),
+        "latest" | "time" | "recent" => Ok(DiscoverySort::Latest),
+        other => Err(format!(
+            "invalid --sort: {other}; use relevance, clone-ready, name, owner, or latest"
+        )
+        .into()),
     }
 }
 
@@ -619,6 +772,34 @@ fn push_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>)
             )),
         });
     }
+}
+
+fn discover_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "discover_cache",
+            command: format!("nexus-node agent discover --base {base} --json"),
+        },
+        CommandHint {
+            name: "discover_lan_refresh",
+            command: format!("nexus-node discover --base {base} --lan --json --timeout-ms 3000"),
+        },
+        CommandHint {
+            name: "daemon_start",
+            command: format!(
+                "nexus-node daemon start --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"
+            ),
+        },
+    ]
 }
 
 fn inbox_recommended_commands(base: &Path) -> Vec<CommandHint> {
@@ -941,6 +1122,51 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
     ]
 }
 
+fn print_agent_discover_text(report: &AgentDiscoverReport) {
+    println!("Agent discover: {}", report.base);
+    println!("mode: {}", report.mode);
+    println!(
+        "daemon: running={} ipc_available={}",
+        report.daemon.running, report.daemon.ipc_available
+    );
+    println!(
+        "workspaces: {} verified={} clone_ready={} cached_announcements={}",
+        report.summary.workspaces,
+        report.summary.verified,
+        report.summary.clone_ready,
+        report.summary.cached_announcements
+    );
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+    }
+    for workspace in &report.workspaces {
+        println!(
+            "\n{}  {}  peers={} latest={} verified={} clone_ready={}",
+            workspace.workspace,
+            workspace.name,
+            workspace.peers.len(),
+            workspace.latest_timestamp,
+            workspace.verified,
+            workspace.clone_ready
+        );
+        if !workspace.description.is_empty() {
+            println!("  description: {}", workspace.description);
+        }
+        println!("  owner: {}", workspace.owner);
+        println!("  root: {}", workspace.root.as_deref().unwrap_or("-"));
+        for peer in &workspace.peers {
+            println!("  peer: {peer}");
+        }
+        for addr in &workspace.addrs {
+            println!("  addr: {addr}");
+        }
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
+}
+
 fn print_agent_inbox_text(report: &AgentInboxReport) {
     println!("Agent inbox: {}", report.base);
     println!("agent: {}", report.agent.as_deref().unwrap_or("-"));
@@ -1038,6 +1264,10 @@ fn display_count(value: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{
+        record_workspace_announcement, sign_workspace_announcement, WorkspaceAnnouncement,
+        WORKSPACE_ANNOUNCEMENT_VERSION,
+    };
     use crate::social_sync::save_social_memory;
     use nexus_agent::{
         AgentIntent, AgentManifest, CapabilityDecl, IntentKind, SocialEventKind, TaskAcceptance,
@@ -1281,5 +1511,46 @@ mod tests {
             .find(|item| item.kind == "assigned_task")
             .unwrap();
         assert_eq!(item.task_id.as_deref(), Some(task_id.as_str()));
+    }
+
+    #[test]
+    fn discover_reads_cached_clone_ready_workspaces() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([72; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/1234/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "cached workspace".into(),
+            description: "ready for clone".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 10,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let report = agent_discover_report(
+            temp.path(),
+            DiscoveryFilter {
+                clone_ready_only: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(report.schema, "nexus.agent_discover.v1");
+        assert_eq!(report.mode, "local_cache");
+        assert_eq!(report.summary.cached_announcements, 1);
+        assert_eq!(report.summary.workspaces, 1);
+        assert_eq!(report.summary.verified, 1);
+        assert_eq!(report.summary.clone_ready, 1);
+        assert_eq!(report.workspaces[0].workspace, workspace.to_string());
+        assert!(report.workspaces[0].clone_ready);
+        assert!(!identity_path(temp.path()).exists());
     }
 }
