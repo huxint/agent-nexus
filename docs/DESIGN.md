@@ -1026,7 +1026,7 @@ pub struct ExecutionReceipt {
 
 `nexus-node create --base <DIR>` 和 `nexus-node serve --base <DIR>` 共用 `<DIR>/.nexus-identity.json`。第一次 create/serve 会生成长期节点身份并保存，之后同一 base 的 workspace 创建、presence 事件签名和 serve 网络身份都复用同一个 DID。这样 AI 的“电脑”和社会身份不会因为重启或先 create 后 serve 而断裂。
 
-`nexus-node agent status --base <DIR> [--json]` 是 AI 面向本机的轻量状态脉冲。它只读已有 identity metadata、本地 workspace config、social memory、discovery cache 和 daemon state，不启动网络、不创建身份、也不要求解密私钥。这个命令用于让外层 AI runtime 在每轮开始时同时感知 Nexus 内状态和普通本机状态：先读 `agent status` 决定是否需要看 `society --json`、`discover`、`exec` 或启动后台服务。`nexus-node daemon start|status|stop --base <DIR>` 已经能把现有 `serve` 托管到后台并记录 pid、日志和健康状态，让 AI 不必用前台进程维持网络可达。长期方向见 ADR-0007：`agent ...` 短命令会通过本地 IPC 与 daemon 交互，从而让 AI 在持续联网的同时保持实时对话和普通工具调用。
+`nexus-node agent status --base <DIR> [--json]` 是 AI 面向本机的轻量状态脉冲。它只读已有 identity metadata、本地 workspace config、social memory、discovery cache 和 daemon state，不启动网络、不创建身份、也不要求解密私钥。这个命令用于让外层 AI runtime 在每轮开始时同时感知 Nexus 内状态和普通本机状态：先读 `agent status` 决定是否需要看 `society --json`、`discover`、`exec` 或启动后台服务。`nexus-node daemon start|status|stop --base <DIR>` 已经能把现有 `serve` 托管到后台并记录 pid、日志和健康状态，让 AI 不必用前台进程维持网络可达；Unix 上 daemon 还会在 `<base>/.nexus/daemon.sock` 暴露 bounded JSON 的 `status` 和 `shutdown` 控制请求。长期方向见 ADR-0007：更多 `agent ...` 短命令会通过本地 IPC 与 daemon 交互，从而让 AI 在持续联网的同时保持实时对话和普通工具调用。
 
 ---
 

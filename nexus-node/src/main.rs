@@ -815,6 +815,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
     let mut bootstrap = Vec::new();
     let mut use_public_bootstrap = true;
+    let mut control_socket = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -836,6 +837,10 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--no-public-bootstrap" => {
                 use_public_bootstrap = false;
+            }
+            "--control-socket" => {
+                i += 1;
+                control_socket = Some(PathBuf::from(required_arg(args, i, "--control-socket")?));
             }
             o => {
                 eprintln!("unknown: {o}");
@@ -909,6 +914,18 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         server.workspace_count()
     );
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let _control_task = if let Some(control_socket) = control_socket {
+        Some(daemon::spawn_serve_control_socket(
+            base.clone(),
+            control_socket,
+            shutdown_tx.clone(),
+        )?)
+    } else {
+        None
+    };
+    let _shutdown_tx = shutdown_tx;
+
     // Event loop
     let mut observe_tick = tokio::time::interval(WORKSPACE_OBSERVE_INTERVAL);
     loop {
@@ -930,6 +947,12 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 println!("Shutting down.");
                 break;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    println!("Shutting down by daemon control.");
+                    break;
+                }
             }
         }
     }

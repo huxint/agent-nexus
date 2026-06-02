@@ -1,4 +1,6 @@
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -6,18 +8,27 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
 
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{parse_u64_arg, required_arg};
 use crate::state::write_file_atomic;
 use crate::unix_now;
 
-const DAEMON_RECORD_VERSION: u32 = 1;
+const DAEMON_RECORD_VERSION: u32 = 2;
 const DEFAULT_DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_CONTROL_REQUEST_MAX_BYTES: usize = 16 * 1024;
+const DAEMON_CONTROL_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
+const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_START_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DaemonStatusReport {
-    pub(crate) schema: &'static str,
+    pub(crate) schema: String,
     pub(crate) base: String,
     pub(crate) supported: bool,
     pub(crate) running: bool,
@@ -30,6 +41,8 @@ pub(crate) struct DaemonStatusReport {
     pub(crate) state_path: String,
     pub(crate) stdout_log: Option<String>,
     pub(crate) stderr_log: Option<String>,
+    pub(crate) control_socket: Option<String>,
+    pub(crate) ipc_available: bool,
     pub(crate) command: Vec<String>,
     pub(crate) error: Option<String>,
 }
@@ -58,7 +71,22 @@ struct DaemonRecord {
     bootstrap_peers: Vec<String>,
     stdout_log: String,
     stderr_log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_socket: Option<String>,
     command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DaemonControlRequest {
+    command: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DaemonControlResponse {
+    ok: bool,
+    shutdown: bool,
+    status: DaemonStatusReport,
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,10 +148,24 @@ fn cmd_daemon_stop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub(crate) fn daemon_status_report(base: &Path) -> DaemonStatusReport {
+    let status = daemon_status_report_from_record(base);
+    if status.running {
+        if let Some(socket) = status.control_socket.as_deref() {
+            if let Ok(response) = query_control_socket(Path::new(socket), "status") {
+                if response.ok {
+                    return response.status;
+                }
+            }
+        }
+    }
+    status
+}
+
+fn daemon_status_report_from_record(base: &Path) -> DaemonStatusReport {
     let state_path = daemon_record_path(base);
     let Ok(record) = load_daemon_record(base) else {
         return DaemonStatusReport {
-            schema: "nexus.daemon_status.v1",
+            schema: "nexus.daemon_status.v1".into(),
             base: base.display().to_string(),
             supported: true,
             running: false,
@@ -136,6 +178,8 @@ pub(crate) fn daemon_status_report(base: &Path) -> DaemonStatusReport {
             state_path: state_path.display().to_string(),
             stdout_log: None,
             stderr_log: None,
+            control_socket: None,
+            ipc_available: false,
             command: Vec::new(),
             error: read_daemon_record_error(base),
         };
@@ -143,7 +187,7 @@ pub(crate) fn daemon_status_report(base: &Path) -> DaemonStatusReport {
 
     let running = is_process_running(record.pid);
     DaemonStatusReport {
-        schema: "nexus.daemon_status.v1",
+        schema: "nexus.daemon_status.v1".into(),
         base: base.display().to_string(),
         supported: true,
         running,
@@ -156,6 +200,8 @@ pub(crate) fn daemon_status_report(base: &Path) -> DaemonStatusReport {
         state_path: state_path.display().to_string(),
         stdout_log: Some(record.stdout_log),
         stderr_log: Some(record.stderr_log),
+        control_socket: record.control_socket,
+        ipc_available: false,
         command: record.command,
         error: None,
     }
@@ -178,6 +224,7 @@ fn start_daemon(
     std::fs::create_dir_all(daemon_dir(&options.base))?;
     let stdout_log = daemon_stdout_log_path(&options.base);
     let stderr_log = daemon_stderr_log_path(&options.base);
+    let control_socket = daemon_control_socket_path(&options.base);
     let stdout = open_append_log(&stdout_log)?;
     let stderr = open_append_log(&stderr_log)?;
 
@@ -189,6 +236,11 @@ fn start_daemon(
         "--listen".to_string(),
         options.listen.clone(),
     ];
+    #[cfg(unix)]
+    {
+        command_args.push("--control-socket".to_string());
+        command_args.push(control_socket.display().to_string());
+    }
     for peer in &options.bootstrap_peers {
         command_args.push("--bootstrap".to_string());
         command_args.push(peer.to_string());
@@ -220,6 +272,7 @@ fn start_daemon(
             .collect(),
         stdout_log: stdout_log.display().to_string(),
         stderr_log: stderr_log.display().to_string(),
+        control_socket: control_socket_for_record(&control_socket),
         command: std::iter::once(exe.display().to_string())
             .chain(command_args)
             .collect(),
@@ -228,7 +281,7 @@ fn start_daemon(
 
     Ok(DaemonStartReport {
         started: true,
-        status: daemon_status_report(&options.base),
+        status: wait_for_daemon_ready(&options.base, DAEMON_START_READY_TIMEOUT),
     })
 }
 
@@ -253,25 +306,14 @@ fn stop_daemon(
         });
     }
 
-    terminate_process(pid)?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !is_process_running(pid) {
-            remove_daemon_record(base)?;
-            return Ok(DaemonStopReport {
-                stopped: true,
-                stale_removed: false,
-                status: daemon_status_report(base),
-            });
+    if let Some(socket) = before.control_socket.as_deref() {
+        if query_control_socket(Path::new(socket), "shutdown").is_ok() {
+            return wait_for_daemon_stopped(base, pid, timeout, false);
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
 
-    Ok(DaemonStopReport {
-        stopped: false,
-        stale_removed: false,
-        status: daemon_status_report(base),
-    })
+    terminate_process(pid)?;
+    wait_for_daemon_stopped(base, pid, timeout, false)
 }
 
 fn parse_daemon_start_options(
@@ -426,6 +468,63 @@ fn daemon_stderr_log_path(base: &Path) -> PathBuf {
     daemon_dir(base).join("daemon.stderr.log")
 }
 
+fn daemon_control_socket_path(base: &Path) -> PathBuf {
+    daemon_dir(base).join("daemon.sock")
+}
+
+#[cfg(unix)]
+fn control_socket_for_record(path: &Path) -> Option<String> {
+    Some(path.display().to_string())
+}
+
+#[cfg(not(unix))]
+fn control_socket_for_record(_path: &Path) -> Option<String> {
+    None
+}
+
+fn wait_for_daemon_ready(base: &Path, timeout: Duration) -> DaemonStatusReport {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = daemon_status_report(base);
+        if status.ipc_available || !status.running || Instant::now() >= deadline {
+            if status.running && !status.ipc_available && status.error.is_none() {
+                status.error = Some(format!(
+                    "daemon control socket did not become ready within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_daemon_stopped(
+    base: &Path,
+    pid: u32,
+    timeout: Duration,
+    stale_removed: bool,
+) -> Result<DaemonStopReport, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !is_process_running(pid) {
+            remove_daemon_record(base)?;
+            return Ok(DaemonStopReport {
+                stopped: !stale_removed,
+                stale_removed,
+                status: daemon_status_report(base),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(DaemonStopReport {
+        stopped: false,
+        stale_removed: false,
+        status: daemon_status_report(base),
+    })
+}
+
 fn open_append_log(path: &Path) -> Result<File, std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -454,7 +553,7 @@ fn load_daemon_record(base: &Path) -> Result<DaemonRecord, Box<dyn std::error::E
     let path = daemon_record_path(base);
     let data = std::fs::read(&path)?;
     let record = serde_json::from_slice::<DaemonRecord>(&data)?;
-    if record.version != DAEMON_RECORD_VERSION {
+    if record.version == 0 || record.version > DAEMON_RECORD_VERSION {
         return Err(format!("unsupported daemon record version {}", record.version).into());
     }
     Ok(record)
@@ -552,6 +651,143 @@ fn terminate_process(_pid: u32) -> Result<(), std::io::Error> {
     ))
 }
 
+#[cfg(unix)]
+pub(crate) fn spawn_serve_control_socket(
+    base: PathBuf,
+    socket_path: PathBuf,
+    shutdown_tx: watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let base = base.clone();
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                handle_control_stream(stream, base, shutdown_tx).await;
+            });
+        }
+    });
+    Ok(handle)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_serve_control_socket(
+    _base: PathBuf,
+    _socket_path: PathBuf,
+    _shutdown_tx: watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    Err("daemon control socket is unsupported on this platform".into())
+}
+
+#[cfg(unix)]
+async fn handle_control_stream(
+    mut stream: UnixStream,
+    base: PathBuf,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    let response = match read_control_request(&mut stream).await {
+        Ok(request) => match request.command.as_str() {
+            "status" => DaemonControlResponse {
+                ok: true,
+                shutdown: false,
+                status: daemon_control_status(&base),
+                error: None,
+            },
+            "shutdown" => DaemonControlResponse {
+                ok: true,
+                shutdown: true,
+                status: daemon_control_status(&base),
+                error: None,
+            },
+            other => DaemonControlResponse {
+                ok: false,
+                shutdown: false,
+                status: daemon_control_status(&base),
+                error: Some(format!("unknown daemon control command: {other}")),
+            },
+        },
+        Err(error) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status: daemon_control_status(&base),
+            error: Some(error.to_string()),
+        },
+    };
+    let shutdown = response.shutdown && response.ok;
+    if let Ok(mut data) = serde_json::to_vec(&response) {
+        data.push(b'\n');
+        let _ = stream.write_all(&data).await;
+        let _ = stream.shutdown().await;
+    }
+    if shutdown {
+        let _ = shutdown_tx.send(true);
+    }
+}
+
+#[cfg(unix)]
+async fn read_control_request(
+    stream: &mut UnixStream,
+) -> Result<DaemonControlRequest, Box<dyn std::error::Error>> {
+    let mut buffer = vec![0u8; DAEMON_CONTROL_REQUEST_MAX_BYTES + 1];
+    let bytes_read = stream.read(&mut buffer).await?;
+    if bytes_read == 0 {
+        return Err("empty daemon control request".into());
+    }
+    if bytes_read > DAEMON_CONTROL_REQUEST_MAX_BYTES {
+        return Err("daemon control request is too large".into());
+    }
+    buffer.truncate(bytes_read);
+    Ok(serde_json::from_slice(&buffer)?)
+}
+
+fn daemon_control_status(base: &Path) -> DaemonStatusReport {
+    let mut status = daemon_status_report_from_record(base);
+    status.ipc_available = true;
+    status
+}
+
+#[cfg(unix)]
+fn query_control_socket(
+    socket_path: &Path,
+    command: &str,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(DAEMON_CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(DAEMON_CONTROL_TIMEOUT))?;
+    let request = serde_json::to_vec(&DaemonControlRequest {
+        command: command.to_string(),
+    })?;
+    if request.len() > DAEMON_CONTROL_REQUEST_MAX_BYTES {
+        return Err("daemon control request is too large".into());
+    }
+    stream.write_all(&request)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut reader = stream.take(DAEMON_CONTROL_RESPONSE_MAX_BYTES + 1);
+    let mut response = Vec::new();
+    reader.read_to_end(&mut response)?;
+    if response.len() as u64 > DAEMON_CONTROL_RESPONSE_MAX_BYTES {
+        return Err("daemon control response is too large".into());
+    }
+    Ok(serde_json::from_slice(&response)?)
+}
+
+#[cfg(not(unix))]
+fn query_control_socket(
+    _socket_path: &Path,
+    _command: &str,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
+    Err("daemon control socket is unsupported on this platform".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +817,7 @@ mod tests {
             bootstrap_peers: Vec::new(),
             stdout_log: "stdout.log".into(),
             stderr_log: "stderr.log".into(),
+            control_socket: None,
             command: vec!["nexus-node".into(), "serve".into()],
         };
         save_daemon_record(temp.path(), &record).unwrap();
@@ -603,5 +840,56 @@ mod tests {
 
         assert!(!status.running);
         assert!(status.error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_socket_reports_status_and_shutdown() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket = daemon_control_socket_path(temp.path());
+        let record = DaemonRecord {
+            version: DAEMON_RECORD_VERSION,
+            base: temp.path().display().to_string(),
+            pid: std::process::id(),
+            started_at: 456,
+            listen: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            public_defaults_enabled: false,
+            bootstrap_peers: Vec::new(),
+            stdout_log: "stdout.log".into(),
+            stderr_log: "stderr.log".into(),
+            control_socket: Some(socket.display().to_string()),
+            command: vec!["nexus-node".into(), "serve".into()],
+        };
+        save_daemon_record(temp.path(), &record).unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let handle =
+            spawn_serve_control_socket(temp.path().to_path_buf(), socket.clone(), shutdown_tx)
+                .unwrap();
+
+        let status_socket = socket.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            query_control_socket(&status_socket, "status").map_err(|err| err.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(status.ok);
+        assert!(!status.shutdown);
+        assert!(status.status.running);
+        assert!(status.status.ipc_available);
+
+        let shutdown_socket = socket.clone();
+        let shutdown = tokio::task::spawn_blocking(move || {
+            query_control_socket(&shutdown_socket, "shutdown").map_err(|err| err.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(shutdown.ok);
+        assert!(shutdown.shutdown);
+        shutdown_rx.changed().await.unwrap();
+        assert!(*shutdown_rx.borrow());
+
+        handle.abort();
     }
 }
