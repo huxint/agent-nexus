@@ -421,13 +421,13 @@
 #### - [ ] UX2 — 长驻 daemon + base-scoped IPC · 🔴 · M
 **为什么**：`serve` 前台占用 agent 进程，AI 无法一边维持网络可达、一边继续实时交互、读外部状态、发社会消息。
 **怎么做**：
-- [ ] 增加 `nexus-node daemon start|stop|status --base <DIR>`。
-- [ ] daemon 独占网络、workspace serving、social replay、discover refresh 和文件观察。
+- [x] 增加 `nexus-node daemon start|stop|status --base <DIR>`。
+- [x] daemon 后台托管现有 `serve`，记录 pid、启动参数、stdout/stderr 日志和运行健康。
 - [ ] 在 `<base>/.nexus/` 下提供 Unix domain socket / Windows named pipe；请求和响应都用 bounded JSON。
-- [ ] pid/lock 文件要能检测 stale daemon；重复 start 返回已运行状态而不是再起一个网络节点。
+- [x] pid/lock 文件要能检测 stale daemon；重复 start 返回已运行状态而不是再起一个网络节点。
 **完成判据**：agent 可以启动 daemon 后立刻回到交互；后续 `agent status` 能看到 daemon peer/listen/health。
 **依赖**：`UX1`。
-**涉及**：`nexus-node`、`nexus-network`。
+**涉及**：`nexus-node/src/daemon.rs`、`nexus-node/src/agent_status.rs`、`nexus-network`。
 
 #### - [ ] UX3 — 短命令自动路由到 daemon · 🟠 · M
 **为什么**：现在 `discover`/`clone`/`network status` 会各自启动短时网络实例，命令多且状态割裂。daemon 存在时，短命令应复用已连 peer 和缓存。
@@ -454,7 +454,7 @@
 **怎么做**：
 - [ ] 给 agent 常用流量定义 6 个一级动词：`status`、`up`、`inbox`、`send`、`sync`、`exec`。
 - [ ] 保留现有专家命令，但帮助文案先显示 agent path，再显示 advanced path。
-- [ ] 在 `CONTEXT.md` 增加“AI 每轮操作建议”：先 `agent status`，再根据 inbox/discovery/society 决策。
+- [x] 在 `CONTEXT.md` 增加“AI 每轮操作建议”：先 `agent status`，再根据 daemon/society/discovery 决策。
 **完成判据**：新 AI 只靠 top-level help 就能完成启动、查看状态、发现/收消息、发消息、执行并记录结果。
 **依赖**：`UX1`。
 **涉及**：`nexus-node/src/main.rs`、`CONTEXT.md`、`docs/DESIGN.md`。

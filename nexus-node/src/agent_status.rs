@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cli_args::required_arg;
+use crate::daemon::{daemon_status_report, DaemonStatusReport};
 use crate::discovery::{discovered_workspace_views, load_workspace_discovery, DiscoveryFilter};
 use crate::local_state::{identity_path, local_workspace_paths};
 use crate::social_sync::load_social_memory;
@@ -15,6 +16,7 @@ pub(crate) struct AgentStatusReport {
     social_memory: SocialMemoryStatus,
     local_workspaces: Vec<LocalWorkspaceStatus>,
     discovered_workspaces: Vec<DiscoveredWorkspaceStatus>,
+    daemon: DaemonStatusReport,
     control_plane: ControlPlaneStatus,
     recommended_commands: Vec<CommandHint>,
 }
@@ -125,6 +127,8 @@ fn cmd_agent_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
+    let daemon = daemon_status_report(base);
+    let control_plane = control_plane_status(&daemon);
     AgentStatusReport {
         schema: "nexus.agent_status.v1",
         base: base.display().to_string(),
@@ -132,14 +136,29 @@ pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
         social_memory: social_memory_status(base),
         local_workspaces: local_workspace_statuses(base),
         discovered_workspaces: discovered_workspace_statuses(base),
-        control_plane: ControlPlaneStatus {
-            mode: "foreground_serve_only",
-            realtime_ready: false,
-            daemon_supported: false,
-            issue: "serve owns the invoking process, so agents cannot keep a conversational turn active while serving",
-            next_design: "add a local daemon plus short-lived control commands over a base-scoped IPC socket",
-        },
+        daemon,
+        control_plane,
         recommended_commands: recommended_commands(base),
+    }
+}
+
+fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
+    if daemon.running {
+        ControlPlaneStatus {
+            mode: "daemon_running",
+            realtime_ready: true,
+            daemon_supported: true,
+            issue: "daemon is running; request-response IPC routing is still pending",
+            next_design: "route agent inbox, sync, discover, send, and exec through the base-scoped daemon control socket",
+        }
+    } else {
+        ControlPlaneStatus {
+            mode: "daemon_supported_not_running",
+            realtime_ready: false,
+            daemon_supported: true,
+            issue: "daemon is not running, so network serving still requires an explicit foreground or daemon start command",
+            next_design: "start daemon for background network availability, then add request-response IPC routing",
+        }
     }
 }
 
@@ -344,6 +363,16 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
             command: format!("nexus-node discover --base {base} --lan --json --timeout-ms 3000"),
         },
         CommandHint {
+            name: "daemon_start",
+            command: format!(
+                "nexus-node daemon start --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"
+            ),
+        },
+        CommandHint {
+            name: "daemon_status",
+            command: format!("nexus-node daemon status --base {base} --json"),
+        },
+        CommandHint {
             name: "serve_foreground",
             command: format!("nexus-node serve --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"),
         },
@@ -388,6 +417,15 @@ fn print_agent_status_text(report: &AgentStatusReport) {
         "control_plane: mode={} realtime_ready={}",
         report.control_plane.mode, report.control_plane.realtime_ready
     );
+    println!(
+        "daemon: running={} pid={}",
+        report.daemon.running,
+        report
+            .daemon
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
     println!("recommended:");
     for hint in &report.recommended_commands {
         println!("  {}: {}", hint.name, hint.command);
@@ -412,7 +450,8 @@ mod tests {
 
         assert!(!report.identity.present);
         assert!(!identity_path(temp.path()).exists());
-        assert_eq!(report.control_plane.mode, "foreground_serve_only");
+        assert_eq!(report.control_plane.mode, "daemon_supported_not_running");
+        assert!(!report.daemon.running);
     }
 
     #[test]

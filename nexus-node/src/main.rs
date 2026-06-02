@@ -10,6 +10,7 @@
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
+//!   nexus-node daemon start|status|stop --base <dir> [--json]
 //!   nexus-node agent status --base <dir> [--json]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
@@ -25,6 +26,7 @@ use serde::Serialize;
 mod agent_status;
 mod bootstrap;
 mod cli_args;
+mod daemon;
 mod discovery;
 mod ids;
 mod local_state;
@@ -35,6 +37,7 @@ mod state;
 use agent_status::cmd_agent;
 use bootstrap::*;
 use cli_args::*;
+use daemon::cmd_daemon;
 use discovery::*;
 use ids::{parse_cid, parse_workspace_id};
 use local_state::*;
@@ -124,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "discover" => cmd_discover(&args).await?,
         "bootstrap" => cmd_bootstrap(&args)?,
         "network" => cmd_network(&args).await?,
+        "daemon" => cmd_daemon(&args)?,
         "agent" => cmd_agent(&args)?,
         "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
@@ -148,6 +152,9 @@ fn print_usage(prog: &str) {
         "  {prog} bootstrap status --base <DIR> [--json] [--invite <ADDR>] [--no-public-bootstrap]"
     );
     eprintln!("  {prog} network status --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--timeout-ms <N>]");
+    eprintln!("  {prog} daemon start --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap]");
+    eprintln!("  {prog} daemon status --base <DIR> [--json]");
+    eprintln!("  {prog} daemon stop --base <DIR> [--json] [--timeout-ms <N>]");
     eprintln!("  {prog} agent status --base <DIR> [--json]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
