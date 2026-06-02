@@ -2,11 +2,17 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::cli_args::required_arg;
+use nexus_agent::{
+    IntentActionKind, IntentActionPlan, IntentRecommendation, SocialMemory, Task, TaskState,
+};
+use nexus_core::Did;
+
+use crate::cli_args::{parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{daemon_status_report, DaemonStatusReport};
 use crate::discovery::{discovered_workspace_views, load_workspace_discovery, DiscoveryFilter};
 use crate::local_state::{identity_path, local_workspace_paths};
 use crate::social_sync::load_social_memory;
+use crate::unix_now;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct AgentStatusReport {
@@ -91,11 +97,59 @@ struct CommandHint {
     command: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct AgentInboxReport {
+    schema: &'static str,
+    base: String,
+    agent: Option<String>,
+    generated_at: u64,
+    daemon: DaemonStatusReport,
+    summary: AgentInboxSummary,
+    items: Vec<AgentInboxItem>,
+    recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+struct AgentInboxSummary {
+    items: usize,
+    daemon_alerts: usize,
+    intent_recommendations: usize,
+    open_tasks: usize,
+    assigned_tasks: usize,
+    discovered_workspaces: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct AgentInboxItem {
+    kind: &'static str,
+    priority: u32,
+    title: String,
+    body: Option<String>,
+    author: Option<String>,
+    workspace: Option<String>,
+    task_id: Option<String>,
+    capability: Option<String>,
+    timestamp: Option<u64>,
+    score: Option<f64>,
+    reasons: Vec<String>,
+    actions: Vec<AgentInboxAction>,
+    command_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct AgentInboxAction {
+    kind: String,
+    event_hint: String,
+    confidence: Option<f64>,
+    command_hint: Option<String>,
+}
+
 pub(crate) fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.get(2).map(String::as_str) {
         Some("status") | Some("context") => cmd_agent_status(args),
+        Some("inbox") => cmd_agent_inbox(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status".into()),
+        None => Err("agent subcommand required: status or inbox".into()),
     }
 }
 
@@ -126,6 +180,48 @@ fn cmd_agent_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn cmd_agent_inbox(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut agent = None;
+    let mut json = false;
+    let mut limit = 20usize;
+    let mut since = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--agent" | "--did" => {
+                i += 1;
+                agent = Some(Did::new(required_arg(args, i, "--agent")?.to_string()));
+            }
+            "--json" => {
+                json = true;
+            }
+            "--limit" => {
+                i += 1;
+                limit = parse_usize_arg(required_arg(args, i, "--limit")?, "--limit")?;
+            }
+            "--since" => {
+                i += 1;
+                since = Some(parse_u64_arg(required_arg(args, i, "--since")?, "--since")?);
+            }
+            other => return Err(format!("unknown agent inbox option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let report = agent_inbox_report(&base, agent, limit, since);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_inbox_text(&report);
+    }
+    Ok(())
+}
+
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
     let daemon = daemon_status_report(base);
     let control_plane = control_plane_status(&daemon);
@@ -139,6 +235,75 @@ pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
         daemon,
         control_plane,
         recommended_commands: recommended_commands(base),
+    }
+}
+
+pub(crate) fn agent_inbox_report(
+    base: &Path,
+    requested_agent: Option<Did>,
+    limit: usize,
+    since: Option<u64>,
+) -> AgentInboxReport {
+    let generated_at = unix_now();
+    let daemon = daemon_status_report(base);
+    let resolved_agent = requested_agent.or_else(|| identity_status(base).did.map(Did::new));
+    let mut items = Vec::new();
+
+    push_daemon_inbox_items(base, &daemon, generated_at, &mut items);
+
+    let memory_path = base.join(".nexus-social-memory.json");
+    match load_social_memory(&memory_path) {
+        Ok(memory) => {
+            if let Some(agent) = resolved_agent.as_ref() {
+                push_intent_recommendation_items(
+                    base,
+                    &memory,
+                    agent,
+                    limit,
+                    generated_at,
+                    &mut items,
+                );
+            }
+            push_task_items(base, &memory, resolved_agent.as_ref(), &mut items);
+        }
+        Err(error) => items.push(AgentInboxItem {
+            kind: "social_memory_error",
+            priority: 85,
+            title: "Social memory is unreadable".into(),
+            body: Some(format!("{}: {error}", memory_path.display())),
+            author: None,
+            workspace: None,
+            task_id: None,
+            capability: None,
+            timestamp: Some(generated_at),
+            score: None,
+            reasons: vec!["social-memory-read-error".into()],
+            actions: Vec::new(),
+            command_hint: Some(format!(
+                "nexus-node agent status --base {} --json",
+                base.display()
+            )),
+        }),
+    }
+
+    push_discovered_workspace_items(base, &mut items);
+
+    if let Some(cursor) = since {
+        items.retain(|item| item.timestamp.is_none_or(|timestamp| timestamp > cursor));
+    }
+    sort_inbox_items(&mut items);
+    items.truncate(limit);
+
+    let summary = summarize_inbox_items(&items);
+    AgentInboxReport {
+        schema: "nexus.agent_inbox.v1",
+        base: base.display().to_string(),
+        agent: resolved_agent.as_ref().map(ToString::to_string),
+        generated_at,
+        daemon,
+        summary,
+        items,
+        recommended_commands: inbox_recommended_commands(base),
     }
 }
 
@@ -160,6 +325,403 @@ fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
             next_design: "start daemon for background network availability, then add request-response IPC routing",
         }
     }
+}
+
+fn push_daemon_inbox_items(
+    base: &Path,
+    daemon: &DaemonStatusReport,
+    generated_at: u64,
+    items: &mut Vec<AgentInboxItem>,
+) {
+    if let Some(error) = &daemon.error {
+        items.push(AgentInboxItem {
+            kind: "daemon_alert",
+            priority: 95,
+            title: "Daemon state is unreadable".into(),
+            body: Some(error.clone()),
+            author: None,
+            workspace: None,
+            task_id: None,
+            capability: None,
+            timestamp: Some(generated_at),
+            score: None,
+            reasons: vec!["daemon-state-error".into()],
+            actions: Vec::new(),
+            command_hint: Some(format!(
+                "nexus-node daemon status --base {} --json",
+                base.display()
+            )),
+        });
+        return;
+    }
+
+    if daemon.stale {
+        items.push(AgentInboxItem {
+            kind: "daemon_alert",
+            priority: 90,
+            title: "Daemon record is stale".into(),
+            body: Some("The recorded daemon pid is no longer running.".into()),
+            author: None,
+            workspace: None,
+            task_id: None,
+            capability: None,
+            timestamp: daemon.started_at.or(Some(generated_at)),
+            score: None,
+            reasons: vec!["stale-daemon-record".into()],
+            actions: Vec::new(),
+            command_hint: Some(format!("nexus-node daemon stop --base {}", base.display())),
+        });
+    } else if !daemon.running {
+        items.push(AgentInboxItem {
+            kind: "daemon_alert",
+            priority: 70,
+            title: "Daemon is not running".into(),
+            body: Some(
+                "Inbox is based on local caches; start the daemon for live P2P availability."
+                    .into(),
+            ),
+            author: None,
+            workspace: None,
+            task_id: None,
+            capability: None,
+            timestamp: Some(generated_at),
+            score: None,
+            reasons: vec!["daemon-not-running".into()],
+            actions: Vec::new(),
+            command_hint: Some(format!(
+                "nexus-node daemon start --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1",
+                base.display()
+            )),
+        });
+    } else if !daemon.ipc_available {
+        items.push(AgentInboxItem {
+            kind: "daemon_alert",
+            priority: 65,
+            title: "Daemon IPC is not available".into(),
+            body: Some(
+                "The daemon appears to be running, but live control-socket status is unavailable."
+                    .into(),
+            ),
+            author: None,
+            workspace: None,
+            task_id: None,
+            capability: None,
+            timestamp: daemon.started_at.or(Some(generated_at)),
+            score: None,
+            reasons: vec!["daemon-ipc-unavailable".into()],
+            actions: Vec::new(),
+            command_hint: Some(format!(
+                "nexus-node daemon status --base {} --json",
+                base.display()
+            )),
+        });
+    }
+}
+
+fn push_intent_recommendation_items(
+    base: &Path,
+    memory: &SocialMemory,
+    agent: &Did,
+    limit: usize,
+    now: u64,
+    items: &mut Vec<AgentInboxItem>,
+) {
+    for recommendation in memory.society().recommend_intents(agent, Some(now), limit) {
+        items.push(intent_recommendation_item(base, recommendation));
+    }
+}
+
+fn intent_recommendation_item(base: &Path, recommendation: IntentRecommendation) -> AgentInboxItem {
+    let IntentRecommendation {
+        intent,
+        ranking_score,
+        reasons,
+        actions,
+        ..
+    } = recommendation;
+    let command_hint = actions
+        .first()
+        .map(|action| intent_action_command_hint(base, action))
+        .or_else(|| {
+            Some(format!(
+                "nexus-node society --base {} --json --intent-limit 10",
+                base.display()
+            ))
+        });
+    let actions = actions
+        .into_iter()
+        .map(|action| AgentInboxAction {
+            kind: intent_action_kind_name(action.kind).into(),
+            event_hint: action.event_hint.clone(),
+            confidence: Some(action.confidence),
+            command_hint: Some(intent_action_command_hint(base, &action)),
+        })
+        .collect::<Vec<_>>();
+
+    AgentInboxItem {
+        kind: "intent_recommendation",
+        priority: priority_from_score(55, 40, ranking_score),
+        title: intent.title.clone(),
+        body: non_empty_string(intent.body.clone()),
+        author: Some(intent.author.to_string()),
+        workspace: intent.workspace.map(|workspace| workspace.to_string()),
+        task_id: intent.task_id,
+        capability: intent.capability,
+        timestamp: Some(intent.created_at),
+        score: Some(ranking_score),
+        reasons,
+        actions,
+        command_hint,
+    }
+}
+
+fn push_task_items(
+    base: &Path,
+    memory: &SocialMemory,
+    agent: Option<&Did>,
+    items: &mut Vec<AgentInboxItem>,
+) {
+    let society = memory.society();
+    for task in society.tasks() {
+        if task.state == TaskState::InProgress
+            && agent.is_some_and(|agent| task.assigned_to.as_ref() == Some(agent))
+        {
+            items.push(assigned_task_item(base, task));
+            continue;
+        }
+        if task.is_open() {
+            items.push(open_task_item(
+                base,
+                task,
+                task_matches_agent_capability(memory, task, agent),
+                agent,
+            ));
+        }
+    }
+}
+
+fn open_task_item(
+    base: &Path,
+    task: &Task,
+    capability_match: bool,
+    agent: Option<&Did>,
+) -> AgentInboxItem {
+    let mut reasons = vec![
+        "task-open".into(),
+        format!("capability:{}", task.required_capability),
+    ];
+    if capability_match {
+        reasons.push("matches-agent-capability".into());
+    }
+    if agent.is_some_and(|agent| task.publisher == *agent) {
+        reasons.push("published-by-agent".into());
+    }
+
+    AgentInboxItem {
+        kind: "open_task",
+        priority: if capability_match { 76 } else { 58 },
+        title: format!("Open task: {}", task.description),
+        body: Some(
+            format!("{} {}", task.command, task.args.join(" "))
+                .trim()
+                .to_string(),
+        ),
+        author: Some(task.publisher.to_string()),
+        workspace: None,
+        task_id: Some(task.id.clone()),
+        capability: Some(task.required_capability.clone()),
+        timestamp: Some(task.created_at),
+        score: None,
+        reasons,
+        actions: Vec::new(),
+        command_hint: Some(format!(
+            "nexus-node society --base {} --json --task {}",
+            base.display(),
+            task.id
+        )),
+    }
+}
+
+fn assigned_task_item(base: &Path, task: &Task) -> AgentInboxItem {
+    AgentInboxItem {
+        kind: "assigned_task",
+        priority: 88,
+        title: format!("Assigned task in progress: {}", task.description),
+        body: Some(
+            format!("{} {}", task.command, task.args.join(" "))
+                .trim()
+                .to_string(),
+        ),
+        author: Some(task.publisher.to_string()),
+        workspace: None,
+        task_id: Some(task.id.clone()),
+        capability: Some(task.required_capability.clone()),
+        timestamp: Some(task.created_at),
+        score: None,
+        reasons: vec![
+            "task-assigned-to-agent".into(),
+            format!("capability:{}", task.required_capability),
+        ],
+        actions: Vec::new(),
+        command_hint: Some(format!(
+            "nexus-node society --base {} --json --task {}",
+            base.display(),
+            task.id
+        )),
+    }
+}
+
+fn task_matches_agent_capability(memory: &SocialMemory, task: &Task, agent: Option<&Did>) -> bool {
+    let Some(agent) = agent else {
+        return false;
+    };
+    memory
+        .society()
+        .agent_manifest(agent)
+        .is_some_and(|manifest| {
+            manifest
+                .provides
+                .iter()
+                .any(|capability| capability.name == task.required_capability)
+        })
+}
+
+fn push_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>) {
+    let Ok(announcements) = load_workspace_discovery(base) else {
+        return;
+    };
+    for workspace in discovered_workspace_views(&announcements, &DiscoveryFilter::default()) {
+        if !workspace.clone_ready {
+            continue;
+        }
+        items.push(AgentInboxItem {
+            kind: "discovered_workspace",
+            priority: 52,
+            title: format!("Clone-ready workspace: {}", workspace.name),
+            body: non_empty_string(workspace.description),
+            author: Some(workspace.owner.to_string()),
+            workspace: Some(workspace.workspace.clone()),
+            task_id: None,
+            capability: None,
+            timestamp: Some(workspace.latest_timestamp),
+            score: None,
+            reasons: vec![
+                "clone-ready".into(),
+                "verified".into(),
+                format!("peers:{}", workspace.peers.len()),
+                format!("addrs:{}", workspace.addrs.len()),
+            ],
+            actions: Vec::new(),
+            command_hint: Some(format!(
+                "nexus-node discover --base {} --clone-ready --json --workspace {}",
+                base.display(),
+                workspace.workspace
+            )),
+        });
+    }
+}
+
+fn inbox_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "society",
+            command: format!("nexus-node society --base {base} --json --intent-limit 10"),
+        },
+        CommandHint {
+            name: "discover_ready",
+            command: format!("nexus-node discover --base {base} --clone-ready --json"),
+        },
+        CommandHint {
+            name: "daemon_start",
+            command: format!(
+                "nexus-node daemon start --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"
+            ),
+        },
+    ]
+}
+
+fn sort_inbox_items(items: &mut [AgentInboxItem]) {
+    items.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.timestamp.unwrap_or(0).cmp(&a.timestamp.unwrap_or(0)))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+}
+
+fn summarize_inbox_items(items: &[AgentInboxItem]) -> AgentInboxSummary {
+    let mut summary = AgentInboxSummary {
+        items: items.len(),
+        ..Default::default()
+    };
+    for item in items {
+        match item.kind {
+            "daemon_alert" => summary.daemon_alerts += 1,
+            "intent_recommendation" => summary.intent_recommendations += 1,
+            "open_task" => summary.open_tasks += 1,
+            "assigned_task" => summary.assigned_tasks += 1,
+            "discovered_workspace" => summary.discovered_workspaces += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+fn priority_from_score(base: u32, weight: u32, score: f64) -> u32 {
+    let normalized = if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    base + (weight as f64 * normalized).round() as u32
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn intent_action_kind_name(kind: IntentActionKind) -> &'static str {
+    match kind {
+        IntentActionKind::RespondIntent => "RespondIntent",
+        IntentActionKind::OfferTask => "OfferTask",
+        IntentActionKind::JoinWorkspace => "JoinWorkspace",
+        IntentActionKind::ProposeCollective => "ProposeCollective",
+    }
+}
+
+fn intent_action_kind_arg(kind: IntentActionKind) -> &'static str {
+    match kind {
+        IntentActionKind::RespondIntent => "respond-intent",
+        IntentActionKind::OfferTask => "offer-task",
+        IntentActionKind::JoinWorkspace => "join-workspace",
+        IntentActionKind::ProposeCollective => "propose-collective",
+    }
+}
+
+fn intent_action_command_hint(base: &Path, action: &IntentActionPlan) -> String {
+    let mut command = format!(
+        "nexus-node act --base {} --intent {} --kind {}",
+        base.display(),
+        action.intent_id,
+        intent_action_kind_arg(action.kind)
+    );
+    if let Some(price) = action.suggested_price {
+        command.push_str(&format!(" --price {price}"));
+    }
+    if let Some(eta) = action.estimated_time_secs {
+        command.push_str(&format!(" --eta {eta}"));
+    }
+    command
 }
 
 fn identity_status(base: &Path) -> IdentityStatus {
@@ -379,6 +941,41 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
     ]
 }
 
+fn print_agent_inbox_text(report: &AgentInboxReport) {
+    println!("Agent inbox: {}", report.base);
+    println!("agent: {}", report.agent.as_deref().unwrap_or("-"));
+    println!("generated_at: {}", report.generated_at);
+    println!(
+        "daemon: running={} ipc_available={}",
+        report.daemon.running, report.daemon.ipc_available
+    );
+    println!(
+        "items: {} daemon_alerts={} intents={} open_tasks={} assigned_tasks={} discovered_workspaces={}",
+        report.summary.items,
+        report.summary.daemon_alerts,
+        report.summary.intent_recommendations,
+        report.summary.open_tasks,
+        report.summary.assigned_tasks,
+        report.summary.discovered_workspaces
+    );
+    for item in &report.items {
+        println!("  [{} p{}] {}", item.kind, item.priority, item.title);
+        if let Some(body) = &item.body {
+            println!("    {body}");
+        }
+        if !item.reasons.is_empty() {
+            println!("    reasons: {}", item.reasons.join(", "));
+        }
+        if let Some(command) = &item.command_hint {
+            println!("    command: {command}");
+        }
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
+}
+
 fn print_agent_status_text(report: &AgentStatusReport) {
     println!("Agent status: {}", report.base);
     println!(
@@ -441,6 +1038,13 @@ fn display_count(value: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::social_sync::save_social_memory;
+    use nexus_agent::{
+        AgentIntent, AgentManifest, CapabilityDecl, IntentKind, SocialEventKind, TaskAcceptance,
+        TaskOffer, TaskSpec,
+    };
+    use nexus_core::WorkspaceId;
+    use nexus_crypto::NodeIdentity;
 
     #[test]
     fn status_does_not_create_identity() {
@@ -487,5 +1091,195 @@ mod tests {
             Some("2222222222222222222222222222222222222222222222222222222222222222")
         );
         assert_eq!(report.social_memory.events, Some(0));
+    }
+
+    #[test]
+    fn inbox_does_not_create_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let report = agent_inbox_report(temp.path(), None, 10, None);
+
+        assert!(report.agent.is_none());
+        assert!(!identity_path(temp.path()).exists());
+        assert_eq!(report.summary.daemon_alerts, 1);
+        assert!(report.items.iter().any(|item| {
+            item.kind == "daemon_alert"
+                && item
+                    .command_hint
+                    .as_deref()
+                    .is_some_and(|command| command.contains("nexus-node daemon start"))
+        }));
+    }
+
+    #[test]
+    fn inbox_recommends_intents_and_open_tasks_for_agent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let requester = NodeIdentity::generate();
+        let author = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([71; 32]);
+        let memory_path = temp.path().join(".nexus-social-memory.json");
+        let mut memory = SocialMemory::new();
+
+        let requester_events = memory
+            .sign_event_sequence(
+                &requester,
+                [
+                    (
+                        1,
+                        SocialEventKind::ManifestPublished {
+                            manifest: AgentManifest::new(requester.did().clone(), "reviewer", 1)
+                                .provide(CapabilityDecl {
+                                    name: "code-review".into(),
+                                    description: "review workspaces".into(),
+                                    version: "1.0".into(),
+                                    price_per_unit: 7,
+                                    price_unit: "per-request".into(),
+                                })
+                                .preference("high-autonomy"),
+                        },
+                    ),
+                    (2, SocialEventKind::WorkspaceJoined { workspace }),
+                ],
+            )
+            .unwrap();
+        assert_eq!(memory.ingest_events(requester_events).unwrap(), 2);
+
+        let task = TaskSpec::new(
+            author.did().clone(),
+            "inspect a shared workspace",
+            "code-review",
+            "nexus-node",
+            vec!["society".into(), "--json".into()],
+            100,
+            4_102_444_800,
+            4,
+        );
+        let task_id = task.id.clone();
+        let author_events = memory
+            .sign_event_sequence(
+                &author,
+                [
+                    (
+                        3,
+                        SocialEventKind::IntentPublished {
+                            intent: AgentIntent {
+                                id: "intent-review-open".into(),
+                                author: author.did().clone(),
+                                kind: IntentKind::Need,
+                                title: "Need reviewer".into(),
+                                body: "inspect this AI workspace".into(),
+                                workspace: Some(workspace),
+                                task_id: Some(task_id.clone()),
+                                capability: Some("code-review".into()),
+                                tags: vec!["high-autonomy".into()],
+                                created_at: 3,
+                                expires_at: Some(4_102_444_800),
+                            },
+                        },
+                    ),
+                    (4, SocialEventKind::TaskPublished { task }),
+                ],
+            )
+            .unwrap();
+        assert_eq!(memory.ingest_events(author_events).unwrap(), 2);
+        save_social_memory(&memory_path, &memory).unwrap();
+
+        let report = agent_inbox_report(temp.path(), Some(requester.did().clone()), 10, None);
+
+        assert_eq!(report.agent.as_deref(), Some(requester.did().as_str()));
+        assert_eq!(report.summary.intent_recommendations, 1);
+        assert_eq!(report.summary.open_tasks, 1);
+        let intent_item = report
+            .items
+            .iter()
+            .find(|item| item.kind == "intent_recommendation")
+            .unwrap();
+        assert_eq!(intent_item.task_id.as_deref(), Some(task_id.as_str()));
+        assert!(intent_item
+            .reasons
+            .contains(&"capability:code-review".into()));
+        assert!(intent_item.actions.iter().any(|action| {
+            action.kind == "RespondIntent"
+                && action.command_hint.as_deref().is_some_and(|command| {
+                    command.contains("nexus-node act") && command.contains("--kind respond-intent")
+                })
+        }));
+        let task_item = report
+            .items
+            .iter()
+            .find(|item| item.kind == "open_task")
+            .unwrap();
+        assert_eq!(task_item.task_id.as_deref(), Some(task_id.as_str()));
+        assert!(task_item
+            .reasons
+            .contains(&"matches-agent-capability".into()));
+    }
+
+    #[test]
+    fn inbox_reports_assigned_tasks_for_agent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let publisher = NodeIdentity::generate();
+        let worker = NodeIdentity::generate();
+        let memory_path = temp.path().join(".nexus-social-memory.json");
+        let mut memory = SocialMemory::new();
+
+        let task = TaskSpec::new(
+            publisher.did().clone(),
+            "finish accepted task",
+            "native-workspace",
+            "true",
+            Vec::new(),
+            10,
+            4_102_444_800,
+            1,
+        );
+        let task_id = task.id.clone();
+        let published = memory
+            .sign_event(&publisher, 1, SocialEventKind::TaskPublished { task })
+            .unwrap();
+        assert!(memory.ingest_event(published).unwrap());
+        let offered = memory
+            .sign_event(
+                &worker,
+                2,
+                SocialEventKind::TaskOffered {
+                    offer: TaskOffer {
+                        task_id: task_id.clone(),
+                        bidder: worker.did().clone(),
+                        price: 7,
+                        estimated_time_secs: 60,
+                        rationale: "ready".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(memory.ingest_event(offered).unwrap());
+        let accepted = memory
+            .sign_event(
+                &publisher,
+                3,
+                SocialEventKind::TaskAccepted {
+                    acceptance: TaskAcceptance {
+                        task_id: task_id.clone(),
+                        publisher: publisher.did().clone(),
+                        bidder: worker.did().clone(),
+                        price: 7,
+                        accepted_at: 3,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(memory.ingest_event(accepted).unwrap());
+        save_social_memory(&memory_path, &memory).unwrap();
+
+        let report = agent_inbox_report(temp.path(), Some(worker.did().clone()), 10, None);
+
+        assert_eq!(report.summary.assigned_tasks, 1);
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.kind == "assigned_task")
+            .unwrap();
+        assert_eq!(item.task_id.as_deref(), Some(task_id.as_str()));
     }
 }

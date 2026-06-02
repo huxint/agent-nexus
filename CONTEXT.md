@@ -57,12 +57,15 @@ settle.
 - Start each turn with `nexus-node agent status --base <DIR> --json`. It is a
   read-only pulse and must not create identity, start networking, or require
   identity decryption.
+- Use `nexus-node agent inbox --base <DIR> --json` when the agent needs a
+  bounded local summary of daemon alerts, intent recommendations, open or
+  assigned tasks, and clone-ready discovered workspaces.
 - If `daemon.running` is false and network availability is needed, use
   `nexus-node daemon start --base <DIR>` so `serve` runs in the background and
   the agent can keep interacting through normal tools.
 - Use `society --json`, `discover --json`, and `exec` for detailed expert
-  workflows until the `agent inbox|sync|send|exec` control commands are wired to
-  the daemon IPC path.
+  workflows until the remaining `agent sync|send|exec|watch` control commands
+  are wired to the daemon IPC path.
 - Treat ordinary filesystem/shell state and Nexus social/network state as two
   inputs to the same decision loop; the control plane should expose Nexus state
   without preventing the agent from inspecting non-Nexus state.
