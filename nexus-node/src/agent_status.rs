@@ -7,8 +7,9 @@ use nexus_agent::{
 };
 use nexus_core::Did;
 
+use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{parse_u64_arg, parse_usize_arg, required_arg};
-use crate::daemon::{daemon_status_report, DaemonStatusReport};
+use crate::daemon::{daemon_status_report, start_daemon, DaemonStartOptions, DaemonStatusReport};
 use crate::discovery::{
     discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
     DiscoverySort,
@@ -152,6 +153,14 @@ pub(crate) struct AgentDiscoverReport {
     recommended_commands: Vec<CommandHint>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct AgentUpReport {
+    schema: &'static str,
+    started: bool,
+    status: DaemonStatusReport,
+    recommended_commands: Vec<CommandHint>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 struct AgentDiscoverSummary {
     cached_announcements: usize,
@@ -171,10 +180,11 @@ struct AgentInboxAction {
 pub(crate) fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.get(2).map(String::as_str) {
         Some("status") | Some("context") => cmd_agent_status(args),
+        Some("up") | Some("start") => cmd_agent_up(args),
         Some("inbox") => cmd_agent_inbox(args),
         Some("discover") => cmd_agent_discover(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status, inbox, or discover".into()),
+        None => Err("agent subcommand required: status, up, inbox, or discover".into()),
     }
 }
 
@@ -201,6 +211,59 @@ fn cmd_agent_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_agent_status_text(&report);
+    }
+    Ok(())
+}
+
+fn cmd_agent_up(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = DaemonStartOptions {
+        base: PathBuf::from("."),
+        listen: "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+        bootstrap_peers: Vec::new(),
+        use_public_bootstrap: true,
+        json: false,
+    };
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                options.base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--listen" => {
+                i += 1;
+                options.listen = required_arg(args, i, "--listen")?.to_string();
+            }
+            "--bootstrap" => {
+                i += 1;
+                options
+                    .bootstrap_peers
+                    .push(required_arg(args, i, "--bootstrap")?.parse()?);
+            }
+            "--invite" => {
+                i += 1;
+                extend_bootstrap_peers(
+                    &mut options.bootstrap_peers,
+                    required_arg(args, i, "--invite")?,
+                )?;
+            }
+            "--no-public-bootstrap" => {
+                options.use_public_bootstrap = false;
+            }
+            "--json" => {
+                options.json = true;
+            }
+            other => return Err(format!("unknown agent up option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let json = options.json;
+    let report = agent_up_report(&options)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_up_text(&report);
     }
     Ok(())
 }
@@ -314,6 +377,18 @@ fn cmd_agent_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         print_agent_discover_text(&report);
     }
     Ok(())
+}
+
+pub(crate) fn agent_up_report(
+    options: &DaemonStartOptions,
+) -> Result<AgentUpReport, Box<dyn std::error::Error>> {
+    let report = start_daemon(options)?;
+    Ok(AgentUpReport {
+        schema: "nexus.agent_up.v1",
+        started: report.started,
+        recommended_commands: up_recommended_commands(&options.base),
+        status: report.status,
+    })
 }
 
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
@@ -774,6 +849,32 @@ fn push_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>)
     }
 }
 
+fn up_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "discover",
+            command: format!("nexus-node agent discover --base {base} --json"),
+        },
+        CommandHint {
+            name: "daemon_status",
+            command: format!("nexus-node daemon status --base {base} --json"),
+        },
+        CommandHint {
+            name: "daemon_stop",
+            command: format!("nexus-node daemon stop --base {base} --json"),
+        },
+    ]
+}
+
 fn discover_recommended_commands(base: &Path) -> Vec<CommandHint> {
     let base = base.display();
     vec![
@@ -1120,6 +1221,29 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
             command: format!("nexus-node serve --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"),
         },
     ]
+}
+
+fn print_agent_up_text(report: &AgentUpReport) {
+    println!("Agent up: {}", report.status.base);
+    println!("started: {}", report.started);
+    println!(
+        "daemon: running={} ipc_available={} pid={}",
+        report.status.running,
+        report.status.ipc_available,
+        report
+            .status
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("listen: {}", report.status.listen.as_deref().unwrap_or("-"));
+    if let Some(error) = &report.status.error {
+        println!("error: {error}");
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
 }
 
 fn print_agent_discover_text(report: &AgentDiscoverReport) {
@@ -1551,6 +1675,46 @@ mod tests {
         assert_eq!(report.summary.clone_ready, 1);
         assert_eq!(report.workspaces[0].workspace, workspace.to_string());
         assert!(report.workspaces[0].clone_ready);
+        assert!(!identity_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn up_reports_existing_daemon_without_creating_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": null,
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let options = DaemonStartOptions {
+            base: temp.path().to_path_buf(),
+            listen: "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+            bootstrap_peers: Vec::new(),
+            use_public_bootstrap: true,
+            json: true,
+        };
+
+        let report = agent_up_report(&options).unwrap();
+
+        assert_eq!(report.schema, "nexus.agent_up.v1");
+        assert!(!report.started);
+        assert!(report.status.running);
+        assert_eq!(report.status.pid, Some(std::process::id()));
         assert!(!identity_path(temp.path()).exists());
     }
 }

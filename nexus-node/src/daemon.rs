@@ -48,9 +48,9 @@ pub(crate) struct DaemonStatusReport {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-struct DaemonStartReport {
-    started: bool,
-    status: DaemonStatusReport,
+pub(crate) struct DaemonStartReport {
+    pub(crate) started: bool,
+    pub(crate) status: DaemonStatusReport,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -90,12 +90,12 @@ struct DaemonControlResponse {
 }
 
 #[derive(Clone, Debug)]
-struct DaemonStartOptions {
-    base: PathBuf,
-    listen: String,
-    bootstrap_peers: Vec<libp2p::Multiaddr>,
-    use_public_bootstrap: bool,
-    json: bool,
+pub(crate) struct DaemonStartOptions {
+    pub(crate) base: PathBuf,
+    pub(crate) listen: String,
+    pub(crate) bootstrap_peers: Vec<libp2p::Multiaddr>,
+    pub(crate) use_public_bootstrap: bool,
+    pub(crate) json: bool,
 }
 
 pub(crate) fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -207,7 +207,7 @@ fn daemon_status_report_from_record(base: &Path) -> DaemonStatusReport {
     }
 }
 
-fn start_daemon(
+pub(crate) fn start_daemon(
     options: &DaemonStartOptions,
 ) -> Result<DaemonStartReport, Box<dyn std::error::Error>> {
     let current = daemon_status_report(&options.base);
