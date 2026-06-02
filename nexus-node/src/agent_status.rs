@@ -3,20 +3,21 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use nexus_agent::{
-    IntentActionKind, IntentActionPlan, IntentRecommendation, SocialMemory, Task, TaskState,
+    AgentIntent, IntentActionKind, IntentActionPlan, IntentKind, IntentRecommendation,
+    SocialEventKind, SocialMemory, Task, TaskState,
 };
 use nexus_core::Did;
 
 use crate::bootstrap::extend_bootstrap_peers;
-use crate::cli_args::{parse_u64_arg, parse_usize_arg, required_arg};
+use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{daemon_status_report, start_daemon, DaemonStartOptions, DaemonStatusReport};
 use crate::discovery::{
     discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
     DiscoverySort,
 };
 use crate::ids::parse_workspace_id;
-use crate::local_state::{identity_path, local_workspace_paths};
-use crate::social_sync::load_social_memory;
+use crate::local_state::{identity_path, load_or_create_identity, local_workspace_paths};
+use crate::social_sync::{load_social_memory, save_social_memory};
 use crate::unix_now;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -161,6 +162,63 @@ pub(crate) struct AgentUpReport {
     recommended_commands: Vec<CommandHint>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct AgentSendReport {
+    schema: &'static str,
+    base: String,
+    event: AgentSendEvent,
+    intent: AgentSendIntent,
+    delivery: AgentSendDelivery,
+    daemon: DaemonStatusReport,
+    recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSendEvent {
+    id: String,
+    author: String,
+    seq: u64,
+    timestamp: u64,
+    inserted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSendIntent {
+    id: String,
+    kind: &'static str,
+    title: String,
+    body: String,
+    workspace: Option<String>,
+    task_id: Option<String>,
+    capability: Option<String>,
+    tags: Vec<String>,
+    expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSendDelivery {
+    mode: &'static str,
+    local_memory: bool,
+    live_broadcast: bool,
+    issue: &'static str,
+    suggested_command: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AgentSendOptions {
+    base: PathBuf,
+    id: Option<String>,
+    kind: IntentKind,
+    title: Option<String>,
+    body: String,
+    workspace: Option<nexus_core::WorkspaceId>,
+    task_id: Option<String>,
+    capability: Option<String>,
+    tags: Vec<String>,
+    expires_at: Option<u64>,
+    json: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 struct AgentDiscoverSummary {
     cached_announcements: usize,
@@ -183,8 +241,9 @@ pub(crate) fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error
         Some("up") | Some("start") => cmd_agent_up(args),
         Some("inbox") => cmd_agent_inbox(args),
         Some("discover") => cmd_agent_discover(args),
+        Some("send") => cmd_agent_send(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status, up, inbox, or discover".into()),
+        None => Err("agent subcommand required: status, up, inbox, discover, or send".into()),
     }
 }
 
@@ -379,6 +438,87 @@ fn cmd_agent_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+fn cmd_agent_send(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = AgentSendOptions {
+        base: PathBuf::from("."),
+        id: None,
+        kind: IntentKind::Status,
+        title: None,
+        body: String::new(),
+        workspace: None,
+        task_id: None,
+        capability: None,
+        tags: Vec::new(),
+        expires_at: None,
+        json: false,
+    };
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                options.base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--id" | "--intent" => {
+                i += 1;
+                options.id = Some(required_arg(args, i, "--id")?.to_string());
+            }
+            "--kind" | "--type" => {
+                i += 1;
+                options.kind = parse_agent_intent_kind(required_arg(args, i, "--kind")?)?;
+            }
+            "--title" => {
+                i += 1;
+                options.title = Some(required_arg(args, i, "--title")?.to_string());
+            }
+            "--body" | "--message" | "--note" => {
+                i += 1;
+                options.body = required_arg(args, i, "--body")?.to_string();
+            }
+            "--workspace" => {
+                i += 1;
+                options.workspace =
+                    Some(parse_workspace_id(required_arg(args, i, "--workspace")?)?);
+            }
+            "--task" | "--task-id" => {
+                i += 1;
+                options.task_id = Some(required_arg(args, i, "--task")?.to_string());
+            }
+            "--capability" | "--cap" => {
+                i += 1;
+                options.capability = Some(required_arg(args, i, "--capability")?.to_string());
+            }
+            "--tag" => {
+                i += 1;
+                options
+                    .tags
+                    .push(required_arg(args, i, "--tag")?.to_string());
+            }
+            "--expires-at" | "--expires" => {
+                i += 1;
+                options.expires_at = Some(parse_u64_arg(
+                    required_arg(args, i, "--expires-at")?,
+                    "--expires-at",
+                )?);
+            }
+            "--json" => {
+                options.json = true;
+            }
+            other => return Err(format!("unknown agent send option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let json = options.json;
+    let report = agent_send_report(options)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_send_text(&report);
+    }
+    Ok(())
+}
+
 pub(crate) fn agent_up_report(
     options: &DaemonStartOptions,
 ) -> Result<AgentUpReport, Box<dyn std::error::Error>> {
@@ -388,6 +528,73 @@ pub(crate) fn agent_up_report(
         started: report.started,
         recommended_commands: up_recommended_commands(&options.base),
         status: report.status,
+    })
+}
+
+fn agent_send_report(
+    options: AgentSendOptions,
+) -> Result<AgentSendReport, Box<dyn std::error::Error>> {
+    let now = unix_now();
+    let title = options
+        .title
+        .or_else(|| title_from_body(&options.body))
+        .ok_or("--title required")?;
+    let identity = load_or_create_identity(&options.base)?;
+    let memory_path = options.base.join(".nexus-social-memory.json");
+    let mut memory = load_social_memory(&memory_path)?;
+    let mut intent = AgentIntent::new(
+        identity.did().clone(),
+        options.kind,
+        title.clone(),
+        options.body.clone(),
+        options.workspace,
+        options.task_id.clone(),
+        options.capability.clone(),
+        options.tags.clone(),
+        now,
+        options.expires_at,
+    );
+    if let Some(id) = options.id {
+        intent.id = id;
+    }
+    let event = memory.sign_event(
+        &identity,
+        now,
+        SocialEventKind::IntentPublished {
+            intent: intent.clone(),
+        },
+    )?;
+    let inserted = memory.ingest_event(event.clone())?;
+    if inserted {
+        save_social_memory(&memory_path, &memory)?;
+    }
+    let daemon = daemon_status_report(&options.base);
+    let delivery = send_delivery(&options.base, &daemon);
+
+    Ok(AgentSendReport {
+        schema: "nexus.agent_send.v1",
+        base: options.base.display().to_string(),
+        event: AgentSendEvent {
+            id: event.id,
+            author: event.author.to_string(),
+            seq: event.seq,
+            timestamp: event.timestamp,
+            inserted,
+        },
+        intent: AgentSendIntent {
+            id: intent.id,
+            kind: intent_kind_name(intent.kind),
+            title: intent.title,
+            body: intent.body,
+            workspace: intent.workspace.map(|workspace| workspace.to_string()),
+            task_id: intent.task_id,
+            capability: intent.capability,
+            tags: intent.tags,
+            expires_at: intent.expires_at,
+        },
+        delivery,
+        daemon,
+        recommended_commands: send_recommended_commands(&options.base),
     })
 }
 
@@ -518,6 +725,66 @@ pub(crate) fn agent_inbox_report(
         summary,
         items,
         recommended_commands: inbox_recommended_commands(base),
+    }
+}
+
+fn parse_agent_intent_kind(value: &str) -> Result<IntentKind, Box<dyn std::error::Error>> {
+    match normalize_symbol(value).as_str() {
+        "goal" => Ok(IntentKind::Goal),
+        "need" | "request" => Ok(IntentKind::Need),
+        "offer" | "provide" => Ok(IntentKind::Offer),
+        "proposal" | "propose" => Ok(IntentKind::Proposal),
+        "status" | "state" => Ok(IntentKind::Status),
+        other => Err(format!("unknown intent kind: {other}").into()),
+    }
+}
+
+fn intent_kind_name(kind: IntentKind) -> &'static str {
+    match kind {
+        IntentKind::Goal => "goal",
+        IntentKind::Need => "need",
+        IntentKind::Offer => "offer",
+        IntentKind::Proposal => "proposal",
+        IntentKind::Status => "status",
+    }
+}
+
+fn title_from_body(body: &str) -> Option<String> {
+    let title = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default();
+    if title.is_empty() {
+        return None;
+    }
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut chars = title.chars();
+    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        Some(format!("{truncated}..."))
+    } else {
+        Some(truncated)
+    }
+}
+
+fn send_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentSendDelivery {
+    if daemon.running {
+        AgentSendDelivery {
+            mode: "local_memory_daemon_running",
+            local_memory: true,
+            live_broadcast: false,
+            issue: "daemon send IPC is pending; the event is saved locally but not injected into the running daemon",
+            suggested_command: Some(format!("nexus-node daemon status --base {} --json", base.display())),
+        }
+    } else {
+        AgentSendDelivery {
+            mode: "local_memory",
+            local_memory: true,
+            live_broadcast: false,
+            issue: "daemon is not running; the event will be available for replay after the daemon or serve starts",
+            suggested_command: Some(format!("nexus-node agent up --base {} --json", base.display())),
+        }
     }
 }
 
@@ -849,6 +1116,28 @@ fn push_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>)
     }
 }
 
+fn send_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "society",
+            command: format!("nexus-node society --base {base} --json --intent-limit 10"),
+        },
+        CommandHint {
+            name: "up",
+            command: format!("nexus-node agent up --base {base} --json"),
+        },
+    ]
+}
+
 fn up_recommended_commands(base: &Path) -> Vec<CommandHint> {
     let base = base.display();
     vec![
@@ -863,6 +1152,12 @@ fn up_recommended_commands(base: &Path) -> Vec<CommandHint> {
         CommandHint {
             name: "discover",
             command: format!("nexus-node agent discover --base {base} --json"),
+        },
+        CommandHint {
+            name: "send_status",
+            command: format!(
+                "nexus-node agent send --base {base} --kind status --title <TEXT> --json"
+            ),
         },
         CommandHint {
             name: "daemon_status",
@@ -885,6 +1180,12 @@ fn discover_recommended_commands(base: &Path) -> Vec<CommandHint> {
         CommandHint {
             name: "inbox",
             command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "send_status",
+            command: format!(
+                "nexus-node agent send --base {base} --kind status --title <TEXT> --json"
+            ),
         },
         CommandHint {
             name: "discover_cache",
@@ -913,6 +1214,12 @@ fn inbox_recommended_commands(base: &Path) -> Vec<CommandHint> {
         CommandHint {
             name: "inbox",
             command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "send_status",
+            command: format!(
+                "nexus-node agent send --base {base} --kind status --title <TEXT> --json"
+            ),
         },
         CommandHint {
             name: "society",
@@ -1217,10 +1524,40 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
             command: format!("nexus-node daemon status --base {base} --json"),
         },
         CommandHint {
+            name: "send_status",
+            command: format!(
+                "nexus-node agent send --base {base} --kind status --title <TEXT> --json"
+            ),
+        },
+        CommandHint {
             name: "serve_foreground",
             command: format!("nexus-node serve --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"),
         },
     ]
+}
+
+fn print_agent_send_text(report: &AgentSendReport) {
+    println!("Agent send: {}", report.base);
+    println!(
+        "event: {} author={} seq={} inserted={}",
+        report.event.id, report.event.author, report.event.seq, report.event.inserted
+    );
+    println!(
+        "intent: {} kind={} title={}",
+        report.intent.id, report.intent.kind, report.intent.title
+    );
+    println!(
+        "delivery: mode={} local_memory={} live_broadcast={}",
+        report.delivery.mode, report.delivery.local_memory, report.delivery.live_broadcast
+    );
+    println!("issue: {}", report.delivery.issue);
+    if let Some(command) = &report.delivery.suggested_command {
+        println!("suggested: {command}");
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
 }
 
 fn print_agent_up_text(report: &AgentUpReport) {
@@ -1716,5 +2053,68 @@ mod tests {
         assert!(report.status.running);
         assert_eq!(report.status.pid, Some(std::process::id()));
         assert!(!identity_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn send_records_signed_status_intent() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let report = agent_send_report(AgentSendOptions {
+            base: temp.path().to_path_buf(),
+            id: Some("intent-agent-send-status".into()),
+            kind: IntentKind::Status,
+            title: Some("Agent status update".into()),
+            body: "ready for collaboration".into(),
+            workspace: None,
+            task_id: None,
+            capability: Some("native-workspace".into()),
+            tags: vec!["agent-send".into()],
+            expires_at: None,
+            json: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.schema, "nexus.agent_send.v1");
+        assert_eq!(report.intent.id, "intent-agent-send-status");
+        assert_eq!(report.intent.kind, "status");
+        assert!(report.event.inserted);
+        assert_eq!(report.delivery.mode, "local_memory");
+        assert!(!report.delivery.live_broadcast);
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 1);
+        memory.events()[0].verify_signature().unwrap();
+        let author = Did::new(report.event.author.clone());
+        let intents = memory.society().agent_intents(&author);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].id, "intent-agent-send-status");
+        assert_eq!(intents[0].title, "Agent status update");
+        assert_eq!(intents[0].capability.as_deref(), Some("native-workspace"));
+    }
+
+    #[test]
+    fn send_can_derive_title_from_body() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let report = agent_send_report(AgentSendOptions {
+            base: temp.path().to_path_buf(),
+            id: None,
+            kind: IntentKind::Need,
+            title: None,
+            body: "Need a reviewer\nwith workspace context".into(),
+            workspace: None,
+            task_id: Some("task-send-title".into()),
+            capability: Some("code-review".into()),
+            tags: Vec::new(),
+            expires_at: Some(4_102_444_800),
+            json: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.intent.kind, "need");
+        assert_eq!(report.intent.title, "Need a reviewer");
+        assert_eq!(report.intent.task_id.as_deref(), Some("task-send-title"));
+        assert_eq!(report.intent.capability.as_deref(), Some("code-review"));
+        assert_eq!(report.intent.expires_at, Some(4_102_444_800));
     }
 }
