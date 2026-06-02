@@ -13,6 +13,7 @@
 //!   nexus-node daemon start|status|stop --base <dir> [--json]
 //!   nexus-node agent status --base <dir> [--json]
 //!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
+//!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -159,6 +160,9 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} agent status --base <DIR> [--json]");
     eprintln!(
         "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]"
+    );
+    eprintln!(
+        "  {prog} agent discover --base <DIR> [--json] [--sort <relevance|clone-ready|name|owner|latest>] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]"
     );
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(

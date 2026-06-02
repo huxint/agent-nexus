@@ -36,6 +36,7 @@ The first stable control commands are:
 ```text
 nexus-node agent status --base <DIR> [--json]
 nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]
+nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 ```
 
 `agent status` reports existing identity metadata, local workspace metadata,
@@ -45,6 +46,10 @@ decrypting the identity. `agent inbox` builds a bounded local "what needs
 attention" summary from daemon alerts, society intent recommendations, open or
 assigned tasks, and clone-ready discovery cache entries. It is also read-only:
 it does not start networking, create identities, or decrypt the identity key.
+`agent discover` exposes the same cached workspace-discovery projection under
+the short-lived agent namespace. It rejects online refresh flags; operators can
+still use top-level `discover --lan` or `discover --global` until daemon-backed
+routing owns refreshes.
 
 The initial daemon lifecycle commands are:
 
