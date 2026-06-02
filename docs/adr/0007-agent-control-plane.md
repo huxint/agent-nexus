@@ -50,15 +50,18 @@ nexus-node daemon stop --base <DIR> [--timeout-ms <N>] [--json]
 ```
 
 `daemon start` backgrounds the existing `serve` path and writes pid, command,
-listen address, bootstrap inputs, and stdout/stderr logs under `<base>/.nexus/`.
-`daemon status` detects stale pid records, and repeated `start` returns the
-already-running daemon instead of spawning another network node.
+listen address, bootstrap inputs, stdout/stderr logs, and the Unix control
+socket path under `<base>/.nexus/`. `daemon status` detects stale pid records
+and, when available, asks the control socket for live status. `daemon stop`
+prefers the control socket `shutdown` request before falling back to process
+termination. Repeated `start` returns the already-running daemon instead of
+spawning another network node.
 
 The daemon API should be base-scoped. A future Unix domain socket or named pipe
-under `<base>/.nexus/` can expose request/response commands such as `up`,
-`down`, `sync`, `send`, `inbox`, `exec`, `watch`, and `tail`. Foreground
-commands should detect that daemon when present and use IPC instead of starting
-their own network instance.
+under `<base>/.nexus/` can expose additional request/response commands such as
+`sync`, `send`, `inbox`, `exec`, `watch`, and `tail`. Foreground commands should
+detect that daemon when present and use IPC instead of starting their own
+network instance.
 
 ## Consequences
 

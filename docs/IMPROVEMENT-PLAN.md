@@ -423,7 +423,8 @@
 **怎么做**：
 - [x] 增加 `nexus-node daemon start|stop|status --base <DIR>`。
 - [x] daemon 后台托管现有 `serve`，记录 pid、启动参数、stdout/stderr 日志和运行健康。
-- [ ] 在 `<base>/.nexus/` 下提供 Unix domain socket / Windows named pipe；请求和响应都用 bounded JSON。
+- [x] 在 `<base>/.nexus/daemon.sock` 下提供 Unix domain socket；`status`/`shutdown` 请求和响应都用 bounded JSON。
+- [ ] Windows named pipe parity。
 - [x] pid/lock 文件要能检测 stale daemon；重复 start 返回已运行状态而不是再起一个网络节点。
 **完成判据**：agent 可以启动 daemon 后立刻回到交互；后续 `agent status` 能看到 daemon peer/listen/health。
 **依赖**：`UX1`。
