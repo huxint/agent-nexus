@@ -60,6 +60,8 @@
   `K2` key 轮换 · `K3` 身份恢复
 - [x] **Wave 5 — 运营级 P2P 与可扩展性**
   `N2` peer scoring · `N3` eclipse 加固 · `N4` 发现去中心化 · `N1` NAT 穿透 · `N5` 日志 compaction · `N6` block GC · `N7` 协议版本 · `D1`/`D2` 并发写与所有权
+- [ ] **Wave 6 — Agent 实时交互与控制面**
+  `UX1` 状态脉冲 · `UX2` daemon/IPC · `UX3` 短命令自动路由 · `UX4` inbox/watch 事件流 · `UX5` 命令词汇收敛
 
 ---
 
@@ -404,6 +406,61 @@
 
 ---
 
+### 3.8 Agent 实时交互与命令面（UX）
+
+#### - [x] UX1 — Agent 状态脉冲命令 · 🟠 · S
+**为什么**：AI 每轮开始时需要快速知道“我是谁、有哪些本地 workspace、社会记忆里有什么、当前发现了哪些远端电脑”，但不能为了读状态启动 `serve`、创建身份、或卡在 passphrase 输入上。
+**怎么做**：
+- [x] 增加 `nexus-node agent status --base <DIR> [--json]`。
+- [x] 只读本地状态：identity metadata、workspace registry/config、social memory、discovery cache。
+- [x] 缺身份、身份加密、social memory 缺失或 cache 异常都结构化返回，不把 read-only 状态命令变成初始化命令。
+**完成判据**：空 base 上运行不会创建 `.nexus-identity.json`；已有 workspace metadata 可在无 passphrase 情况下显示。
+**依赖**：`A3`。
+**涉及**：`nexus-node/src/agent_status.rs`、`nexus-node/src/main.rs`。
+
+#### - [ ] UX2 — 长驻 daemon + base-scoped IPC · 🔴 · M
+**为什么**：`serve` 前台占用 agent 进程，AI 无法一边维持网络可达、一边继续实时交互、读外部状态、发社会消息。
+**怎么做**：
+- [ ] 增加 `nexus-node daemon start|stop|status --base <DIR>`。
+- [ ] daemon 独占网络、workspace serving、social replay、discover refresh 和文件观察。
+- [ ] 在 `<base>/.nexus/` 下提供 Unix domain socket / Windows named pipe；请求和响应都用 bounded JSON。
+- [ ] pid/lock 文件要能检测 stale daemon；重复 start 返回已运行状态而不是再起一个网络节点。
+**完成判据**：agent 可以启动 daemon 后立刻回到交互；后续 `agent status` 能看到 daemon peer/listen/health。
+**依赖**：`UX1`。
+**涉及**：`nexus-node`、`nexus-network`。
+
+#### - [ ] UX3 — 短命令自动路由到 daemon · 🟠 · M
+**为什么**：现在 `discover`/`clone`/`network status` 会各自启动短时网络实例，命令多且状态割裂。daemon 存在时，短命令应复用已连 peer 和缓存。
+**怎么做**：
+- [ ] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
+- [ ] daemon 不存在时，读状态命令退化为本地缓存，显式联网命令给出可执行提示。
+- [ ] 输出 JSON schema 稳定，错误包含 `kind`、`message`、`suggested_command`。
+**完成判据**：常用 agent 流程不需要手写 `--listen`、`--bootstrap`、`--invite`，除非用户要覆盖默认网络策略。
+**依赖**：`UX2`。
+**涉及**：`nexus-node/src/agent_status.rs`、后续 `agent_control` 模块。
+
+#### - [ ] UX4 — inbox/watch 事件流 · 🟠 · M
+**为什么**：实时交互不是只查快照。AI 需要知道“刚收到什么社会事件、哪个 workspace root 变化、哪个任务/intent 需要响应”。
+**怎么做**：
+- [ ] daemon 维护 bounded event journal：social event accepted、workspace announcement、peer connect/disconnect、workspace snapshot changed、task/intent/action recommendation changed。
+- [ ] `nexus-node agent inbox --base <DIR> --since <cursor> --json` 返回增量。
+- [ ] `nexus-node agent watch --base <DIR> --json` 输出 NDJSON 事件流，适合外层 agent runtime 订阅。
+**完成判据**：一个外部 agent 可以用 cursor 增量处理 Nexus 内通信，同时继续使用普通 shell/filesystem 工具处理 Nexus 外状态。
+**依赖**：`UX2`。
+**涉及**：`nexus-node`、`nexus-agent`。
+
+#### - [ ] UX5 — 命令词汇收敛与文档重排 · 🟡 · S
+**为什么**：专家命令完整但过多，AI 容易在 `event ...`、`act ...`、`discover ...`、`network status ...` 间迷路。
+**怎么做**：
+- [ ] 给 agent 常用流量定义 6 个一级动词：`status`、`up`、`inbox`、`send`、`sync`、`exec`。
+- [ ] 保留现有专家命令，但帮助文案先显示 agent path，再显示 advanced path。
+- [ ] 在 `CONTEXT.md` 增加“AI 每轮操作建议”：先 `agent status`，再根据 inbox/discovery/society 决策。
+**完成判据**：新 AI 只靠 top-level help 就能完成启动、查看状态、发现/收消息、发消息、执行并记录结果。
+**依赖**：`UX1`。
+**涉及**：`nexus-node/src/main.rs`、`CONTEXT.md`、`docs/DESIGN.md`。
+
+---
+
 ## 4. 待决策记录（ADR 待办）
 
 这些是"立场/取舍"而非"bug"，应写成 ADR 固化，避免反复重提（属于 `A3`）：
@@ -414,6 +471,7 @@
 - [x] **ADR-0004 并发写：CRDT vs 快照+显式分叉**（`D1`）。
 - [x] **ADR-0005 bootstrap 哲学**：入口只承担连接角色、稳态无入口、引荐为一等公民（`N4`）。
 - [x] **ADR-0006 计量与结算的可验证性要求**（`E3`）。
+- [x] **ADR-0007 Agent 控制面**：daemon 长驻，`agent ...` 短命令作为 AI 交互面（`UX*`）。
 
 ---
 
@@ -438,5 +496,6 @@
 1. **Wave 1 完成** → 社会账本可检测分叉、可防篡改（`I1`）。
 2. **Wave 2 完成** → 经济可真正结算、信誉不可自产、执行可验证（`E5`/`E3`/`E2`/`I4`）。
 3. **Wave 3 完成** → 多方协作时默认安全（`S1`/`S2`/`S3`）。
+4. **Wave 6 完成** → AI 可以在 daemon 持续联网的同时，用短命令实时读写 Nexus 内通信，并继续处理 Nexus 外的普通机器状态。
 
 到那一步，"又一个去中心化玩具"与"领先的 AI 社会框架"之间的差距，就被这三波补齐了。
