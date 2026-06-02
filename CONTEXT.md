@@ -62,3 +62,4 @@ Architecture decisions live in [docs/adr](docs/adr). Start with:
 - [ADR-0004](docs/adr/0004-concurrency-model.md)
 - [ADR-0005](docs/adr/0005-bootstrap-as-connectivity.md)
 - [ADR-0006](docs/adr/0006-verifiable-execution-and-metering.md)
+- [ADR-0007](docs/adr/0007-agent-control-plane.md)

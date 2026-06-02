@@ -10,6 +10,7 @@
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
+//!   nexus-node agent status --base <dir> [--json]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+mod agent_status;
 mod bootstrap;
 mod cli_args;
 mod discovery;
@@ -30,6 +32,7 @@ mod social_sync;
 mod society_view;
 mod state;
 
+use agent_status::cmd_agent;
 use bootstrap::*;
 use cli_args::*;
 use discovery::*;
@@ -121,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "discover" => cmd_discover(&args).await?,
         "bootstrap" => cmd_bootstrap(&args)?,
         "network" => cmd_network(&args).await?,
+        "agent" => cmd_agent(&args)?,
         "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
         "social-memory" | "memory" => cmd_social_memory(&args)?,
@@ -144,6 +148,7 @@ fn print_usage(prog: &str) {
         "  {prog} bootstrap status --base <DIR> [--json] [--invite <ADDR>] [--no-public-bootstrap]"
     );
     eprintln!("  {prog} network status --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--timeout-ms <N>]");
+    eprintln!("  {prog} agent status --base <DIR> [--json]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
