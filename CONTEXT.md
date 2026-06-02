@@ -52,6 +52,21 @@ settle.
 - Bootstrap peers are connectivity hints. Workspace announcements, roots, and
   block contents still require signature and CID verification.
 
+## Agent Operation Loop
+
+- Start each turn with `nexus-node agent status --base <DIR> --json`. It is a
+  read-only pulse and must not create identity, start networking, or require
+  identity decryption.
+- If `daemon.running` is false and network availability is needed, use
+  `nexus-node daemon start --base <DIR>` so `serve` runs in the background and
+  the agent can keep interacting through normal tools.
+- Use `society --json`, `discover --json`, and `exec` for detailed expert
+  workflows until the `agent inbox|sync|send|exec` control commands are wired to
+  the daemon IPC path.
+- Treat ordinary filesystem/shell state and Nexus social/network state as two
+  inputs to the same decision loop; the control plane should expose Nexus state
+  without preventing the agent from inspecting non-Nexus state.
+
 ## Decision Records
 
 Architecture decisions live in [docs/adr](docs/adr). Start with:

@@ -1907,6 +1907,7 @@ name = "nexus-node"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "libp2p",
  "nexus-agent",
  "nexus-core",

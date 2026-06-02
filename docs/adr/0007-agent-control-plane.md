@@ -38,8 +38,21 @@ nexus-node agent status --base <DIR> [--json]
 ```
 
 It reports existing identity metadata, local workspace metadata, social-memory
-counts, cached discovery state, current control-plane mode, and the next command
-hints without starting the network or decrypting the identity.
+counts, cached discovery state, daemon health, current control-plane mode, and
+the next command hints without starting the network or decrypting the identity.
+
+The initial daemon lifecycle commands are:
+
+```text
+nexus-node daemon start --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]
+nexus-node daemon status --base <DIR> [--json]
+nexus-node daemon stop --base <DIR> [--timeout-ms <N>] [--json]
+```
+
+`daemon start` backgrounds the existing `serve` path and writes pid, command,
+listen address, bootstrap inputs, and stdout/stderr logs under `<base>/.nexus/`.
+`daemon status` detects stale pid records, and repeated `start` returns the
+already-running daemon instead of spawning another network node.
 
 The daemon API should be base-scoped. A future Unix domain socket or named pipe
 under `<base>/.nexus/` can expose request/response commands such as `up`,
