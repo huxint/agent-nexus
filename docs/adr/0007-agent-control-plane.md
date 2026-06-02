@@ -31,15 +31,20 @@ Split the operator surface into three layers:
    explicit operator workflows, but agent docs should prefer the control
    commands.
 
-The first stable control command is:
+The first stable control commands are:
 
 ```text
 nexus-node agent status --base <DIR> [--json]
+nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]
 ```
 
-It reports existing identity metadata, local workspace metadata, social-memory
-counts, cached discovery state, daemon health, current control-plane mode, and
-the next command hints without starting the network or decrypting the identity.
+`agent status` reports existing identity metadata, local workspace metadata,
+social-memory counts, cached discovery state, daemon health, current
+control-plane mode, and the next command hints without starting the network or
+decrypting the identity. `agent inbox` builds a bounded local "what needs
+attention" summary from daemon alerts, society intent recommendations, open or
+assigned tasks, and clone-ready discovery cache entries. It is also read-only:
+it does not start networking, create identities, or decrypt the identity key.
 
 The initial daemon lifecycle commands are:
 
@@ -59,9 +64,9 @@ spawning another network node.
 
 The daemon API should be base-scoped. A future Unix domain socket or named pipe
 under `<base>/.nexus/` can expose additional request/response commands such as
-`sync`, `send`, `inbox`, `exec`, `watch`, and `tail`. Foreground commands should
-detect that daemon when present and use IPC instead of starting their own
-network instance.
+`sync`, `send`, daemon-backed `inbox`, `exec`, `watch`, and `tail`. Foreground
+commands should detect that daemon when present and use IPC instead of starting
+their own network instance.
 
 ## Consequences
 
