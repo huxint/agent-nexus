@@ -20,7 +20,7 @@
 //!   nexus-node discover --base <dir> [--global|--lan] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--sort <mode>] [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
-//!   nexus-node daemon start|status|stop --base <dir> [--json]
+//!   nexus-node daemon start|status|events|stop --base <dir> [--json]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -181,6 +181,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} network status --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--timeout-ms <N>]");
     eprintln!("  {prog} daemon start --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap]");
     eprintln!("  {prog} daemon status --base <DIR> [--json]");
+    eprintln!("  {prog} daemon events --base <DIR> [--since <CURSOR>] [--limit <N>] [--json]");
     eprintln!("  {prog} daemon stop --base <DIR> [--json] [--timeout-ms <N>]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
@@ -978,6 +979,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("Node DID: {}", id.did());
     let memory_path = base.join(".nexus-social-memory.json");
     let mut social_memory = load_social_memory(&memory_path)?;
+    let event_journal = daemon::DaemonEventJournalHandle::new();
 
     let network = Network::new(&id, network_config(listen.parse()?, bootstrap)).await?;
 
@@ -1025,6 +1027,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &mut server,
         &mut social_memory,
         &memory_path,
+        &event_journal,
         unix_now(),
     )
     .await;
@@ -1040,18 +1043,27 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             base.clone(),
             control_socket,
             shutdown_tx.clone(),
+            event_journal.clone(),
         )?)
     } else {
         None
     };
     let _shutdown_tx = shutdown_tx;
+    let event_context = NodeEventContext {
+        network: &network,
+        memory_path: &memory_path,
+        base: &base,
+        identity: &id,
+        event_journal: &event_journal,
+    };
 
     // Event loop
     let mut observe_tick = tokio::time::interval(WORKSPACE_OBSERVE_INTERVAL);
     loop {
         tokio::select! {
             Some(event) = net_clone.next_event() => {
-                handle_node_event(event, &network, &mut server, &mut social_memory, &memory_path, &base, &id).await;
+                record_daemon_network_event(event_context.event_journal, &event);
+                handle_node_event(event, &event_context, &mut server, &mut social_memory).await;
             }
             _ = observe_tick.tick() => {
                 publish_workspace_announcements(
@@ -1060,6 +1072,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     &mut server,
                     &mut social_memory,
                     &memory_path,
+                    &event_journal,
                     unix_now(),
                 )
                 .await;
@@ -1810,6 +1823,33 @@ fn network_status_event_summary(event: &NetworkEvent) -> Option<String> {
         }
         NetworkEvent::SocialEvent { source, .. } => Some(format!("social_event source={source:?}")),
         NetworkEvent::SyncRequest { peer, .. } => Some(format!("sync_request peer={peer}")),
+    }
+}
+
+fn record_daemon_network_event(journal: &daemon::DaemonEventJournalHandle, event: &NetworkEvent) {
+    let Some(kind) = daemon_network_event_kind(event) else {
+        return;
+    };
+    let Some(summary) = network_status_event_summary(event) else {
+        return;
+    };
+    journal.push(kind, summary);
+}
+
+fn daemon_network_event_kind(event: &NetworkEvent) -> Option<&'static str> {
+    match event {
+        NetworkEvent::PeerDiscovered { .. } => Some("peer_discovered"),
+        NetworkEvent::RoutingUpdated { .. } => Some("routing_updated"),
+        NetworkEvent::PeerConnected(_) => Some("peer_connected"),
+        NetworkEvent::PeerDisconnected(_) => Some("peer_disconnected"),
+        NetworkEvent::Listening(_) => Some("listening"),
+        NetworkEvent::SyncRequest { .. } => Some("sync_request"),
+        NetworkEvent::ProvidersFound { .. } => Some("providers_found"),
+        NetworkEvent::AutonatStatusChanged { .. } => Some("autonat_status_changed"),
+        NetworkEvent::AutonatEvent { .. } => Some("autonat_event"),
+        NetworkEvent::DcutrEvent { .. } => Some("dcutr_event"),
+        NetworkEvent::RelayEvent { .. } => Some("relay_event"),
+        NetworkEvent::WorkspaceAnnounce { .. } | NetworkEvent::SocialEvent { .. } => None,
     }
 }
 
@@ -4885,6 +4925,7 @@ async fn publish_workspace_announcements(
     server: &mut WorkspaceServer,
     social_memory: &mut SocialMemory,
     memory_path: &Path,
+    event_journal: &daemon::DaemonEventJournalHandle,
     now: u64,
 ) {
     let peer = network.local_peer_id();
@@ -4910,6 +4951,7 @@ async fn publish_workspace_announcements(
             social_memory,
             memory_path,
             &state,
+            event_journal,
             now,
         )
         .await;
@@ -4946,6 +4988,7 @@ async fn record_served_workspace_snapshot(
     social_memory: &mut SocialMemory,
     memory_path: &Path,
     state: &WorkspaceState,
+    event_journal: &daemon::DaemonEventJournalHandle,
     now: u64,
 ) {
     if social_memory
@@ -4987,6 +5030,14 @@ async fn record_served_workspace_snapshot(
                 );
             }
             publish_social_event_with_retry(network, &event).await;
+            event_journal.push(
+                "workspace_snapshot_changed",
+                format!(
+                    "workspace_snapshot_changed workspace={} root={}",
+                    state.workspace_id,
+                    hex::encode(state.root.as_bytes())
+                ),
+            );
         }
         Ok(false) => {}
         Err(err) => {
@@ -5127,32 +5178,51 @@ async fn request_workspace_announcements_from_peer(
     inserted
 }
 
+struct NodeEventContext<'a> {
+    network: &'a Network,
+    memory_path: &'a Path,
+    base: &'a Path,
+    identity: &'a NodeIdentity,
+    event_journal: &'a daemon::DaemonEventJournalHandle,
+}
+
 async fn handle_node_event(
     event: NetworkEvent,
-    network: &Network,
+    context: &NodeEventContext<'_>,
     server: &mut WorkspaceServer,
     social_memory: &mut SocialMemory,
-    memory_path: &Path,
-    base: &Path,
-    identity: &NodeIdentity,
 ) {
     match &event {
         NetworkEvent::WorkspaceAnnounce {
             source: Some(source),
             data,
-        } => match record_workspace_announcement_bytes(base, Some(*source), data) {
-            Ok(true) => tracing::info!("recorded workspace announcement from {}", source),
+        } => match record_workspace_announcement_bytes(context.base, Some(*source), data) {
+            Ok(true) => {
+                tracing::info!("recorded workspace announcement from {}", source);
+                context.event_journal.push(
+                    "workspace_announcement",
+                    format!("workspace_announcement source={source}"),
+                );
+            }
             Ok(false) => {}
             Err(err) => tracing::warn!("rejected workspace announcement from {:?}: {err}", source),
         },
         NetworkEvent::SocialEvent { source, data } => {
-            match ingest_social_event_bytes(data, social_memory, memory_path) {
+            match ingest_social_event_bytes(data, social_memory, context.memory_path) {
                 Ok(SocialIngestOutcome::Inserted) => {
                     tracing::info!(
                         "accepted social event from {:?}; events={}, agents={}",
                         source,
                         social_memory.event_count(),
                         social_memory.agent_count()
+                    );
+                    context.event_journal.push(
+                        "social_event",
+                        format!(
+                            "social_event source={source:?} events={} agents={}",
+                            social_memory.event_count(),
+                            social_memory.agent_count()
+                        ),
                     );
                 }
                 Ok(SocialIngestOutcome::Duplicate) => {
@@ -5169,18 +5239,24 @@ async fn handle_node_event(
                 social_memory.event_count(),
                 peer
             );
-            replay_social_memory(network, social_memory).await;
+            replay_social_memory(context.network, social_memory).await;
             publish_workspace_announcements(
-                identity,
-                network,
+                context.identity,
+                context.network,
                 server,
                 social_memory,
-                memory_path,
+                context.memory_path,
+                context.event_journal,
                 unix_now(),
             )
             .await;
-            let _ =
-                request_social_events_from_peer(network, *peer, social_memory, memory_path).await;
+            let _ = request_social_events_from_peer(
+                context.network,
+                *peer,
+                social_memory,
+                context.memory_path,
+            )
+            .await;
         }
         NetworkEvent::SyncRequest {
             request_id,
@@ -5192,7 +5268,7 @@ async fn handle_node_event(
             ..
         } => {
             let response = social_events_response(social_memory, known_event_ids, *limit);
-            network.respond_to_sync(*request_id, response);
+            context.network.respond_to_sync(*request_id, response);
             return;
         }
         NetworkEvent::SyncRequest {
@@ -5205,15 +5281,15 @@ async fn handle_node_event(
             ..
         } => {
             let response = workspace_announcements_response(
-                identity,
-                network,
+                context.identity,
+                context.network,
                 server,
                 *workspace_id,
                 *limit,
                 unix_now(),
             )
             .await;
-            network.respond_to_sync(*request_id, response);
+            context.network.respond_to_sync(*request_id, response);
             return;
         }
         NetworkEvent::SyncRequest {
@@ -5223,15 +5299,16 @@ async fn handle_node_event(
         } => match server.refresh_workspace(workspace_id).await {
             Ok(Some(state)) => {
                 record_served_workspace_snapshot(
-                    identity,
-                    network,
+                    context.identity,
+                    context.network,
                     social_memory,
-                    memory_path,
+                    context.memory_path,
                     &state,
+                    context.event_journal,
                     unix_now(),
                 )
                 .await;
-                network.respond_to_sync(
+                context.network.respond_to_sync(
                     *request_id,
                     SyncResponse::StateResponse {
                         workspace_id: state.workspace_id,
@@ -5243,7 +5320,7 @@ async fn handle_node_event(
                 return;
             }
             Ok(None) => {
-                network.respond_to_sync(
+                context.network.respond_to_sync(
                     *request_id,
                     SyncResponse::WorkspaceNotFound {
                         workspace_id: *workspace_id,
@@ -5253,7 +5330,7 @@ async fn handle_node_event(
             }
             Err(err) => {
                 tracing::warn!("failed to refresh workspace {workspace_id}: {err}");
-                network.respond_to_sync(
+                context.network.respond_to_sync(
                     *request_id,
                     SyncResponse::Error {
                         message: format!("refresh workspace state: {err}"),
@@ -5534,6 +5611,7 @@ mod tests {
         let mut dcutr_events = Vec::new();
         let mut relay_events = Vec::new();
         let mut recent_events = Vec::new();
+        let journal = daemon::DaemonEventJournalHandle::new();
 
         record_network_status_event(
             NetworkEvent::AutonatStatusChanged {
@@ -5564,6 +5642,14 @@ mod tests {
             &mut relay_events,
             &mut recent_events,
         );
+        record_daemon_network_event(&journal, &NetworkEvent::PeerConnected(peer));
+        record_daemon_network_event(
+            &journal,
+            &NetworkEvent::SocialEvent {
+                source: Some(peer),
+                data: Vec::new(),
+            },
+        );
 
         assert_eq!(autonat.current_status.as_deref(), Some("Public"));
         assert_eq!(
@@ -5585,6 +5671,10 @@ mod tests {
         assert!(recent_events[0].contains("autonat_status_changed"));
         assert!(recent_events[1].contains("dcutr_event"));
         assert!(recent_events[2].contains("relay_event"));
+        let daemon_events = journal.snapshot(Path::new("."), None, Some(10));
+        assert_eq!(daemon_events.events.len(), 1);
+        assert_eq!(daemon_events.events[0].kind, "peer_connected");
+        assert!(daemon_events.events[0].summary.contains(&peer.to_string()));
     }
 
     #[tokio::test]
@@ -6371,6 +6461,7 @@ mod tests {
                         &mut server,
                         &mut social_memory,
                         &memory_path,
+                        &daemon::DaemonEventJournalHandle::new(),
                         unix_now(),
                     )
                     .await;
@@ -6413,7 +6504,7 @@ mod tests {
 
         let clone_base = TempDir::new().unwrap();
         let clone_identity = load_or_create_identity(clone_base.path()).unwrap();
-        let mut net_b = Network::new(
+        let net_b = Network::new(
             &clone_identity,
             NetworkConfig {
                 listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
@@ -6441,22 +6532,22 @@ mod tests {
         let mut memory = SocialMemory::new();
         let memory_path = clone_base.path().join(".nexus-social-memory.json");
         let mut server_b = WorkspaceServer::new(Arc::new(net_b.clone()));
+        let event_journal = daemon::DaemonEventJournalHandle::new();
+        let mut net_b_events = net_b.clone();
+        let event_context = NodeEventContext {
+            network: &net_b,
+            memory_path: &memory_path,
+            base: clone_base.path(),
+            identity: &clone_identity,
+            event_journal: &event_journal,
+        };
 
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(event @ NetworkEvent::WorkspaceAnnounce { .. }) =
-                    net_b.next_event().await
+                    net_b_events.next_event().await
                 {
-                    handle_node_event(
-                        event,
-                        &net_b,
-                        &mut server_b,
-                        &mut memory,
-                        &memory_path,
-                        clone_base.path(),
-                        &clone_identity,
-                    )
-                    .await;
+                    handle_node_event(event, &event_context, &mut server_b, &mut memory).await;
                     if !load_workspace_discovery(clone_base.path())
                         .unwrap()
                         .is_empty()
@@ -6475,6 +6566,12 @@ mod tests {
         assert_eq!(announcements[0].workspace, workspace_id.to_string());
         assert_eq!(announcements[0].owner, *owner.did());
         assert_eq!(announcements[0].root, Some(hex::encode(root.as_bytes())));
+        let journal = event_journal.snapshot(clone_base.path(), None, Some(10));
+        assert_eq!(journal.events.len(), 1);
+        assert_eq!(journal.events[0].kind, "workspace_announcement");
+        assert!(journal.events[0]
+            .summary
+            .contains(&net_a.local_peer_id().to_string()));
 
         let view = society_json_for_base(clone_base.path(), &memory, SocietyJsonOptions::default());
         assert_eq!(
@@ -6967,6 +7064,7 @@ mod tests {
         server.register(workspace);
         let mut memory = SocialMemory::new();
         let memory_path = owner_base.path().join(".nexus-social-memory.json");
+        let event_journal = daemon::DaemonEventJournalHandle::new();
 
         let mut external = Workspace::load(&owner, &workspace_path).await.unwrap();
         external
@@ -6981,6 +7079,7 @@ mod tests {
             &mut server,
             &mut memory,
             &memory_path,
+            &event_journal,
             77,
         )
         .await;
@@ -6991,6 +7090,12 @@ mod tests {
         assert_eq!(snapshots[0].root, updated_root);
         assert_eq!(snapshots[0].label.as_deref(), Some("served"));
         assert!(memory_path.exists());
+        let journal = event_journal.snapshot(owner_base.path(), None, Some(10));
+        assert_eq!(journal.events.len(), 1);
+        assert_eq!(journal.events[0].kind, "workspace_snapshot_changed");
+        assert!(journal.events[0]
+            .summary
+            .contains(&format!("workspace={workspace_id}")));
     }
 
     #[tokio::test]
