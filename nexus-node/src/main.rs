@@ -17,6 +17,7 @@
 //!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
 //!   nexus-node agent exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] [--note <text>] [--json] -- <command> [args...]
+//!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--json]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -174,6 +175,7 @@ fn print_usage(prog: &str) {
         "  {prog} agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>] [--json]"
     );
     eprintln!("  {prog} agent exec --base <DIR> --workspace <PATH> [--isolation auto|native|bubblewrap] [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] [--json] -- <CMD> [ARG...]");
+    eprintln!("  {prog} agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"

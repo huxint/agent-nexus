@@ -190,6 +190,70 @@ pub(crate) struct AgentExecReport {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct AgentSyncReport {
+    schema: &'static str,
+    base: String,
+    mode: &'static str,
+    daemon: DaemonStatusReport,
+    filter: AgentSyncFilter,
+    summary: AgentSyncSummary,
+    targets: Vec<AgentSyncTarget>,
+    error: Option<String>,
+    issue: &'static str,
+    suggested_command: Option<String>,
+    recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSyncFilter {
+    workspace: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+struct AgentSyncSummary {
+    targets: usize,
+    local_workspaces: usize,
+    discovered_workspaces: usize,
+    clone_ready: usize,
+    clone_suggestions: usize,
+    refresh_suggestions: usize,
+    local_only: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSyncTarget {
+    workspace: String,
+    name: Option<String>,
+    status: &'static str,
+    action: &'static str,
+    local: Option<AgentSyncLocal>,
+    discovered: Option<AgentSyncDiscovered>,
+    reasons: Vec<String>,
+    command_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSyncLocal {
+    path: String,
+    present: bool,
+    latest_root: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSyncDiscovered {
+    owner: String,
+    root: Option<String>,
+    verified: bool,
+    clone_ready: bool,
+    peers: usize,
+    addrs: usize,
+    latest_timestamp: u64,
+    forked: bool,
+    fork_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct AgentExecExecution {
     workspace: String,
     workspace_path: String,
@@ -303,8 +367,11 @@ pub(crate) async fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error:
         Some("discover") => cmd_agent_discover(args),
         Some("send") => cmd_agent_send(args),
         Some("exec") | Some("run") => cmd_agent_exec(args).await,
+        Some("sync") => cmd_agent_sync(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status, up, inbox, discover, send, or exec".into()),
+        None => Err(
+            "agent subcommand required: status, up, inbox, discover, send, exec, or sync".into(),
+        ),
     }
 }
 
@@ -499,6 +566,51 @@ fn cmd_agent_discover(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+fn cmd_agent_sync(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut json = false;
+    let mut workspace = None;
+    let mut name = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(parse_workspace_id(required_arg(args, i, "--workspace")?)?);
+            }
+            "--name" | "--local-name" => {
+                i += 1;
+                name = Some(required_arg(args, i, "--name")?.to_string());
+            }
+            "--json" => {
+                json = true;
+            }
+            "--global" | "--online" | "--lan" | "--bootstrap" | "--invite" | "--listen"
+            | "--timeout-ms" | "--peer" | "--apply" => {
+                return Err(format!(
+                    "agent sync is cache-backed for now; use `nexus-node clone {}` or `nexus-node discover {}` for explicit network work",
+                    args[i], args[i]
+                )
+                .into());
+            }
+            other => return Err(format!("unknown agent sync option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let report = agent_sync_report(&base, workspace.map(|id| id.to_string()), name);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_sync_text(&report);
+    }
+    Ok(())
+}
+
 fn cmd_agent_send(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = AgentSendOptions {
         base: PathBuf::from("."),
@@ -638,6 +750,76 @@ fn agent_exec_report_from_workspace_report(
         },
         delivery,
         recommended_commands: exec_recommended_commands(base),
+    }
+}
+
+pub(crate) fn agent_sync_report(
+    base: &Path,
+    workspace_filter: Option<String>,
+    name: Option<String>,
+) -> AgentSyncReport {
+    let daemon = daemon_status_report(base);
+    let mode = sync_mode(&daemon);
+    let locals = local_workspace_statuses(base);
+    let (discovered, error) = match load_workspace_discovery(base) {
+        Ok(announcements) => {
+            let filter = DiscoveryFilter {
+                workspace: workspace_filter.clone(),
+                ..Default::default()
+            };
+            (discovered_workspace_views(&announcements, &filter), None)
+        }
+        Err(error) => (Vec::new(), Some(format!("read discovery cache: {error}"))),
+    };
+
+    let mut targets = Vec::new();
+    for workspace in discovered {
+        if let Some(filter) = &workspace_filter {
+            if &workspace.workspace != filter {
+                continue;
+            }
+        }
+        let local = find_local_workspace(&locals, &workspace.workspace);
+        targets.push(sync_target_from_discovered(
+            base,
+            local,
+            workspace,
+            name.as_deref(),
+        ));
+    }
+    for local in &locals {
+        let Some(id) = local.id.as_deref() else {
+            continue;
+        };
+        if workspace_filter
+            .as_deref()
+            .is_some_and(|filter| id != filter)
+        {
+            continue;
+        }
+        if targets.iter().any(|target| target.workspace == id) {
+            continue;
+        }
+        targets.push(sync_target_from_local(base, local));
+    }
+
+    let summary = summarize_sync_targets(&targets);
+    let (issue, suggested_command) = sync_issue(base, &daemon);
+    AgentSyncReport {
+        schema: "nexus.agent_sync.v1",
+        base: base.display().to_string(),
+        mode,
+        daemon,
+        filter: AgentSyncFilter {
+            workspace: workspace_filter,
+            name,
+        },
+        summary,
+        targets,
+        error,
+        issue,
+        suggested_command,
+        recommended_commands: sync_recommended_commands(base),
     }
 }
 
@@ -918,6 +1100,229 @@ fn exec_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentExecDelivery 
                 base.display()
             )),
         }
+    }
+}
+
+fn sync_mode(daemon: &DaemonStatusReport) -> &'static str {
+    if daemon.running {
+        if daemon.ipc_available {
+            "daemon_running_local_plan"
+        } else {
+            "daemon_running_no_ipc_local_plan"
+        }
+    } else {
+        "local_cache_plan"
+    }
+}
+
+fn sync_issue(base: &Path, daemon: &DaemonStatusReport) -> (&'static str, Option<String>) {
+    if daemon.running {
+        (
+            "daemon sync IPC is pending; this report is based on local workspace and discovery caches",
+            Some(format!("nexus-node daemon status --base {} --json", base.display())),
+        )
+    } else {
+        (
+            "daemon is not running; this report is based on local caches and suggests explicit clone/discover commands",
+            Some(format!(
+                "nexus-node agent up --base {} --json",
+                base.display()
+            )),
+        )
+    }
+}
+
+fn find_local_workspace<'a>(
+    locals: &'a [LocalWorkspaceStatus],
+    workspace: &str,
+) -> Option<&'a LocalWorkspaceStatus> {
+    locals
+        .iter()
+        .find(|local| local.id.as_deref() == Some(workspace))
+}
+
+fn sync_target_from_discovered(
+    base: &Path,
+    local: Option<&LocalWorkspaceStatus>,
+    workspace: DiscoveredWorkspaceView,
+    clone_name: Option<&str>,
+) -> AgentSyncTarget {
+    let discovered = sync_discovered(&workspace);
+    let local = local.map(sync_local);
+    let mut reasons = vec!["discovery-cache".into()];
+    if discovered.verified {
+        reasons.push("verified-announcement".into());
+    }
+    if discovered.clone_ready {
+        reasons.push("clone-ready".into());
+    }
+    if local.is_some() {
+        reasons.push("local-workspace-present".into());
+    }
+    if workspace.forked {
+        reasons.push("snapshot-forks".into());
+    }
+
+    let (status, action, command_hint) = match (&local, discovered.clone_ready) {
+        (Some(local), _) => {
+            if local
+                .latest_root
+                .as_deref()
+                .zip(discovered.root.as_deref())
+                .is_some_and(|(local_root, discovered_root)| local_root != discovered_root)
+            {
+                (
+                    "local_and_discovered_roots_differ",
+                    "inspect_snapshot_fork",
+                    Some(format!(
+                        "nexus-node society --base {} --json --workspace {}",
+                        base.display(),
+                        workspace.workspace
+                    )),
+                )
+            } else {
+                (
+                    "local_and_discovered",
+                    "no_network_action",
+                    Some(format!(
+                        "nexus-node agent status --base {} --json",
+                        base.display()
+                    )),
+                )
+            }
+        }
+        (None, true) => {
+            let name = sync_clone_name(clone_name, &workspace.name, &workspace.workspace);
+            (
+                "clone_ready",
+                "clone_with_expert_command",
+                Some(format!(
+                    "nexus-node clone --base {} --workspace {} --name {}",
+                    base.display(),
+                    workspace.workspace,
+                    name
+                )),
+            )
+        }
+        (None, false) => (
+            "discovered_not_clone_ready",
+            "refresh_discovery",
+            Some(format!(
+                "nexus-node discover --base {} --lan --json --workspace {}",
+                base.display(),
+                workspace.workspace
+            )),
+        ),
+    };
+
+    AgentSyncTarget {
+        workspace: workspace.workspace,
+        name: Some(workspace.name),
+        status,
+        action,
+        local,
+        discovered: Some(discovered),
+        reasons,
+        command_hint,
+    }
+}
+
+fn sync_target_from_local(base: &Path, local: &LocalWorkspaceStatus) -> AgentSyncTarget {
+    let workspace = local.id.clone().unwrap_or_else(|| "unknown".into());
+    AgentSyncTarget {
+        workspace,
+        name: local.name.clone(),
+        status: "local_only",
+        action: "serve_or_refresh_discovery",
+        local: Some(sync_local(local)),
+        discovered: None,
+        reasons: vec!["local-workspace".into(), "no-discovery-cache-match".into()],
+        command_hint: Some(format!(
+            "nexus-node agent up --base {} --json",
+            base.display()
+        )),
+    }
+}
+
+fn sync_local(local: &LocalWorkspaceStatus) -> AgentSyncLocal {
+    AgentSyncLocal {
+        path: local.path.clone(),
+        present: local.present,
+        latest_root: local.latest_root.clone(),
+    }
+}
+
+fn sync_discovered(workspace: &DiscoveredWorkspaceView) -> AgentSyncDiscovered {
+    AgentSyncDiscovered {
+        owner: workspace.owner.to_string(),
+        root: workspace.root.clone(),
+        verified: workspace.verified,
+        clone_ready: workspace.clone_ready,
+        peers: workspace.peers.len(),
+        addrs: workspace.addrs.len(),
+        latest_timestamp: workspace.latest_timestamp,
+        forked: workspace.forked,
+        fork_roots: workspace.fork_roots.clone(),
+    }
+}
+
+fn summarize_sync_targets(targets: &[AgentSyncTarget]) -> AgentSyncSummary {
+    let mut summary = AgentSyncSummary {
+        targets: targets.len(),
+        ..Default::default()
+    };
+    for target in targets {
+        if target.local.is_some() {
+            summary.local_workspaces += 1;
+        }
+        if let Some(discovered) = &target.discovered {
+            summary.discovered_workspaces += 1;
+            if discovered.clone_ready {
+                summary.clone_ready += 1;
+            }
+        }
+        match target.action {
+            "clone_with_expert_command" => summary.clone_suggestions += 1,
+            "refresh_discovery" | "serve_or_refresh_discovery" => summary.refresh_suggestions += 1,
+            _ => {}
+        }
+        if target.status == "local_only" {
+            summary.local_only += 1;
+        }
+    }
+    summary
+}
+
+fn sync_clone_name(explicit: Option<&str>, discovered_name: &str, workspace: &str) -> String {
+    let raw = explicit.unwrap_or(discovered_name);
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            Some(ch.to_ascii_lowercase())
+        } else if ch.is_ascii_whitespace() || matches!(ch, '-' | '/') {
+            Some('-')
+        } else {
+            None
+        };
+        let Some(ch) = normalized else {
+            continue;
+        };
+        if ch == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        slug.push(ch);
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        format!("workspace-{}", &workspace[..workspace.len().min(12)])
+    } else {
+        slug
     }
 }
 
@@ -1325,6 +1730,34 @@ fn exec_recommended_commands(base: &Path) -> Vec<CommandHint> {
     ]
 }
 
+fn sync_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "discover_cache",
+            command: format!("nexus-node agent discover --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "discover_lan_refresh",
+            command: format!("nexus-node discover --base {base} --lan --json --timeout-ms 3000"),
+        },
+        CommandHint {
+            name: "daemon_start",
+            command: format!(
+                "nexus-node agent up --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1 --json"
+            ),
+        },
+    ]
+}
+
 fn up_recommended_commands(base: &Path) -> Vec<CommandHint> {
     let base = base.display();
     vec![
@@ -1723,10 +2156,76 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
             ),
         },
         CommandHint {
+            name: "sync",
+            command: format!("nexus-node agent sync --base {base} --json"),
+        },
+        CommandHint {
             name: "serve_foreground",
             command: format!("nexus-node serve --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"),
         },
     ]
+}
+
+fn print_agent_sync_text(report: &AgentSyncReport) {
+    println!("Agent sync: {}", report.base);
+    println!("mode: {}", report.mode);
+    println!(
+        "daemon: running={} ipc_available={}",
+        report.daemon.running, report.daemon.ipc_available
+    );
+    println!(
+        "targets: {} local={} discovered={} clone_ready={} clone_suggestions={} refresh_suggestions={}",
+        report.summary.targets,
+        report.summary.local_workspaces,
+        report.summary.discovered_workspaces,
+        report.summary.clone_ready,
+        report.summary.clone_suggestions,
+        report.summary.refresh_suggestions
+    );
+    println!("issue: {}", report.issue);
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+    }
+    if let Some(command) = &report.suggested_command {
+        println!("suggested: {command}");
+    }
+    for target in &report.targets {
+        println!(
+            "\n{}  status={} action={}",
+            target.workspace, target.status, target.action
+        );
+        if let Some(name) = &target.name {
+            println!("  name: {name}");
+        }
+        if let Some(local) = &target.local {
+            println!(
+                "  local: {} root={}",
+                local.path,
+                local.latest_root.as_deref().unwrap_or("-")
+            );
+        }
+        if let Some(discovered) = &target.discovered {
+            println!(
+                "  discovered: owner={} root={} peers={} addrs={} verified={} clone_ready={}",
+                discovered.owner,
+                discovered.root.as_deref().unwrap_or("-"),
+                discovered.peers,
+                discovered.addrs,
+                discovered.verified,
+                discovered.clone_ready
+            );
+        }
+        if !target.reasons.is_empty() {
+            println!("  reasons: {}", target.reasons.join(", "));
+        }
+        if let Some(command) = &target.command_hint {
+            println!("  command: {command}");
+        }
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
 }
 
 fn print_agent_exec_text(report: &AgentExecReport) {
@@ -2232,6 +2731,94 @@ mod tests {
         assert_eq!(report.summary.clone_ready, 1);
         assert_eq!(report.workspaces[0].workspace, workspace.to_string());
         assert!(report.workspaces[0].clone_ready);
+        assert!(!identity_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn sync_reports_clone_ready_discovery_without_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([73; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/2345/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "Remote Workspace".into(),
+            description: "ready for sync planning".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 11,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let report = agent_sync_report(
+            temp.path(),
+            Some(workspace.to_string()),
+            Some("Remote Copy".into()),
+        );
+
+        assert_eq!(report.schema, "nexus.agent_sync.v1");
+        assert_eq!(report.mode, "local_cache_plan");
+        assert_eq!(report.summary.targets, 1);
+        assert_eq!(report.summary.clone_ready, 1);
+        assert_eq!(report.summary.clone_suggestions, 1);
+        assert_eq!(report.targets[0].status, "clone_ready");
+        assert_eq!(report.targets[0].action, "clone_with_expert_command");
+        assert!(report.targets[0]
+            .command_hint
+            .as_deref()
+            .is_some_and(|command| {
+                command.contains("nexus-node clone")
+                    && command.contains("--name remote-copy")
+                    && command.contains(&workspace.to_string())
+            }));
+        assert!(!identity_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn sync_reports_local_workspace_without_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace-local");
+        std::fs::create_dir_all(workspace.join(".nexus")).unwrap();
+        std::fs::write(
+            workspace.join(".nexus/config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "workspace-local",
+                "description": "local sync test",
+                "id": "3333333333333333333333333333333333333333333333333333333333333333",
+                "owner": "did:key:z6Mklocal",
+                "snapshot_history": [
+                    "4444444444444444444444444444444444444444444444444444444444444444"
+                ],
+                "snapshot_retention_limit": 32
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = agent_sync_report(temp.path(), None, None);
+
+        assert_eq!(report.summary.targets, 1);
+        assert_eq!(report.summary.local_workspaces, 1);
+        assert_eq!(report.summary.local_only, 1);
+        assert_eq!(report.targets[0].status, "local_only");
+        assert_eq!(report.targets[0].action, "serve_or_refresh_discovery");
+        assert_eq!(
+            report.targets[0]
+                .local
+                .as_ref()
+                .and_then(|local| local.latest_root.as_deref()),
+            Some("4444444444444444444444444444444444444444444444444444444444444444")
+        );
+        assert!(report.targets[0]
+            .command_hint
+            .as_deref()
+            .is_some_and(|command| command.contains("nexus-node agent up")));
         assert!(!identity_path(temp.path()).exists());
     }
 
