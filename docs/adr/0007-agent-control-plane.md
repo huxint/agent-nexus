@@ -54,11 +54,13 @@ builds a bounded local "what needs attention" summary from daemon alerts,
 society intent recommendations, open or assigned tasks, and clone-ready
 discovery cache entries. When daemon IPC is live, the JSON report also includes
 a `daemon_events` journal and maps `--since <CURSOR>` deltas into
-`daemon_event` inbox items. `agent watch` keeps polling that daemon journal and
-writes one `nexus.agent_watch_event.v1` JSON object per line, so an outer agent
-runtime can subscribe without blocking its own shell/filesystem work. It is
-also read-only: it does not start networking, create identities, or decrypt the
-identity key.
+`daemon_event` inbox items; clone-ready discovery prompts also prefer the
+daemon `agent_discover` projection and expose a `discovery_source` field so
+callers can tell whether daemon IPC or local cache supplied them. `agent watch`
+keeps polling that daemon journal and writes one `nexus.agent_watch_event.v1`
+JSON object per line, so an outer agent runtime can subscribe without blocking
+its own shell/filesystem work. It is also read-only: it does not start
+networking, create identities, or decrypt the identity key.
 `agent discover` exposes the same cached workspace-discovery projection under
 the short-lived agent namespace. When daemon IPC is available it asks the
 base-scoped control socket for `agent_discover`; if that request fails it falls
