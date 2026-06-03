@@ -16,9 +16,9 @@ use nexus_storage::Cid;
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{
-    daemon_agent_discover, daemon_agent_sync, daemon_events_report, daemon_status_report,
-    start_daemon, DaemonEvent, DaemonEventJournal, DaemonEventsReport, DaemonStartOptions,
-    DaemonStatusReport,
+    daemon_agent_discover, daemon_agent_send, daemon_agent_sync, daemon_events_report,
+    daemon_status_report, start_daemon, DaemonAgentSendRequest, DaemonAgentSendResponse,
+    DaemonEvent, DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
 };
 #[cfg(test)]
 use crate::daemon::{spawn_serve_control_socket, DaemonEventJournalHandle};
@@ -360,7 +360,7 @@ struct AgentSendEvent {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct AgentSendIntent {
     id: String,
-    kind: &'static str,
+    kind: String,
     title: String,
     body: String,
     workspace: Option<String>,
@@ -1075,11 +1075,38 @@ pub(crate) fn agent_sync_report(
 fn agent_send_report(
     options: AgentSendOptions,
 ) -> Result<AgentSendReport, Box<dyn std::error::Error>> {
-    let now = unix_now();
     let title = options
         .title
+        .clone()
         .or_else(|| title_from_body(&options.body))
         .ok_or("--title required")?;
+    let daemon = daemon_status_report(&options.base);
+    if daemon.running && daemon.ipc_available {
+        let request = daemon_agent_send_request_from_options(&options, title.clone());
+        match daemon_agent_send(&options.base, request) {
+            Ok(response) => {
+                return Ok(agent_send_report_from_daemon(
+                    options.base,
+                    response.status,
+                    response.send,
+                ));
+            }
+            Err(error) => {
+                return local_agent_send_report(options, title, daemon, Some(error.to_string()));
+            }
+        }
+    }
+
+    local_agent_send_report(options, title, daemon, None)
+}
+
+fn local_agent_send_report(
+    options: AgentSendOptions,
+    title: String,
+    daemon: DaemonStatusReport,
+    fallback_error: Option<String>,
+) -> Result<AgentSendReport, Box<dyn std::error::Error>> {
+    let now = unix_now();
     let identity = load_or_create_identity(&options.base)?;
     let memory_path = options.base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
@@ -1109,8 +1136,7 @@ fn agent_send_report(
     if inserted {
         save_social_memory(&memory_path, &memory)?;
     }
-    let daemon = daemon_status_report(&options.base);
-    let delivery = send_delivery(&options.base, &daemon);
+    let delivery = send_delivery(&options.base, &daemon, fallback_error);
 
     Ok(AgentSendReport {
         schema: "nexus.agent_send.v1",
@@ -1124,7 +1150,7 @@ fn agent_send_report(
         },
         intent: AgentSendIntent {
             id: intent.id,
-            kind: intent_kind_name(intent.kind),
+            kind: intent_kind_name(intent.kind).into(),
             title: intent.title,
             body: intent.body,
             workspace: intent.workspace.map(|workspace| workspace.to_string()),
@@ -1137,6 +1163,87 @@ fn agent_send_report(
         daemon,
         recommended_commands: send_recommended_commands(&options.base),
     })
+}
+
+fn daemon_agent_send_request_from_options(
+    options: &AgentSendOptions,
+    title: String,
+) -> DaemonAgentSendRequest {
+    DaemonAgentSendRequest {
+        id: options.id.clone(),
+        kind: intent_kind_name(options.kind).into(),
+        title,
+        body: options.body.clone(),
+        workspace: options.workspace.as_ref().map(ToString::to_string),
+        task_id: options.task_id.clone(),
+        capability: options.capability.clone(),
+        tags: options.tags.clone(),
+        expires_at: options.expires_at,
+    }
+}
+
+fn agent_send_report_from_daemon(
+    base: PathBuf,
+    daemon: DaemonStatusReport,
+    response: DaemonAgentSendResponse,
+) -> AgentSendReport {
+    let DaemonAgentSendResponse {
+        event_id,
+        author,
+        seq,
+        timestamp,
+        inserted,
+        intent_id,
+        kind,
+        title,
+        body,
+        workspace,
+        task_id,
+        capability,
+        tags,
+        expires_at,
+        live_broadcast,
+    } = response;
+
+    AgentSendReport {
+        schema: "nexus.agent_send.v1",
+        base: base.display().to_string(),
+        event: AgentSendEvent {
+            id: event_id,
+            author,
+            seq,
+            timestamp,
+            inserted,
+        },
+        intent: AgentSendIntent {
+            id: intent_id,
+            kind,
+            title,
+            body,
+            workspace,
+            task_id,
+            capability,
+            tags,
+            expires_at,
+        },
+        delivery: daemon_send_delivery(live_broadcast),
+        daemon,
+        recommended_commands: send_recommended_commands(&base),
+    }
+}
+
+fn daemon_send_delivery(live_broadcast: bool) -> AgentSendDelivery {
+    let message = if live_broadcast {
+        "daemon signed, persisted, and broadcast the event through the live network"
+    } else {
+        "daemon signed and persisted the event; live broadcast was not accepted by the network yet"
+    };
+    AgentSendDelivery {
+        mode: "daemon_ipc",
+        local_memory: true,
+        live_broadcast,
+        issue: agent_issue("daemon_ipc_delivery", message, None),
+    }
 }
 
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
@@ -1390,15 +1497,44 @@ fn title_from_body(body: &str) -> Option<String> {
     }
 }
 
-fn send_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentSendDelivery {
-    if daemon.running {
+fn send_delivery(
+    base: &Path,
+    daemon: &DaemonStatusReport,
+    fallback_error: Option<String>,
+) -> AgentSendDelivery {
+    if let Some(error) = fallback_error {
+        AgentSendDelivery {
+            mode: "local_memory_daemon_ipc_fallback",
+            local_memory: true,
+            live_broadcast: false,
+            issue: agent_issue(
+                "daemon_send_ipc_failed",
+                format!("daemon send IPC failed; the event is saved locally instead: {error}"),
+                Some(format!(
+                    "nexus-node daemon status --base {} --json",
+                    base.display()
+                )),
+            ),
+        }
+    } else if daemon.running && daemon.ipc_available {
+        AgentSendDelivery {
+            mode: "local_memory_daemon_ipc_unavailable",
+            local_memory: true,
+            live_broadcast: false,
+            issue: agent_issue(
+                "daemon_send_ipc_unavailable",
+                "daemon send IPC was not available; the event is saved locally but not injected into the running daemon",
+                Some(format!("nexus-node daemon status --base {} --json", base.display())),
+            ),
+        }
+    } else if daemon.running {
         AgentSendDelivery {
             mode: "local_memory_daemon_running",
             local_memory: true,
             live_broadcast: false,
             issue: agent_issue(
-                "daemon_send_ipc_pending",
-                "daemon send IPC is pending; the event is saved locally but not injected into the running daemon",
+                "daemon_send_ipc_unavailable",
+                "daemon is running without an available control socket; the event is saved locally but not injected into the running daemon",
                 Some(format!("nexus-node daemon status --base {} --json", base.display())),
             ),
         }
@@ -1724,13 +1860,14 @@ fn control_plane_status(base: &Path, daemon: &DaemonStatusReport) -> ControlPlan
             daemon_supported: true,
             issue: agent_issue(
                 "daemon_ipc_routing_pending",
-                "daemon is running; request-response IPC routing is still pending",
+                "daemon is running; exec and remaining live sync IPC routes are still pending",
                 Some(format!(
                     "nexus-node daemon status --base {} --json",
                     base.display()
                 )),
             ),
-            next_design: "route agent inbox, sync, discover, send, and exec through the base-scoped daemon control socket",
+            next_design:
+                "route agent exec and live sync through the base-scoped daemon control socket",
         }
     } else {
         ControlPlaneStatus {
@@ -3091,6 +3228,7 @@ mod tests {
             socket,
             shutdown_tx,
             DaemonEventJournalHandle::new(),
+            None,
         )
         .unwrap();
 
@@ -3494,6 +3632,7 @@ mod tests {
             socket,
             shutdown_tx,
             DaemonEventJournalHandle::new(),
+            None,
         )
         .unwrap();
 
@@ -3570,6 +3709,7 @@ mod tests {
             socket,
             shutdown_tx,
             DaemonEventJournalHandle::new(),
+            None,
         )
         .unwrap();
 
@@ -3827,6 +3967,106 @@ mod tests {
         assert_eq!(report.intent.task_id.as_deref(), Some("task-send-title"));
         assert_eq!(report.intent.capability.as_deref(), Some("code-review"));
         assert_eq!(report.intent.expires_at, Some(4_102_444_800));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prefers_daemon_ipc_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let command_task = tokio::spawn(async move {
+            let Some(crate::daemon::DaemonControlCommand::AgentSend { request, reply }) =
+                control_rx.recv().await
+            else {
+                panic!("agent_send command should be forwarded to the serve loop");
+            };
+            assert_eq!(request.id.as_deref(), Some("intent-daemon-send"));
+            assert_eq!(request.kind, "status");
+            assert_eq!(request.title, "Daemon status update");
+            assert_eq!(request.body, "ready through daemon");
+            assert_eq!(request.capability.as_deref(), Some("daemon-ipc"));
+            assert_eq!(request.tags, vec!["daemon-send".to_string()]);
+            reply
+                .send(Ok(DaemonAgentSendResponse {
+                    event_id: "event-daemon-send".into(),
+                    author: "did:key:daemon".into(),
+                    seq: 7,
+                    timestamp: 456,
+                    inserted: true,
+                    intent_id: request.id.unwrap(),
+                    kind: request.kind,
+                    title: request.title,
+                    body: request.body,
+                    workspace: request.workspace,
+                    task_id: request.task_id,
+                    capability: request.capability,
+                    tags: request.tags,
+                    expires_at: request.expires_at,
+                    live_broadcast: true,
+                }))
+                .unwrap();
+        });
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+            Some(control_tx),
+        )
+        .unwrap();
+
+        let base = temp.path().to_path_buf();
+        let report = tokio::task::spawn_blocking(move || {
+            agent_send_report(AgentSendOptions {
+                base,
+                id: Some("intent-daemon-send".into()),
+                kind: IntentKind::Status,
+                title: Some("Daemon status update".into()),
+                body: "ready through daemon".into(),
+                workspace: None,
+                task_id: None,
+                capability: Some("daemon-ipc".into()),
+                tags: vec!["daemon-send".into()],
+                expires_at: None,
+                json: true,
+            })
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.event.id, "event-daemon-send");
+        assert_eq!(report.event.seq, 7);
+        assert_eq!(report.intent.id, "intent-daemon-send");
+        assert_eq!(report.delivery.mode, "daemon_ipc");
+        assert_eq!(report.delivery.issue.kind, "daemon_ipc_delivery");
+        assert!(report.delivery.live_broadcast);
+
+        command_task.await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]

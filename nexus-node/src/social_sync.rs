@@ -60,19 +60,19 @@ pub fn ingest_social_event_bytes(
     }
 }
 
-pub async fn publish_social_event_with_retry(network: &Network, event: &SocialEvent) {
+pub async fn publish_social_event_with_retry(network: &Network, event: &SocialEvent) -> bool {
     let data = match event.to_json() {
         Ok(data) => data,
         Err(err) => {
             tracing::warn!("failed to serialize social event {}: {err}", event.id);
-            return;
+            return false;
         }
     };
 
     let mut last_error = None;
     for _ in 0..8 {
         match network.publish_social_event(data.clone()).await {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(err) => {
                 last_error = Some(err);
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -83,6 +83,7 @@ pub async fn publish_social_event_with_retry(network: &Network, event: &SocialEv
     if let Some(err) = last_error {
         tracing::debug!("social event {} not broadcast yet: {err}", event.id);
     }
+    false
 }
 
 pub async fn replay_social_memory(network: &Network, social_memory: &SocialMemory) {

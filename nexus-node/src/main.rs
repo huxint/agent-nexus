@@ -1043,12 +1043,14 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(32);
     let _control_task = if let Some(control_socket) = control_socket {
         Some(daemon::spawn_serve_control_socket(
             base.clone(),
             control_socket,
             shutdown_tx.clone(),
             event_journal.clone(),
+            Some(control_tx),
         )?)
     } else {
         None
@@ -1069,6 +1071,9 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             Some(event) = net_clone.next_event() => {
                 record_daemon_network_event(event_context.event_journal, &event);
                 handle_node_event(event, &event_context, &mut server, &mut social_memory).await;
+            }
+            Some(command) = control_rx.recv() => {
+                handle_daemon_control_command(command, &event_context, &mut social_memory).await;
             }
             _ = observe_tick.tick() => {
                 publish_workspace_announcements(
@@ -5189,6 +5194,90 @@ struct NodeEventContext<'a> {
     base: &'a Path,
     identity: &'a NodeIdentity,
     event_journal: &'a daemon::DaemonEventJournalHandle,
+}
+
+async fn handle_daemon_control_command(
+    command: daemon::DaemonControlCommand,
+    context: &NodeEventContext<'_>,
+    social_memory: &mut SocialMemory,
+) {
+    match command {
+        daemon::DaemonControlCommand::AgentSend { request, reply } => {
+            let result = handle_daemon_agent_send(request, context, social_memory)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+    }
+}
+
+async fn handle_daemon_agent_send(
+    request: daemon::DaemonAgentSendRequest,
+    context: &NodeEventContext<'_>,
+    social_memory: &mut SocialMemory,
+) -> Result<daemon::DaemonAgentSendResponse, Box<dyn std::error::Error>> {
+    let timestamp = unix_now();
+    let kind = parse_intent_kind(&request.kind)?;
+    let workspace = request
+        .workspace
+        .as_deref()
+        .map(parse_workspace_id)
+        .transpose()?;
+    let mut intent = AgentIntent::new(
+        context.identity.did().clone(),
+        kind,
+        request.title,
+        request.body,
+        workspace,
+        request.task_id,
+        request.capability,
+        request.tags,
+        timestamp,
+        request.expires_at,
+    );
+    if let Some(id) = request.id {
+        intent.id = id;
+    }
+
+    let event = social_memory.sign_event(
+        context.identity,
+        timestamp,
+        SocialEventKind::IntentPublished {
+            intent: intent.clone(),
+        },
+    )?;
+    let inserted = social_memory.ingest_event(event.clone())?;
+    if inserted {
+        save_social_memory(context.memory_path, social_memory)?;
+        context.event_journal.push(
+            "social_event",
+            format!(
+                "social_event source=local_agent_send events={} agents={}",
+                social_memory.event_count(),
+                social_memory.agent_count()
+            ),
+        );
+        record_daemon_social_event_change_from_event(context.event_journal, &None, &event);
+    }
+    let live_broadcast = publish_social_event_with_retry(context.network, &event).await;
+
+    Ok(daemon::DaemonAgentSendResponse {
+        event_id: event.id,
+        author: event.author.to_string(),
+        seq: event.seq,
+        timestamp: event.timestamp,
+        inserted,
+        intent_id: intent.id,
+        kind: daemon_intent_kind_name(intent.kind).to_string(),
+        title: intent.title,
+        body: intent.body,
+        workspace: intent.workspace.map(|workspace| workspace.to_string()),
+        task_id: intent.task_id,
+        capability: intent.capability,
+        tags: intent.tags,
+        expires_at: intent.expires_at,
+        live_broadcast,
+    })
 }
 
 fn record_daemon_social_event_change(
