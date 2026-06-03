@@ -54,7 +54,7 @@ struct IdentityStatus {
     encrypted: bool,
     legacy_plaintext: bool,
     passphrase_required: bool,
-    error: Option<String>,
+    error: Option<AgentIssue>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -72,7 +72,7 @@ struct SocialMemoryStatus {
     collectives: Option<usize>,
     intents: Option<usize>,
     tasks: Option<usize>,
-    error: Option<String>,
+    error: Option<AgentIssue>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -85,7 +85,7 @@ struct LocalWorkspaceStatus {
     owner: Option<String>,
     latest_root: Option<String>,
     snapshot_count: Option<usize>,
-    error: Option<String>,
+    error: Option<AgentIssue>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -106,7 +106,7 @@ struct ControlPlaneStatus {
     mode: &'static str,
     realtime_ready: bool,
     daemon_supported: bool,
-    issue: &'static str,
+    issue: AgentIssue,
     next_design: &'static str,
 }
 
@@ -114,6 +114,25 @@ struct ControlPlaneStatus {
 struct CommandHint {
     name: &'static str,
     command: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentIssue {
+    kind: &'static str,
+    message: String,
+    suggested_command: Option<String>,
+}
+
+fn agent_issue(
+    kind: &'static str,
+    message: impl Into<String>,
+    suggested_command: Option<String>,
+) -> AgentIssue {
+    AgentIssue {
+        kind,
+        message: message.into(),
+        suggested_command,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -146,7 +165,7 @@ struct AgentWatchEvent {
     cursor: u64,
     kind: &'static str,
     daemon_event: Option<DaemonEvent>,
-    error: Option<String>,
+    error: Option<AgentIssue>,
     command_hint: Option<String>,
 }
 
@@ -186,7 +205,7 @@ pub(crate) struct AgentDiscoverReport {
     daemon: DaemonStatusReport,
     summary: AgentDiscoverSummary,
     workspaces: Vec<DiscoveredWorkspaceView>,
-    error: Option<String>,
+    error: Option<AgentIssue>,
     recommended_commands: Vec<CommandHint>,
 }
 
@@ -228,9 +247,8 @@ pub(crate) struct AgentSyncReport {
     filter: AgentSyncFilter,
     summary: AgentSyncSummary,
     targets: Vec<AgentSyncTarget>,
-    error: Option<String>,
-    issue: &'static str,
-    suggested_command: Option<String>,
+    error: Option<AgentIssue>,
+    issue: AgentIssue,
     recommended_commands: Vec<CommandHint>,
 }
 
@@ -323,8 +341,7 @@ struct AgentExecDelivery {
     mode: &'static str,
     local_memory: bool,
     live_broadcast: bool,
-    issue: &'static str,
-    suggested_command: Option<String>,
+    issue: AgentIssue,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -354,8 +371,7 @@ struct AgentSendDelivery {
     mode: &'static str,
     local_memory: bool,
     live_broadcast: bool,
-    issue: &'static str,
-    suggested_command: Option<String>,
+    issue: AgentIssue,
 }
 
 #[derive(Clone, Debug)]
@@ -612,7 +628,10 @@ fn run_agent_watch(options: &AgentWatchOptions) -> Result<(), Box<dyn std::error
                     error,
                 );
                 write_agent_watch_event(&mut stdout, &watch_event, options.json)?;
-                last_error = watch_event.error.clone();
+                last_error = watch_event
+                    .error
+                    .as_ref()
+                    .map(|issue| issue.message.clone());
             }
         } else {
             last_error = None;
@@ -648,7 +667,14 @@ fn agent_watch_error_event(base: &Path, cursor: u64, error: String) -> AgentWatc
         cursor,
         kind: "watch_error",
         daemon_event: None,
-        error: Some(error),
+        error: Some(agent_issue(
+            "daemon_events_unavailable",
+            error,
+            Some(format!(
+                "nexus-node agent up --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1 --json",
+                base.display()
+            )),
+        )),
         command_hint: Some(format!(
             "nexus-node agent up --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1 --json",
             base.display()
@@ -673,7 +699,11 @@ fn write_agent_watch_event(
             daemon_event.sequence, daemon_event.timestamp, daemon_event.kind, daemon_event.summary
         )?;
     } else if let Some(error) = &event.error {
-        writeln!(writer, "watch_error cursor={} {error}", event.cursor)?;
+        writeln!(
+            writer,
+            "watch_error cursor={} {}",
+            event.cursor, error.message
+        )?;
     }
     Ok(())
 }
@@ -950,7 +980,17 @@ pub(crate) fn agent_sync_report(
             };
             (discovered_workspace_views(&announcements, &filter), None)
         }
-        Err(error) => (Vec::new(), Some(format!("read discovery cache: {error}"))),
+        Err(error) => (
+            Vec::new(),
+            Some(agent_issue(
+                "discovery_cache_read_error",
+                format!("read discovery cache: {error}"),
+                Some(format!(
+                    "nexus-node discover --base {} --lan --json --timeout-ms 3000",
+                    base.display()
+                )),
+            )),
+        ),
     };
 
     let mut targets = Vec::new();
@@ -985,7 +1025,7 @@ pub(crate) fn agent_sync_report(
     }
 
     let summary = summarize_sync_targets(&targets);
-    let (issue, suggested_command) = sync_issue(base, &daemon);
+    let issue = sync_issue(base, &daemon);
     AgentSyncReport {
         schema: "nexus.agent_sync.v1",
         base: base.display().to_string(),
@@ -999,7 +1039,6 @@ pub(crate) fn agent_sync_report(
         targets,
         error,
         issue,
-        suggested_command,
         recommended_commands: sync_recommended_commands(base),
     }
 }
@@ -1073,7 +1112,7 @@ fn agent_send_report(
 
 pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
     let daemon = daemon_status_report(base);
-    let control_plane = control_plane_status(&daemon);
+    let control_plane = control_plane_status(base, &daemon);
     AgentStatusReport {
         schema: "nexus.agent_status.v1",
         base: base.display().to_string(),
@@ -1105,7 +1144,18 @@ pub(crate) fn agent_discover_report(base: &Path, filter: DiscoveryFilter) -> Age
             let workspaces = discovered_workspace_views(&announcements, &filter);
             (cached_announcements, workspaces, None)
         }
-        Err(error) => (0, Vec::new(), Some(error.to_string())),
+        Err(error) => (
+            0,
+            Vec::new(),
+            Some(agent_issue(
+                "discovery_cache_read_error",
+                error.to_string(),
+                Some(format!(
+                    "nexus-node discover --base {} --lan --json --timeout-ms 3000",
+                    base.display()
+                )),
+            )),
+        ),
     };
     let summary = AgentDiscoverSummary {
         cached_announcements,
@@ -1255,16 +1305,22 @@ fn send_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentSendDelivery 
             mode: "local_memory_daemon_running",
             local_memory: true,
             live_broadcast: false,
-            issue: "daemon send IPC is pending; the event is saved locally but not injected into the running daemon",
-            suggested_command: Some(format!("nexus-node daemon status --base {} --json", base.display())),
+            issue: agent_issue(
+                "daemon_send_ipc_pending",
+                "daemon send IPC is pending; the event is saved locally but not injected into the running daemon",
+                Some(format!("nexus-node daemon status --base {} --json", base.display())),
+            ),
         }
     } else {
         AgentSendDelivery {
             mode: "local_memory",
             local_memory: true,
             live_broadcast: false,
-            issue: "daemon is not running; the event will be available for replay after the daemon or serve starts",
-            suggested_command: Some(format!("nexus-node agent up --base {} --json", base.display())),
+            issue: agent_issue(
+                "daemon_not_running",
+                "daemon is not running; the event will be available for replay after the daemon or serve starts",
+                Some(format!("nexus-node agent up --base {} --json", base.display())),
+            ),
         }
     }
 }
@@ -1275,19 +1331,25 @@ fn exec_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentExecDelivery 
             mode: "local_exec_daemon_running",
             local_memory: true,
             live_broadcast: false,
-            issue: "daemon exec IPC is pending; the command ran locally and recorded social memory outside the running daemon",
-            suggested_command: Some(format!("nexus-node daemon status --base {} --json", base.display())),
+            issue: agent_issue(
+                "daemon_exec_ipc_pending",
+                "daemon exec IPC is pending; the command ran locally and recorded social memory outside the running daemon",
+                Some(format!("nexus-node daemon status --base {} --json", base.display())),
+            ),
         }
     } else {
         AgentExecDelivery {
             mode: "local_exec",
             local_memory: true,
             live_broadcast: false,
-            issue: "daemon is not running; the command ran locally and will be available for replay after the daemon or serve starts",
-            suggested_command: Some(format!(
-                "nexus-node daemon start --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1",
-                base.display()
-            )),
+            issue: agent_issue(
+                "daemon_not_running",
+                "daemon is not running; the command ran locally and will be available for replay after the daemon or serve starts",
+                Some(format!(
+                    "nexus-node daemon start --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1",
+                    base.display()
+                )),
+            ),
         }
     }
 }
@@ -1304,14 +1366,16 @@ fn sync_mode(daemon: &DaemonStatusReport) -> &'static str {
     }
 }
 
-fn sync_issue(base: &Path, daemon: &DaemonStatusReport) -> (&'static str, Option<String>) {
+fn sync_issue(base: &Path, daemon: &DaemonStatusReport) -> AgentIssue {
     if daemon.running {
-        (
+        agent_issue(
+            "daemon_sync_ipc_pending",
             "daemon sync IPC is pending; this report is based on local workspace and discovery caches",
             Some(format!("nexus-node daemon status --base {} --json", base.display())),
         )
     } else {
-        (
+        agent_issue(
+            "daemon_not_running",
             "daemon is not running; this report is based on local caches and suggests explicit clone/discover commands",
             Some(format!(
                 "nexus-node agent up --base {} --json",
@@ -1539,13 +1603,20 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
+fn control_plane_status(base: &Path, daemon: &DaemonStatusReport) -> ControlPlaneStatus {
     if daemon.running {
         ControlPlaneStatus {
             mode: "daemon_running",
             realtime_ready: true,
             daemon_supported: true,
-            issue: "daemon is running; request-response IPC routing is still pending",
+            issue: agent_issue(
+                "daemon_ipc_routing_pending",
+                "daemon is running; request-response IPC routing is still pending",
+                Some(format!(
+                    "nexus-node daemon status --base {} --json",
+                    base.display()
+                )),
+            ),
             next_design: "route agent inbox, sync, discover, send, and exec through the base-scoped daemon control socket",
         }
     } else {
@@ -1553,7 +1624,11 @@ fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
             mode: "daemon_supported_not_running",
             realtime_ready: false,
             daemon_supported: true,
-            issue: "daemon is not running, so network serving still requires an explicit foreground or daemon start command",
+            issue: agent_issue(
+                "daemon_not_running",
+                "daemon is not running, so network serving still requires an explicit foreground or daemon start command",
+                Some(format!("nexus-node agent up --base {} --json", base.display())),
+            ),
             next_design: "start daemon for background network availability, then add request-response IPC routing",
         }
     }
@@ -2216,7 +2291,7 @@ fn identity_status(base: &Path) -> IdentityStatus {
             encrypted: false,
             legacy_plaintext: false,
             passphrase_required: false,
-            error: Some(error),
+            error: Some(agent_issue("identity_read_error", error, None)),
         },
     }
 }
@@ -2259,7 +2334,14 @@ fn social_memory_status(base: &Path) -> SocialMemoryStatus {
             collectives: None,
             intents: None,
             tasks: None,
-            error: Some(error.to_string()),
+            error: Some(agent_issue(
+                "social_memory_read_error",
+                error.to_string(),
+                Some(format!(
+                    "nexus-node agent status --base {} --json",
+                    base.display()
+                )),
+            )),
         },
     }
 }
@@ -2279,7 +2361,11 @@ fn local_workspace_statuses(base: &Path) -> Vec<LocalWorkspaceStatus> {
             owner: None,
             latest_root: None,
             snapshot_count: None,
-            error: Some(error.to_string()),
+            error: Some(agent_issue(
+                "local_workspace_list_error",
+                error.to_string(),
+                None,
+            )),
         }],
     }
 }
@@ -2333,7 +2419,11 @@ fn local_workspace_status(path: &Path) -> LocalWorkspaceStatus {
             owner: None,
             latest_root: None,
             snapshot_count: None,
-            error: Some(format!("read {}: {error}", config_path.display())),
+            error: Some(agent_issue(
+                "local_workspace_config_read_error",
+                format!("read {}: {error}", config_path.display()),
+                None,
+            )),
         },
     }
 }
@@ -2423,11 +2513,11 @@ fn print_agent_sync_text(report: &AgentSyncReport) {
         report.summary.clone_suggestions,
         report.summary.refresh_suggestions
     );
-    println!("issue: {}", report.issue);
+    println!("issue: {}", report.issue.message);
     if let Some(error) = &report.error {
-        println!("error: {error}");
+        println!("error[{}]: {}", error.kind, error.message);
     }
-    if let Some(command) = &report.suggested_command {
+    if let Some(command) = &report.issue.suggested_command {
         println!("suggested: {command}");
     }
     for target in &report.targets {
@@ -2485,8 +2575,8 @@ fn print_agent_exec_text(report: &AgentExecReport) {
         "delivery: mode={} local_memory={} live_broadcast={}",
         report.delivery.mode, report.delivery.local_memory, report.delivery.live_broadcast
     );
-    println!("issue: {}", report.delivery.issue);
-    if let Some(command) = &report.delivery.suggested_command {
+    println!("issue: {}", report.delivery.issue.message);
+    if let Some(command) = &report.delivery.issue.suggested_command {
         println!("suggested: {command}");
     }
     println!("recommended:");
@@ -2509,8 +2599,8 @@ fn print_agent_send_text(report: &AgentSendReport) {
         "delivery: mode={} local_memory={} live_broadcast={}",
         report.delivery.mode, report.delivery.local_memory, report.delivery.live_broadcast
     );
-    println!("issue: {}", report.delivery.issue);
-    if let Some(command) = &report.delivery.suggested_command {
+    println!("issue: {}", report.delivery.issue.message);
+    if let Some(command) = &report.delivery.issue.suggested_command {
         println!("suggested: {command}");
     }
     println!("recommended:");
@@ -2557,7 +2647,7 @@ fn print_agent_discover_text(report: &AgentDiscoverReport) {
         report.summary.cached_announcements
     );
     if let Some(error) = &report.error {
-        println!("error: {error}");
+        println!("error[{}]: {}", error.kind, error.message);
     }
     for workspace in &report.workspaces {
         println!(
@@ -2667,6 +2757,10 @@ fn print_agent_status_text(report: &AgentStatusReport) {
     println!(
         "control_plane: mode={} realtime_ready={}",
         report.control_plane.mode, report.control_plane.realtime_ready
+    );
+    println!(
+        "control_plane_issue: {}",
+        report.control_plane.issue.message
     );
     println!(
         "daemon: running={} pid={}",
@@ -2882,6 +2976,15 @@ mod tests {
             .is_some_and(|command| command.contains("--since 9")));
 
         let error_event = agent_watch_error_event(temp.path(), 9, "daemon is not running".into());
+        let mut error_json = Vec::new();
+        write_agent_watch_event(&mut error_json, &error_event, true).unwrap();
+        let error_value: serde_json::Value = serde_json::from_slice(&error_json).unwrap();
+        assert_eq!(error_value["error"]["kind"], "daemon_events_unavailable");
+        assert_eq!(error_value["error"]["message"], "daemon is not running");
+        assert!(error_value["error"]["suggested_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("nexus-node agent up")));
+
         let mut text = Vec::new();
         write_agent_watch_event(&mut text, &error_event, false).unwrap();
         let text = String::from_utf8(text).unwrap();
@@ -3103,6 +3206,31 @@ mod tests {
     }
 
     #[test]
+    fn discover_cache_errors_are_structured() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join(".nexus-workspace-discovery.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        let report = agent_discover_report(temp.path(), DiscoveryFilter::default());
+
+        let error = report.error.as_ref().unwrap();
+        assert_eq!(error.kind, "discovery_cache_read_error");
+        assert!(error
+            .suggested_command
+            .as_deref()
+            .is_some_and(|command| command.contains("nexus-node discover")));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["error"]["kind"], "discovery_cache_read_error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("expected ident")));
+        assert!(value["error"].get("suggested_command").is_some());
+    }
+
+    #[test]
     fn sync_reports_clone_ready_discovery_without_identity() {
         let temp = tempfile::TempDir::new().unwrap();
         let owner = NodeIdentity::generate();
@@ -3132,6 +3260,16 @@ mod tests {
 
         assert_eq!(report.schema, "nexus.agent_sync.v1");
         assert_eq!(report.mode, "local_cache_plan");
+        assert_eq!(report.issue.kind, "daemon_not_running");
+        assert!(report
+            .issue
+            .suggested_command
+            .as_deref()
+            .is_some_and(|command| command.contains("nexus-node agent up")));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["issue"]["kind"], "daemon_not_running");
+        assert!(value["issue"].get("message").is_some());
+        assert!(value["issue"].get("suggested_command").is_some());
         assert_eq!(report.summary.targets, 1);
         assert_eq!(report.summary.clone_ready, 1);
         assert_eq!(report.summary.clone_suggestions, 1);
@@ -3254,6 +3392,13 @@ mod tests {
         assert_eq!(report.intent.kind, "status");
         assert!(report.event.inserted);
         assert_eq!(report.delivery.mode, "local_memory");
+        assert_eq!(report.delivery.issue.kind, "daemon_not_running");
+        assert!(report
+            .delivery
+            .issue
+            .suggested_command
+            .as_deref()
+            .is_some_and(|command| command.contains("nexus-node agent up")));
         assert!(!report.delivery.live_broadcast);
 
         let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
@@ -3338,6 +3483,13 @@ mod tests {
         assert_eq!(report.execution.exit_code, 0);
         assert_eq!(report.execution.stdout.text, "agent-output");
         assert_eq!(report.delivery.mode, "local_exec");
+        assert_eq!(report.delivery.issue.kind, "daemon_not_running");
+        assert!(report
+            .delivery
+            .issue
+            .suggested_command
+            .as_deref()
+            .is_some_and(|command| command.contains("nexus-node daemon start")));
         assert!(!report.delivery.live_broadcast);
         assert_eq!(
             std::fs::read(workspace_path.join("output.txt")).unwrap(),
