@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,8 @@ const DAEMON_CONTROL_REQUEST_MAX_BYTES: usize = 16 * 1024;
 const DAEMON_CONTROL_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
 const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_START_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_EVENT_JOURNAL_LIMIT: usize = 256;
+const DEFAULT_DAEMON_EVENTS_LIMIT: usize = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DaemonStatusReport {
@@ -79,6 +83,10 @@ struct DaemonRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct DaemonControlRequest {
     command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,7 +94,46 @@ struct DaemonControlResponse {
     ok: bool,
     shutdown: bool,
     status: DaemonStatusReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    events: Option<DaemonEventJournal>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonEventsReport {
+    pub(crate) schema: String,
+    pub(crate) base: String,
+    pub(crate) status: DaemonStatusReport,
+    pub(crate) journal: DaemonEventJournal,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonEventJournal {
+    pub(crate) schema: String,
+    pub(crate) base: String,
+    pub(crate) cursor: u64,
+    pub(crate) limit: usize,
+    pub(crate) events: Vec<DaemonEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonEvent {
+    pub(crate) sequence: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) kind: String,
+    pub(crate) summary: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonEventJournalHandle {
+    inner: Arc<Mutex<DaemonEventJournalState>>,
+}
+
+#[derive(Debug)]
+struct DaemonEventJournalState {
+    next_sequence: u64,
+    events: VecDeque<DaemonEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,13 +145,78 @@ pub(crate) struct DaemonStartOptions {
     pub(crate) json: bool,
 }
 
+impl DaemonEventJournalHandle {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DaemonEventJournalState {
+                next_sequence: 1,
+                events: VecDeque::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn push(&self, kind: impl Into<String>, summary: impl Into<String>) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let sequence = guard.next_sequence;
+        guard.next_sequence = guard.next_sequence.saturating_add(1);
+        guard.events.push_back(DaemonEvent {
+            sequence,
+            timestamp: unix_now(),
+            kind: kind.into(),
+            summary: summary.into(),
+        });
+        while guard.events.len() > DAEMON_EVENT_JOURNAL_LIMIT {
+            guard.events.pop_front();
+        }
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        base: &Path,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> DaemonEventJournal {
+        let limit = limit
+            .unwrap_or(DEFAULT_DAEMON_EVENTS_LIMIT)
+            .min(DAEMON_EVENT_JOURNAL_LIMIT);
+        let Ok(guard) = self.inner.lock() else {
+            return empty_event_journal(base, since.unwrap_or(0), limit);
+        };
+        let mut events = guard
+            .events
+            .iter()
+            .filter(|event| since.is_none_or(|since| event.sequence > since))
+            .cloned()
+            .collect::<Vec<_>>();
+        if events.len() > limit {
+            let start = events.len() - limit;
+            events = events.split_off(start);
+        }
+        let cursor = events
+            .last()
+            .map(|event| event.sequence)
+            .or(since)
+            .unwrap_or(0);
+        DaemonEventJournal {
+            schema: "nexus.daemon_events.v1".into(),
+            base: base.display().to_string(),
+            cursor,
+            limit,
+            events,
+        }
+    }
+}
+
 pub(crate) fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.get(2).map(String::as_str) {
         Some("start") => cmd_daemon_start(args),
         Some("status") => cmd_daemon_status(args),
         Some("stop") => cmd_daemon_stop(args),
+        Some("events") => cmd_daemon_events(args),
         Some(other) => Err(format!("unknown daemon subcommand: {other}").into()),
-        None => Err("daemon subcommand required: start, status, or stop".into()),
+        None => Err("daemon subcommand required: start, status, stop, or events".into()),
     }
 }
 
@@ -132,6 +244,43 @@ fn cmd_daemon_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn cmd_daemon_events(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut base = PathBuf::from(".");
+    let mut json = false;
+    let mut since = None;
+    let mut limit = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--json" => {
+                json = true;
+            }
+            "--since" => {
+                i += 1;
+                since = Some(parse_u64_arg(required_arg(args, i, "--since")?, "--since")?);
+            }
+            "--limit" => {
+                i += 1;
+                limit = Some(parse_events_limit(required_arg(args, i, "--limit")?)?);
+            }
+            other => return Err(format!("unknown daemon events option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let report = daemon_events_report(&base, since, limit);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_daemon_events_text(&report);
+    }
+    Ok(())
+}
+
 fn cmd_daemon_stop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (base, json, timeout) = parse_daemon_stop_options(args)?;
     let report = stop_daemon(&base, timeout)?;
@@ -145,6 +294,69 @@ fn cmd_daemon_stop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         print_daemon_status_text(&report.status);
     }
     Ok(())
+}
+
+pub(crate) fn daemon_events_report(
+    base: &Path,
+    since: Option<u64>,
+    limit: Option<usize>,
+) -> DaemonEventsReport {
+    let status = daemon_status_report(base);
+    let effective_limit = limit
+        .unwrap_or(DEFAULT_DAEMON_EVENTS_LIMIT)
+        .min(DAEMON_EVENT_JOURNAL_LIMIT);
+    let empty = empty_event_journal(base, since.unwrap_or(0), effective_limit);
+    let Some(socket) = status.control_socket.as_deref() else {
+        return DaemonEventsReport {
+            schema: "nexus.daemon_events_report.v1".into(),
+            base: base.display().to_string(),
+            status,
+            journal: empty,
+            error: Some("daemon control socket is not available".into()),
+        };
+    };
+    if !status.running {
+        return DaemonEventsReport {
+            schema: "nexus.daemon_events_report.v1".into(),
+            base: base.display().to_string(),
+            status,
+            journal: empty,
+            error: Some("daemon is not running".into()),
+        };
+    }
+
+    match query_control_socket_request(
+        Path::new(socket),
+        &DaemonControlRequest {
+            command: "events".into(),
+            since,
+            limit: Some(effective_limit),
+        },
+    ) {
+        Ok(response) if response.ok => DaemonEventsReport {
+            schema: "nexus.daemon_events_report.v1".into(),
+            base: base.display().to_string(),
+            status: response.status,
+            journal: response.events.unwrap_or(empty),
+            error: response.error,
+        },
+        Ok(response) => DaemonEventsReport {
+            schema: "nexus.daemon_events_report.v1".into(),
+            base: base.display().to_string(),
+            status: response.status,
+            journal: response.events.unwrap_or(empty),
+            error: response
+                .error
+                .or_else(|| Some("daemon events request failed".into())),
+        },
+        Err(error) => DaemonEventsReport {
+            schema: "nexus.daemon_events_report.v1".into(),
+            base: base.display().to_string(),
+            status,
+            journal: empty,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 pub(crate) fn daemon_status_report(base: &Path) -> DaemonStatusReport {
@@ -416,6 +628,16 @@ fn parse_daemon_stop_options(
     Ok((base, json, timeout))
 }
 
+fn parse_events_limit(value: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let limit = parse_u64_arg(value, "--limit")?;
+    if limit == 0 {
+        return Err("--limit must be greater than 0".into());
+    }
+    Ok(usize::try_from(limit)
+        .unwrap_or(usize::MAX)
+        .min(DAEMON_EVENT_JOURNAL_LIMIT))
+}
+
 fn print_daemon_started_text(status: &DaemonStatusReport) {
     println!(
         "Daemon started: base={} pid={} listen={}",
@@ -434,6 +656,29 @@ fn print_daemon_started_text(status: &DaemonStatusReport) {
     }
 }
 
+fn print_daemon_events_text(report: &DaemonEventsReport) {
+    println!("Daemon events: {}", report.base);
+    println!(
+        "daemon: running={} ipc_available={}",
+        report.status.running, report.status.ipc_available
+    );
+    println!(
+        "cursor: {} events={} limit={}",
+        report.journal.cursor,
+        report.journal.events.len(),
+        report.journal.limit
+    );
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+    }
+    for event in &report.journal.events {
+        println!(
+            "  #{} {} {} {}",
+            event.sequence, event.timestamp, event.kind, event.summary
+        );
+    }
+}
+
 fn print_daemon_status_text(status: &DaemonStatusReport) {
     println!("Daemon status: {}", status.base);
     println!("running: {}", status.running);
@@ -449,6 +694,16 @@ fn print_daemon_status_text(status: &DaemonStatusReport) {
     println!("state: {}", status.state_path);
     if let Some(error) = &status.error {
         println!("error: {error}");
+    }
+}
+
+fn empty_event_journal(base: &Path, cursor: u64, limit: usize) -> DaemonEventJournal {
+    DaemonEventJournal {
+        schema: "nexus.daemon_events.v1".into(),
+        base: base.display().to_string(),
+        cursor,
+        limit,
+        events: Vec::new(),
     }
 }
 
@@ -656,6 +911,7 @@ pub(crate) fn spawn_serve_control_socket(
     base: PathBuf,
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
+    event_journal: DaemonEventJournalHandle,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -671,8 +927,9 @@ pub(crate) fn spawn_serve_control_socket(
             };
             let base = base.clone();
             let shutdown_tx = shutdown_tx.clone();
+            let event_journal = event_journal.clone();
             tokio::spawn(async move {
-                handle_control_stream(stream, base, shutdown_tx).await;
+                handle_control_stream(stream, base, shutdown_tx, event_journal).await;
             });
         }
     });
@@ -684,6 +941,7 @@ pub(crate) fn spawn_serve_control_socket(
     _base: PathBuf,
     _socket_path: PathBuf,
     _shutdown_tx: watch::Sender<bool>,
+    _event_journal: DaemonEventJournalHandle,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     Err("daemon control socket is unsupported on this platform".into())
 }
@@ -693,6 +951,7 @@ async fn handle_control_stream(
     mut stream: UnixStream,
     base: PathBuf,
     shutdown_tx: watch::Sender<bool>,
+    event_journal: DaemonEventJournalHandle,
 ) {
     let response = match read_control_request(&mut stream).await {
         Ok(request) => match request.command.as_str() {
@@ -700,18 +959,28 @@ async fn handle_control_stream(
                 ok: true,
                 shutdown: false,
                 status: daemon_control_status(&base),
+                events: None,
                 error: None,
             },
             "shutdown" => DaemonControlResponse {
                 ok: true,
                 shutdown: true,
                 status: daemon_control_status(&base),
+                events: None,
+                error: None,
+            },
+            "events" => DaemonControlResponse {
+                ok: true,
+                shutdown: false,
+                status: daemon_control_status(&base),
+                events: Some(event_journal.snapshot(&base, request.since, request.limit)),
                 error: None,
             },
             other => DaemonControlResponse {
                 ok: false,
                 shutdown: false,
                 status: daemon_control_status(&base),
+                events: None,
                 error: Some(format!("unknown daemon control command: {other}")),
             },
         },
@@ -719,6 +988,7 @@ async fn handle_control_stream(
             ok: false,
             shutdown: false,
             status: daemon_control_status(&base),
+            events: None,
             error: Some(error.to_string()),
         },
     };
@@ -760,16 +1030,29 @@ fn query_control_socket(
     socket_path: &Path,
     command: &str,
 ) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
+    query_control_socket_request(
+        socket_path,
+        &DaemonControlRequest {
+            command: command.to_string(),
+            since: None,
+            limit: None,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn query_control_socket_request(
+    socket_path: &Path,
+    request: &DaemonControlRequest,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
     stream.set_read_timeout(Some(DAEMON_CONTROL_TIMEOUT))?;
     stream.set_write_timeout(Some(DAEMON_CONTROL_TIMEOUT))?;
-    let request = serde_json::to_vec(&DaemonControlRequest {
-        command: command.to_string(),
-    })?;
-    if request.len() > DAEMON_CONTROL_REQUEST_MAX_BYTES {
+    let data = serde_json::to_vec(request)?;
+    if data.len() > DAEMON_CONTROL_REQUEST_MAX_BYTES {
         return Err("daemon control request is too large".into());
     }
-    stream.write_all(&request)?;
+    stream.write_all(&data)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut reader = stream.take(DAEMON_CONTROL_RESPONSE_MAX_BYTES + 1);
     let mut response = Vec::new();
@@ -784,6 +1067,14 @@ fn query_control_socket(
 fn query_control_socket(
     _socket_path: &Path,
     _command: &str,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
+    Err("daemon control socket is unsupported on this platform".into())
+}
+
+#[cfg(not(unix))]
+fn query_control_socket_request(
+    _socket_path: &Path,
+    _request: &DaemonControlRequest,
 ) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
     Err("daemon control socket is unsupported on this platform".into())
 }
@@ -842,6 +1133,57 @@ mod tests {
         assert!(status.error.is_some());
     }
 
+    #[test]
+    fn daemon_events_limit_is_positive_and_clamped() {
+        assert_eq!(parse_events_limit("1").unwrap(), 1);
+        assert_eq!(
+            parse_events_limit(&(DAEMON_EVENT_JOURNAL_LIMIT + 1).to_string()).unwrap(),
+            DAEMON_EVENT_JOURNAL_LIMIT
+        );
+        assert!(parse_events_limit("0")
+            .unwrap_err()
+            .to_string()
+            .contains("greater than 0"));
+    }
+
+    #[test]
+    fn event_journal_is_bounded_and_cursor_filtered() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let journal = DaemonEventJournalHandle::new();
+
+        for index in 1..=300 {
+            journal.push("test_event", format!("event {index}"));
+        }
+
+        let latest = journal.snapshot(temp.path(), None, Some(3));
+        assert_eq!(latest.schema, "nexus.daemon_events.v1");
+        assert_eq!(latest.cursor, 300);
+        assert_eq!(latest.limit, 3);
+        assert_eq!(
+            latest
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![298, 299, 300]
+        );
+
+        let since = journal.snapshot(temp.path(), Some(299), Some(10));
+        assert_eq!(since.cursor, 300);
+        assert_eq!(since.events.len(), 1);
+        assert_eq!(since.events[0].summary, "event 300");
+
+        let empty = journal.snapshot(temp.path(), Some(300), Some(10));
+        assert_eq!(empty.cursor, 300);
+        assert!(empty.events.is_empty());
+
+        let clamped = journal.snapshot(temp.path(), None, Some(usize::MAX));
+        assert_eq!(clamped.limit, DAEMON_EVENT_JOURNAL_LIMIT);
+        assert_eq!(clamped.events.len(), DAEMON_EVENT_JOURNAL_LIMIT);
+        assert_eq!(clamped.events[0].sequence, 45);
+        assert_eq!(clamped.events.last().unwrap().sequence, 300);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn control_socket_reports_status_and_shutdown() {
@@ -862,9 +1204,16 @@ mod tests {
         };
         save_daemon_record(temp.path(), &record).unwrap();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let handle =
-            spawn_serve_control_socket(temp.path().to_path_buf(), socket.clone(), shutdown_tx)
-                .unwrap();
+        let event_journal = DaemonEventJournalHandle::new();
+        event_journal.push("peer_connected", "peer_connected peer=first");
+        event_journal.push("social_event", "social_event source=peer events=1 agents=1");
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket.clone(),
+            shutdown_tx,
+            event_journal,
+        )
+        .unwrap();
 
         let status_socket = socket.clone();
         let status = tokio::task::spawn_blocking(move || {
@@ -877,6 +1226,32 @@ mod tests {
         assert!(!status.shutdown);
         assert!(status.status.running);
         assert!(status.status.ipc_available);
+        assert!(status.events.is_none());
+
+        let events_socket = socket.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            query_control_socket_request(
+                &events_socket,
+                &DaemonControlRequest {
+                    command: "events".into(),
+                    since: Some(1),
+                    limit: Some(10),
+                },
+            )
+            .map_err(|err| err.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(events.ok);
+        assert!(!events.shutdown);
+        let events = events
+            .events
+            .expect("events response should include journal");
+        assert_eq!(events.cursor, 2);
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].sequence, 2);
+        assert_eq!(events.events[0].kind, "social_event");
 
         let shutdown_socket = socket.clone();
         let shutdown = tokio::task::spawn_blocking(move || {
