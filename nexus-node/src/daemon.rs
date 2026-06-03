@@ -109,7 +109,7 @@ struct DaemonControlResponse {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct DaemonAgentDiscoverResponse {
+pub(crate) struct DaemonAgentDiscoveryResponse {
     pub(crate) status: DaemonStatusReport,
     pub(crate) workspaces: Vec<DiscoveredWorkspaceView>,
     pub(crate) cached_announcements: usize,
@@ -1000,7 +1000,9 @@ async fn handle_control_stream(
                 cached_announcements: None,
                 error: None,
             },
-            "agent_discover" => daemon_control_agent_discover_response(&base, request),
+            "agent_discover" | "agent_sync" => {
+                daemon_control_agent_discovery_response(&base, request)
+            }
             other => DaemonControlResponse {
                 ok: false,
                 shutdown: false,
@@ -1032,7 +1034,7 @@ async fn handle_control_stream(
     }
 }
 
-fn daemon_control_agent_discover_response(
+fn daemon_control_agent_discovery_response(
     base: &Path,
     request: DaemonControlRequest,
 ) -> DaemonControlResponse {
@@ -1104,7 +1106,22 @@ fn query_control_socket(
 pub(crate) fn daemon_agent_discover(
     base: &Path,
     filter: DiscoveryFilter,
-) -> Result<DaemonAgentDiscoverResponse, Box<dyn std::error::Error>> {
+) -> Result<DaemonAgentDiscoveryResponse, Box<dyn std::error::Error>> {
+    daemon_agent_discovery(base, "agent_discover", filter)
+}
+
+pub(crate) fn daemon_agent_sync(
+    base: &Path,
+    filter: DiscoveryFilter,
+) -> Result<DaemonAgentDiscoveryResponse, Box<dyn std::error::Error>> {
+    daemon_agent_discovery(base, "agent_sync", filter)
+}
+
+fn daemon_agent_discovery(
+    base: &Path,
+    command: &str,
+    filter: DiscoveryFilter,
+) -> Result<DaemonAgentDiscoveryResponse, Box<dyn std::error::Error>> {
     let status = daemon_status_report(base);
     let Some(socket) = status.control_socket.as_deref() else {
         return Err("daemon control socket is not available".into());
@@ -1116,7 +1133,7 @@ pub(crate) fn daemon_agent_discover(
     let response = query_control_socket_request(
         Path::new(socket),
         &DaemonControlRequest {
-            command: "agent_discover".into(),
+            command: command.into(),
             since: None,
             limit: None,
             discovery_filter: Some(filter),
@@ -1125,10 +1142,10 @@ pub(crate) fn daemon_agent_discover(
     if !response.ok {
         return Err(response
             .error
-            .unwrap_or_else(|| "daemon agent discover request failed".into())
+            .unwrap_or_else(|| format!("daemon {command} request failed"))
             .into());
     }
-    Ok(DaemonAgentDiscoverResponse {
+    Ok(DaemonAgentDiscoveryResponse {
         status: response.status,
         workspaces: response.discovered_workspaces.unwrap_or_default(),
         cached_announcements: response.cached_announcements.unwrap_or(0),
@@ -1375,6 +1392,35 @@ mod tests {
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].workspace, workspace.to_string());
         assert!(workspaces[0].clone_ready);
+
+        let sync_socket = socket.clone();
+        let workspace_filter = workspace.to_string();
+        let sync = tokio::task::spawn_blocking(move || {
+            query_control_socket_request(
+                &sync_socket,
+                &DaemonControlRequest {
+                    command: "agent_sync".into(),
+                    since: None,
+                    limit: None,
+                    discovery_filter: Some(DiscoveryFilter {
+                        workspace: Some(workspace_filter),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .map_err(|err| err.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(sync.ok);
+        assert!(!sync.shutdown);
+        assert_eq!(sync.cached_announcements, Some(1));
+        let workspaces = sync
+            .discovered_workspaces
+            .expect("agent sync response should include workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace, workspace.to_string());
 
         let events_socket = socket.clone();
         let events = tokio::task::spawn_blocking(move || {

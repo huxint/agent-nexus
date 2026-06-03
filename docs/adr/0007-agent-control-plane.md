@@ -75,9 +75,11 @@ recording, then returns `nexus.agent_exec.v1`. It does not yet execute inside
 the daemon; daemon-backed exec routing is part of the pending IPC route.
 `agent sync` is the AI-facing sync planning verb. It reads local workspace
 metadata and cached workspace discovery, returns `nexus.agent_sync.v1`, and
-suggests explicit `clone`, `discover`, or daemon-start commands. It does not
-start a short-lived network node or create/decrypt identity; daemon-backed live
-sync remains part of the pending IPC route.
+suggests explicit `clone`, `discover`, or daemon-start commands. When daemon
+IPC is available it asks the base-scoped control socket for `agent_sync`
+discovery data, then builds the local plan from that daemon-side cache
+projection. It does not start a short-lived network node or create/decrypt
+identity; daemon-backed live sync remains part of the pending IPC route.
 
 Agent-owned JSON issues use a stable `AgentIssue` object with `kind`, `message`,
 and `suggested_command`, including cache read failures, local fallback delivery,
