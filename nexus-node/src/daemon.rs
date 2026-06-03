@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{parse_u64_arg, required_arg};
@@ -92,6 +92,8 @@ struct DaemonControlRequest {
     limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovery_filter: Option<DiscoveryFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_send: Option<DaemonAgentSendRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,7 +107,49 @@ struct DaemonControlResponse {
     discovered_workspaces: Option<Vec<DiscoveredWorkspaceView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cached_announcements: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_send: Option<DaemonAgentSendResponse>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSendRequest {
+    pub(crate) id: Option<String>,
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) task_id: Option<String>,
+    pub(crate) capability: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSendResponse {
+    pub(crate) event_id: String,
+    pub(crate) author: String,
+    pub(crate) seq: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) inserted: bool,
+    pub(crate) intent_id: String,
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) task_id: Option<String>,
+    pub(crate) capability: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) expires_at: Option<u64>,
+    pub(crate) live_broadcast: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum DaemonControlCommand {
+    AgentSend {
+        request: DaemonAgentSendRequest,
+        reply: oneshot::Sender<Result<DaemonAgentSendResponse, String>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,6 +158,12 @@ pub(crate) struct DaemonAgentDiscoveryResponse {
     pub(crate) workspaces: Vec<DiscoveredWorkspaceView>,
     pub(crate) cached_announcements: usize,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSendControlResponse {
+    pub(crate) status: DaemonStatusReport,
+    pub(crate) send: DaemonAgentSendResponse,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,6 +399,7 @@ pub(crate) fn daemon_events_report(
             since,
             limit: Some(effective_limit),
             discovery_filter: None,
+            agent_send: None,
         },
     ) {
         Ok(response) if response.ok => DaemonEventsReport {
@@ -930,6 +981,7 @@ pub(crate) fn spawn_serve_control_socket(
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     event_journal: DaemonEventJournalHandle,
+    control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -946,8 +998,9 @@ pub(crate) fn spawn_serve_control_socket(
             let base = base.clone();
             let shutdown_tx = shutdown_tx.clone();
             let event_journal = event_journal.clone();
+            let control_tx = control_tx.clone();
             tokio::spawn(async move {
-                handle_control_stream(stream, base, shutdown_tx, event_journal).await;
+                handle_control_stream(stream, base, shutdown_tx, event_journal, control_tx).await;
             });
         }
     });
@@ -960,6 +1013,7 @@ pub(crate) fn spawn_serve_control_socket(
     _socket_path: PathBuf,
     _shutdown_tx: watch::Sender<bool>,
     _event_journal: DaemonEventJournalHandle,
+    _control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     Err("daemon control socket is unsupported on this platform".into())
 }
@@ -970,6 +1024,7 @@ async fn handle_control_stream(
     base: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     event_journal: DaemonEventJournalHandle,
+    control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
 ) {
     let response = match read_control_request(&mut stream).await {
         Ok(request) => match request.command.as_str() {
@@ -980,6 +1035,7 @@ async fn handle_control_stream(
                 events: None,
                 discovered_workspaces: None,
                 cached_announcements: None,
+                agent_send: None,
                 error: None,
             },
             "shutdown" => DaemonControlResponse {
@@ -989,6 +1045,7 @@ async fn handle_control_stream(
                 events: None,
                 discovered_workspaces: None,
                 cached_announcements: None,
+                agent_send: None,
                 error: None,
             },
             "events" => DaemonControlResponse {
@@ -998,11 +1055,13 @@ async fn handle_control_stream(
                 events: Some(event_journal.snapshot(&base, request.since, request.limit)),
                 discovered_workspaces: None,
                 cached_announcements: None,
+                agent_send: None,
                 error: None,
             },
             "agent_discover" | "agent_sync" => {
                 daemon_control_agent_discovery_response(&base, request)
             }
+            "agent_send" => daemon_control_agent_send_response(&base, request, control_tx).await,
             other => DaemonControlResponse {
                 ok: false,
                 shutdown: false,
@@ -1010,6 +1069,7 @@ async fn handle_control_stream(
                 events: None,
                 discovered_workspaces: None,
                 cached_announcements: None,
+                agent_send: None,
                 error: Some(format!("unknown daemon control command: {other}")),
             },
         },
@@ -1020,6 +1080,7 @@ async fn handle_control_stream(
             events: None,
             discovered_workspaces: None,
             cached_announcements: None,
+            agent_send: None,
             error: Some(error.to_string()),
         },
     };
@@ -1050,6 +1111,7 @@ fn daemon_control_agent_discovery_response(
                 events: None,
                 discovered_workspaces: Some(discovered_workspace_views(&announcements, &filter)),
                 cached_announcements: Some(cached_announcements),
+                agent_send: None,
                 error: None,
             }
         }
@@ -1060,7 +1122,104 @@ fn daemon_control_agent_discovery_response(
             events: None,
             discovered_workspaces: None,
             cached_announcements: None,
+            agent_send: None,
             error: Some(format!("read discovery cache: {error}")),
+        },
+    }
+}
+
+async fn daemon_control_agent_send_response(
+    base: &Path,
+    request: DaemonControlRequest,
+    control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
+) -> DaemonControlResponse {
+    let status = daemon_control_status(base);
+    let Some(agent_send) = request.agent_send else {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some("agent_send request payload is required".into()),
+        };
+    };
+    let Some(control_tx) = control_tx else {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some("daemon serve-loop command channel is unavailable".into()),
+        };
+    };
+
+    let (reply, reply_rx) = oneshot::channel();
+    if control_tx
+        .send(DaemonControlCommand::AgentSend {
+            request: agent_send,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some("daemon serve-loop command channel is closed".into()),
+        };
+    }
+
+    match tokio::time::timeout(DAEMON_CONTROL_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(agent_send))) => DaemonControlResponse {
+            ok: true,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: Some(agent_send),
+            error: None,
+        },
+        Ok(Ok(Err(error))) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some(error),
+        },
+        Ok(Err(_)) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some("daemon serve-loop dropped agent_send response".into()),
+        },
+        Err(_) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            error: Some("daemon agent_send request timed out".into()),
         },
     }
 }
@@ -1068,7 +1227,7 @@ fn daemon_control_agent_discovery_response(
 #[cfg(unix)]
 async fn read_control_request(
     stream: &mut UnixStream,
-) -> Result<DaemonControlRequest, Box<dyn std::error::Error>> {
+) -> Result<DaemonControlRequest, Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = vec![0u8; DAEMON_CONTROL_REQUEST_MAX_BYTES + 1];
     let bytes_read = stream.read(&mut buffer).await?;
     if bytes_read == 0 {
@@ -1099,6 +1258,7 @@ fn query_control_socket(
             since: None,
             limit: None,
             discovery_filter: None,
+            agent_send: None,
         },
     )
 }
@@ -1137,6 +1297,7 @@ fn daemon_agent_discovery(
             since: None,
             limit: None,
             discovery_filter: Some(filter),
+            agent_send: None,
         },
     )?;
     if !response.ok {
@@ -1150,6 +1311,43 @@ fn daemon_agent_discovery(
         workspaces: response.discovered_workspaces.unwrap_or_default(),
         cached_announcements: response.cached_announcements.unwrap_or(0),
         error: response.error,
+    })
+}
+
+pub(crate) fn daemon_agent_send(
+    base: &Path,
+    request: DaemonAgentSendRequest,
+) -> Result<DaemonAgentSendControlResponse, Box<dyn std::error::Error>> {
+    let status = daemon_status_report(base);
+    let Some(socket) = status.control_socket.as_deref() else {
+        return Err("daemon control socket is not available".into());
+    };
+    if !status.running {
+        return Err("daemon is not running".into());
+    }
+
+    let response = query_control_socket_request(
+        Path::new(socket),
+        &DaemonControlRequest {
+            command: "agent_send".into(),
+            since: None,
+            limit: None,
+            discovery_filter: None,
+            agent_send: Some(request),
+        },
+    )?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "daemon agent_send request failed".into())
+            .into());
+    }
+    let send = response
+        .agent_send
+        .ok_or("daemon agent_send response did not include send result")?;
+    Ok(DaemonAgentSendControlResponse {
+        status: response.status,
+        send,
     })
 }
 
@@ -1331,6 +1529,7 @@ mod tests {
             socket.clone(),
             shutdown_tx,
             event_journal,
+            None,
         )
         .unwrap();
 
@@ -1376,6 +1575,7 @@ mod tests {
                         clone_ready_only: true,
                         ..Default::default()
                     }),
+                    agent_send: None,
                 },
             )
             .map_err(|err| err.to_string())
@@ -1406,6 +1606,7 @@ mod tests {
                         workspace: Some(workspace_filter),
                         ..Default::default()
                     }),
+                    agent_send: None,
                 },
             )
             .map_err(|err| err.to_string())
@@ -1431,6 +1632,7 @@ mod tests {
                     since: Some(1),
                     limit: Some(10),
                     discovery_filter: None,
+                    agent_send: None,
                 },
             )
             .map_err(|err| err.to_string())
