@@ -16,6 +16,7 @@
 //!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
 //!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
+//!   nexus-node agent exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] [--note <text>] [--json] -- <command> [args...]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -132,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "bootstrap" => cmd_bootstrap(&args)?,
         "network" => cmd_network(&args).await?,
         "daemon" => cmd_daemon(&args)?,
-        "agent" => cmd_agent(&args)?,
+        "agent" => cmd_agent(&args).await?,
         "identity" => cmd_identity(&args)?,
         "society" => cmd_society(&args)?,
         "social-memory" | "memory" => cmd_social_memory(&args)?,
@@ -172,6 +173,7 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>] [--json]"
     );
+    eprintln!("  {prog} agent exec --base <DIR> --workspace <PATH> [--isolation auto|native|bubblewrap] [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] [--json] -- <CMD> [ARG...]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
@@ -634,7 +636,57 @@ fn clone_snapshot_note(peer: libp2p::PeerId, fork_roots: &[String]) -> String {
 // exec
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceExecOptions {
+    pub base: PathBuf,
+    pub workspace_path: PathBuf,
+    pub note: Option<String>,
+    pub exec_options: ExecOptions,
+    pub isolation_explicit: bool,
+    pub command: String,
+    pub command_args: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceExecReport {
+    pub workspace_path: PathBuf,
+    pub workspace: WorkspaceId,
+    pub actor: Did,
+    pub command: String,
+    pub args: Vec<String>,
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_cid: Cid,
+    pub stderr_cid: Cid,
+    pub output_root: Cid,
+    pub resources: ResourceUsage,
+    pub context: Option<WorkspaceRunContext>,
+    pub started_at: u64,
+    pub finished_at: u64,
+}
+
 async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (options, json) = parse_workspace_exec_options(args, 2, false)?;
+    debug_assert!(!json);
+    let report = run_workspace_exec(options).await?;
+
+    print!("{}", String::from_utf8_lossy(&report.stdout));
+    eprint!("{}", String::from_utf8_lossy(&report.stderr));
+    println!(
+        "\nRecorded workspace run: workspace={} root={} exit={}",
+        report.workspace,
+        hex::encode(report.output_root.as_bytes()),
+        report.exit_code
+    );
+    Ok(())
+}
+
+pub(crate) fn parse_workspace_exec_options(
+    args: &[String],
+    start: usize,
+    allow_json: bool,
+) -> Result<(WorkspaceExecOptions, bool), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut workspace_path = None;
     let mut note = None;
@@ -642,7 +694,8 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut isolation_explicit = false;
     let mut stdin_source = None::<&'static str>;
     let mut command_start = None;
-    let mut i = 2;
+    let mut json = false;
+    let mut i = start;
     while i < args.len() {
         match args[i].as_str() {
             "--base" => {
@@ -696,6 +749,9 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 exec_options.isolation = ExecIsolation::Native;
                 isolation_explicit = true;
             }
+            "--json" if allow_json => {
+                json = true;
+            }
             "--" => {
                 command_start = Some(i + 1);
                 break;
@@ -718,18 +774,48 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let command_args = args[command_start + 1..].to_vec();
     let workspace_path = workspace_path.ok_or("--workspace required")?;
-    let identity = load_or_create_identity(&base)?;
-    let memory_path = base.join(".nexus-social-memory.json");
+
+    Ok((
+        WorkspaceExecOptions {
+            base,
+            workspace_path,
+            note,
+            exec_options,
+            isolation_explicit,
+            command,
+            command_args,
+        },
+        json,
+    ))
+}
+
+pub(crate) async fn run_workspace_exec(
+    mut options: WorkspaceExecOptions,
+) -> Result<WorkspaceExecReport, Box<dyn std::error::Error>> {
+    let identity = load_or_create_identity(&options.base)?;
+    let memory_path = options.base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
-    let mut workspace = Workspace::load(&identity, &workspace_path).await?;
-    register_workspace_path(&base, workspace.root_dir())?;
-    apply_default_exec_isolation(&identity, &workspace, &mut exec_options, isolation_explicit);
+    let mut workspace = Workspace::load(&identity, &options.workspace_path).await?;
+    register_workspace_path(&options.base, workspace.root_dir())?;
+    apply_default_exec_isolation(
+        &identity,
+        &workspace,
+        &mut options.exec_options,
+        options.isolation_explicit,
+    );
 
     let started_at = unix_now();
-    let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let context = workspace_run_context_from_exec_options(&exec_options);
+    let arg_refs = options
+        .command_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let context = workspace_run_context_from_exec_options(&options.exec_options);
     let wall_start = Instant::now();
-    let output = match workspace.exec(&command, &arg_refs, &exec_options).await {
+    let output = match workspace
+        .exec(&options.command, &arg_refs, &options.exec_options)
+        .await
+    {
         Ok(output) => output,
         Err(err) => {
             let wall_time = wall_start.elapsed();
@@ -738,8 +824,8 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let run = WorkspaceRun {
                 workspace: workspace.id(),
                 actor: identity.did().clone(),
-                command: command.clone(),
-                args: command_args.clone(),
+                command: options.command.clone(),
+                args: options.command_args.clone(),
                 exit_code: -1,
                 stdout: workspace_run_failure_stdout(&err),
                 stderr: workspace_run_failure_stderr(&err),
@@ -749,7 +835,7 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 failure: Some(workspace_run_failure_from_error(&err)),
                 started_at,
                 finished_at,
-                note: note.clone(),
+                note: options.note.clone(),
             };
             match memory.sign_event(
                 &identity,
@@ -770,29 +856,31 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let finished_at = unix_now().max(started_at);
     let output_root = workspace.snapshot().await?;
+    let stdout_cid = Cid::hash_of(&output.stdout);
+    let stderr_cid = Cid::hash_of(&output.stderr);
 
     let run = WorkspaceRun {
         workspace: workspace.id(),
         actor: identity.did().clone(),
-        command: command.clone(),
-        args: command_args.clone(),
+        command: options.command.clone(),
+        args: options.command_args.clone(),
         exit_code: output.exit_code,
-        stdout: Cid::hash_of(&output.stdout),
-        stderr: Cid::hash_of(&output.stderr),
+        stdout: stdout_cid,
+        stderr: stderr_cid,
         output_root: Some(output_root),
         resources: output.resources.clone(),
-        context,
+        context: context.clone(),
         failure: None,
         started_at,
         finished_at,
-        note: note.clone(),
+        note: options.note.clone(),
     };
     let snapshot = WorkspaceSnapshot {
         workspace: workspace.id(),
         actor: identity.did().clone(),
         root: output_root,
-        label: Some(format!("after:{command}")),
-        note,
+        label: Some(format!("after:{}", options.command)),
+        note: options.note.clone(),
         timestamp: finished_at,
     };
 
@@ -811,15 +899,23 @@ async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     record_social_events(&memory_path, &mut memory, events)?;
 
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    println!(
-        "\nRecorded workspace run: workspace={} root={} exit={}",
-        workspace.id(),
-        hex::encode(output_root.as_bytes()),
-        output.exit_code
-    );
-    Ok(())
+    Ok(WorkspaceExecReport {
+        workspace_path: options.workspace_path,
+        workspace: workspace.id(),
+        actor: identity.did().clone(),
+        command: options.command,
+        args: options.command_args,
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        stdout_cid,
+        stderr_cid,
+        output_root,
+        resources: output.resources,
+        context,
+        started_at,
+        finished_at,
+    })
 }
 
 // ---------------------------------------------------------------------------

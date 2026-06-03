@@ -39,6 +39,7 @@ nexus-node agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite 
 nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]
 nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 nexus-node agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--json]
+nexus-node agent exec --base <DIR> --workspace <PATH> [--json] -- <CMD> [ARG...]
 ```
 
 `agent status` reports existing identity metadata, local workspace metadata,
@@ -57,7 +58,11 @@ still use top-level `discover --lan` or `discover --global` until daemon-backed
 routing owns refreshes. `agent send` writes a signed intent/status social event
 to local social memory and returns `nexus.agent_send.v1` delivery metadata. It
 does not yet inject the event into a running daemon; daemon-backed live send is
-part of the pending IPC route.
+part of the pending IPC route. `agent exec` is the short-command entry point for
+free workspace execution. It reuses the existing `exec` semantics for process
+execution, output capture, workspace snapshotting, and signed social-memory
+recording, then returns `nexus.agent_exec.v1`. It does not yet execute inside
+the daemon; daemon-backed exec routing is part of the pending IPC route.
 
 The initial daemon lifecycle commands are:
 
