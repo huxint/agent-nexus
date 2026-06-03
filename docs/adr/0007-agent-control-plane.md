@@ -76,6 +76,11 @@ suggests explicit `clone`, `discover`, or daemon-start commands. It does not
 start a short-lived network node or create/decrypt identity; daemon-backed live
 sync remains part of the pending IPC route.
 
+Agent-owned JSON issues use a stable `AgentIssue` object with `kind`, `message`,
+and `suggested_command`, including cache read failures, local fallback delivery,
+and daemon IPC pending states. Nested expert daemon reports keep their own
+schemas until daemon-routed agent IPC replaces the remaining local fallbacks.
+
 The initial daemon lifecycle commands are:
 
 ```text

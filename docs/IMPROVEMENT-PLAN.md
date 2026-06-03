@@ -436,7 +436,7 @@
 - [ ] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
 - [x] daemon 不存在时，`agent discover` 读 discovery cache 并给出显式联网刷新提示；不启动网络、不创建身份、不解密私钥。
 - [ ] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。
-- [ ] 输出 JSON schema 稳定，错误包含 `kind`、`message`、`suggested_command`。
+- [x] 输出 JSON schema 稳定，错误包含 `kind`、`message`、`suggested_command`。
 **完成判据**：常用 agent 流程不需要手写 `--listen`、`--bootstrap`、`--invite`，除非用户要覆盖默认网络策略。
 **依赖**：`UX2`。
 **涉及**：`nexus-node/src/agent_status.rs`、后续 `agent_control` 模块。
