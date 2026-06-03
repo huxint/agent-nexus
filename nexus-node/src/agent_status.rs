@@ -13,7 +13,10 @@ use nexus_storage::Cid;
 
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
-use crate::daemon::{daemon_status_report, start_daemon, DaemonStartOptions, DaemonStatusReport};
+use crate::daemon::{
+    daemon_events_report, daemon_status_report, start_daemon, DaemonEvent, DaemonEventJournal,
+    DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
+};
 use crate::discovery::{
     discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
     DiscoverySort,
@@ -116,6 +119,7 @@ pub(crate) struct AgentInboxReport {
     agent: Option<String>,
     generated_at: u64,
     daemon: DaemonStatusReport,
+    daemon_events: DaemonEventsReport,
     summary: AgentInboxSummary,
     items: Vec<AgentInboxItem>,
     recommended_commands: Vec<CommandHint>,
@@ -125,6 +129,7 @@ pub(crate) struct AgentInboxReport {
 struct AgentInboxSummary {
     items: usize,
     daemon_alerts: usize,
+    daemon_events: usize,
     intent_recommendations: usize,
     open_tasks: usize,
     assigned_tasks: usize,
@@ -958,51 +963,58 @@ pub(crate) fn agent_inbox_report(
     since: Option<u64>,
 ) -> AgentInboxReport {
     let generated_at = unix_now();
-    let daemon = daemon_status_report(base);
+    let daemon_events = daemon_events_report(base, since, Some(limit));
+    let daemon = daemon_events.status.clone();
     let resolved_agent = requested_agent.or_else(|| identity_status(base).did.map(Did::new));
     let mut items = Vec::new();
+    let daemon_delta_mode = since.is_some() && daemon_events_are_live(&daemon_events);
 
     push_daemon_inbox_items(base, &daemon, generated_at, &mut items);
+    push_daemon_event_items(base, &daemon_events.journal, &mut items);
 
-    let memory_path = base.join(".nexus-social-memory.json");
-    match load_social_memory(&memory_path) {
-        Ok(memory) => {
-            if let Some(agent) = resolved_agent.as_ref() {
-                push_intent_recommendation_items(
-                    base,
-                    &memory,
-                    agent,
-                    limit,
-                    generated_at,
-                    &mut items,
-                );
+    if !daemon_delta_mode {
+        let memory_path = base.join(".nexus-social-memory.json");
+        match load_social_memory(&memory_path) {
+            Ok(memory) => {
+                if let Some(agent) = resolved_agent.as_ref() {
+                    push_intent_recommendation_items(
+                        base,
+                        &memory,
+                        agent,
+                        limit,
+                        generated_at,
+                        &mut items,
+                    );
+                }
+                push_task_items(base, &memory, resolved_agent.as_ref(), &mut items);
             }
-            push_task_items(base, &memory, resolved_agent.as_ref(), &mut items);
+            Err(error) => items.push(AgentInboxItem {
+                kind: "social_memory_error",
+                priority: 85,
+                title: "Social memory is unreadable".into(),
+                body: Some(format!("{}: {error}", memory_path.display())),
+                author: None,
+                workspace: None,
+                task_id: None,
+                capability: None,
+                timestamp: Some(generated_at),
+                score: None,
+                reasons: vec!["social-memory-read-error".into()],
+                actions: Vec::new(),
+                command_hint: Some(format!(
+                    "nexus-node agent status --base {} --json",
+                    base.display()
+                )),
+            }),
         }
-        Err(error) => items.push(AgentInboxItem {
-            kind: "social_memory_error",
-            priority: 85,
-            title: "Social memory is unreadable".into(),
-            body: Some(format!("{}: {error}", memory_path.display())),
-            author: None,
-            workspace: None,
-            task_id: None,
-            capability: None,
-            timestamp: Some(generated_at),
-            score: None,
-            reasons: vec!["social-memory-read-error".into()],
-            actions: Vec::new(),
-            command_hint: Some(format!(
-                "nexus-node agent status --base {} --json",
-                base.display()
-            )),
-        }),
+
+        push_discovered_workspace_items(base, &mut items);
     }
 
-    push_discovered_workspace_items(base, &mut items);
-
-    if let Some(cursor) = since {
-        items.retain(|item| item.timestamp.is_none_or(|timestamp| timestamp > cursor));
+    if !daemon_delta_mode {
+        if let Some(cursor) = since {
+            items.retain(|item| item.timestamp.is_none_or(|timestamp| timestamp > cursor));
+        }
     }
     sort_inbox_items(&mut items);
     items.truncate(limit);
@@ -1014,6 +1026,7 @@ pub(crate) fn agent_inbox_report(
         agent: resolved_agent.as_ref().map(ToString::to_string),
         generated_at,
         daemon,
+        daemon_events,
         summary,
         items,
         recommended_commands: inbox_recommended_commands(base),
@@ -1475,6 +1488,57 @@ fn push_daemon_inbox_items(
     }
 }
 
+fn daemon_events_are_live(report: &DaemonEventsReport) -> bool {
+    report.error.is_none()
+        && report.status.running
+        && report.status.ipc_available
+        && report.status.control_socket.is_some()
+}
+
+fn push_daemon_event_items(
+    base: &Path,
+    journal: &DaemonEventJournal,
+    items: &mut Vec<AgentInboxItem>,
+) {
+    for event in &journal.events {
+        items.push(daemon_event_item(base, event));
+    }
+}
+
+fn daemon_event_item(base: &Path, event: &DaemonEvent) -> AgentInboxItem {
+    AgentInboxItem {
+        kind: "daemon_event",
+        priority: daemon_event_priority(&event.kind),
+        title: format!("Daemon event: {}", event.kind),
+        body: Some(event.summary.clone()),
+        author: None,
+        workspace: None,
+        task_id: None,
+        capability: None,
+        timestamp: Some(event.timestamp),
+        score: None,
+        reasons: vec![format!("daemon-event-sequence:{}", event.sequence)],
+        actions: Vec::new(),
+        command_hint: Some(format!(
+            "nexus-node agent inbox --base {} --since {} --json",
+            base.display(),
+            event.sequence
+        )),
+    }
+}
+
+fn daemon_event_priority(kind: &str) -> u32 {
+    match kind {
+        "social_event" => 84,
+        "workspace_snapshot_changed" => 82,
+        "workspace_announcement" => 78,
+        "sync_request" => 68,
+        "peer_connected" | "peer_disconnected" => 62,
+        "listening" => 58,
+        _ => 54,
+    }
+}
+
 fn push_intent_recommendation_items(
     base: &Path,
     memory: &SocialMemory,
@@ -1876,6 +1940,7 @@ fn summarize_inbox_items(items: &[AgentInboxItem]) -> AgentInboxSummary {
     for item in items {
         match item.kind {
             "daemon_alert" => summary.daemon_alerts += 1,
+            "daemon_event" => summary.daemon_events += 1,
             "intent_recommendation" => summary.intent_recommendations += 1,
             "open_task" => summary.open_tasks += 1,
             "assigned_task" => summary.assigned_tasks += 1,
@@ -2355,13 +2420,21 @@ fn print_agent_inbox_text(report: &AgentInboxReport) {
         report.daemon.running, report.daemon.ipc_available
     );
     println!(
-        "items: {} daemon_alerts={} intents={} open_tasks={} assigned_tasks={} discovered_workspaces={}",
+        "items: {} daemon_alerts={} daemon_events={} intents={} open_tasks={} assigned_tasks={} discovered_workspaces={}",
         report.summary.items,
         report.summary.daemon_alerts,
+        report.summary.daemon_events,
         report.summary.intent_recommendations,
         report.summary.open_tasks,
         report.summary.assigned_tasks,
         report.summary.discovered_workspaces
+    );
+    println!(
+        "daemon_events: cursor={} events={} limit={} error={}",
+        report.daemon_events.journal.cursor,
+        report.daemon_events.journal.events.len(),
+        report.daemon_events.journal.limit,
+        report.daemon_events.error.as_deref().unwrap_or("-")
     );
     for item in &report.items {
         println!("  [{} p{}] {}", item.kind, item.priority, item.title);
@@ -2512,6 +2585,13 @@ mod tests {
         assert!(report.agent.is_none());
         assert!(!identity_path(temp.path()).exists());
         assert_eq!(report.summary.daemon_alerts, 1);
+        assert_eq!(report.summary.daemon_events, 0);
+        assert_eq!(report.daemon_events.journal.cursor, 0);
+        assert!(report.daemon_events.journal.events.is_empty());
+        assert_eq!(
+            report.daemon_events.error.as_deref(),
+            Some("daemon control socket is not available")
+        );
         assert!(report.items.iter().any(|item| {
             item.kind == "daemon_alert"
                 && item
@@ -2519,6 +2599,40 @@ mod tests {
                     .as_deref()
                     .is_some_and(|command| command.contains("nexus-node daemon start"))
         }));
+    }
+
+    #[test]
+    fn daemon_event_items_are_cursor_friendly() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let journal = DaemonEventJournal {
+            schema: "nexus.daemon_events.v1".into(),
+            base: temp.path().display().to_string(),
+            cursor: 42,
+            limit: 10,
+            events: vec![DaemonEvent {
+                sequence: 42,
+                timestamp: 1234,
+                kind: "workspace_snapshot_changed".into(),
+                summary: "workspace_snapshot_changed workspace=abc root=def".into(),
+            }],
+        };
+        let mut items = Vec::new();
+
+        push_daemon_event_items(temp.path(), &journal, &mut items);
+        let summary = summarize_inbox_items(&items);
+
+        assert_eq!(summary.items, 1);
+        assert_eq!(summary.daemon_events, 1);
+        assert_eq!(items[0].kind, "daemon_event");
+        assert_eq!(items[0].priority, 82);
+        assert_eq!(items[0].timestamp, Some(1234));
+        assert!(items[0]
+            .reasons
+            .contains(&"daemon-event-sequence:42".into()));
+        assert!(items[0]
+            .command_hint
+            .as_deref()
+            .is_some_and(|command| command.contains("--since 42")));
     }
 
     #[test]

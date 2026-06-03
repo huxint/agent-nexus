@@ -4,7 +4,7 @@
 //!   Agent control plane:
 //!   nexus-node agent status --base <dir> [--json]
 //!   nexus-node agent up --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--json]
-//!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
+//!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <cursor>] [--limit <n>] [--json]
 //!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
 //!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--json]
 //!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
@@ -157,7 +157,7 @@ fn print_usage(prog: &str) {
         "  {prog} agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]"
     );
     eprintln!(
-        "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]"
+        "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <CURSOR>] [--limit <N>] [--json]"
     );
     eprintln!(
         "  {prog} agent discover --base <DIR> [--json] [--sort <relevance|clone-ready|name|owner|latest>] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]"
