@@ -1,4 +1,6 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -28,6 +30,8 @@ use crate::{
     parse_workspace_exec_options, run_workspace_exec, unix_now, WorkspaceExecOptions,
     WorkspaceExecReport,
 };
+
+const DEFAULT_AGENT_WATCH_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct AgentStatusReport {
@@ -123,6 +127,27 @@ pub(crate) struct AgentInboxReport {
     summary: AgentInboxSummary,
     items: Vec<AgentInboxItem>,
     recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentWatchOptions {
+    base: PathBuf,
+    since: Option<u64>,
+    limit: usize,
+    interval: Duration,
+    json: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentWatchEvent {
+    schema: &'static str,
+    base: String,
+    generated_at: u64,
+    cursor: u64,
+    kind: &'static str,
+    daemon_event: Option<DaemonEvent>,
+    error: Option<String>,
+    command_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -369,13 +394,15 @@ pub(crate) async fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error:
         Some("status") | Some("context") => cmd_agent_status(args),
         Some("up") | Some("start") => cmd_agent_up(args),
         Some("inbox") => cmd_agent_inbox(args),
+        Some("watch") => cmd_agent_watch(args),
         Some("discover") => cmd_agent_discover(args),
         Some("send") => cmd_agent_send(args),
         Some("exec") | Some("run") => cmd_agent_exec(args).await,
         Some("sync") => cmd_agent_sync(args),
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
         None => Err(
-            "agent subcommand required: status, up, inbox, discover, send, exec, or sync".into(),
+            "agent subcommand required: status, up, inbox, watch, discover, send, exec, or sync"
+                .into(),
         ),
     }
 }
@@ -498,6 +525,155 @@ fn cmd_agent_inbox(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_agent_inbox_text(&report);
+    }
+    Ok(())
+}
+
+fn cmd_agent_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let options = parse_agent_watch_options(args)?;
+    run_agent_watch(&options)
+}
+
+fn parse_agent_watch_options(
+    args: &[String],
+) -> Result<AgentWatchOptions, Box<dyn std::error::Error>> {
+    let mut options = AgentWatchOptions {
+        base: PathBuf::from("."),
+        since: None,
+        limit: 50,
+        interval: DEFAULT_AGENT_WATCH_INTERVAL,
+        json: false,
+    };
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base" => {
+                i += 1;
+                options.base = PathBuf::from(required_arg(args, i, "--base")?);
+            }
+            "--json" => {
+                options.json = true;
+            }
+            "--since" => {
+                i += 1;
+                options.since = Some(parse_u64_arg(required_arg(args, i, "--since")?, "--since")?);
+            }
+            "--limit" => {
+                i += 1;
+                options.limit = parse_positive_usize_arg(required_arg(args, i, "--limit")?)?;
+            }
+            "--interval-ms" => {
+                i += 1;
+                options.interval = Duration::from_millis(parse_positive_u64_arg(
+                    required_arg(args, i, "--interval-ms")?,
+                    "--interval-ms",
+                )?);
+            }
+            other => return Err(format!("unknown agent watch option: {other}").into()),
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
+fn parse_positive_usize_arg(value: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let value = parse_usize_arg(value, "--limit")?;
+    if value == 0 {
+        return Err("--limit must be greater than 0".into());
+    }
+    Ok(value)
+}
+
+fn parse_positive_u64_arg(value: &str, flag: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let value = parse_u64_arg(value, flag)?;
+    if value == 0 {
+        return Err(format!("{flag} must be greater than 0").into());
+    }
+    Ok(value)
+}
+
+fn run_agent_watch(options: &AgentWatchOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cursor = options.since;
+    let mut last_error = None;
+    let mut stdout = io::stdout();
+    loop {
+        let report = daemon_events_report(&options.base, cursor, Some(options.limit));
+        for event in &report.journal.events {
+            let watch_event = agent_watch_daemon_event(&options.base, event);
+            write_agent_watch_event(&mut stdout, &watch_event, options.json)?;
+            cursor = Some(event.sequence);
+        }
+
+        if let Some(error) = report.error.clone() {
+            if last_error.as_deref() != Some(error.as_str()) {
+                let watch_event = agent_watch_error_event(
+                    &options.base,
+                    cursor.unwrap_or(report.journal.cursor),
+                    error,
+                );
+                write_agent_watch_event(&mut stdout, &watch_event, options.json)?;
+                last_error = watch_event.error.clone();
+            }
+        } else {
+            last_error = None;
+            cursor = Some(report.journal.cursor);
+        }
+        stdout.flush()?;
+        thread::sleep(options.interval);
+    }
+}
+
+fn agent_watch_daemon_event(base: &Path, event: &DaemonEvent) -> AgentWatchEvent {
+    AgentWatchEvent {
+        schema: "nexus.agent_watch_event.v1",
+        base: base.display().to_string(),
+        generated_at: unix_now(),
+        cursor: event.sequence,
+        kind: "daemon_event",
+        daemon_event: Some(event.clone()),
+        error: None,
+        command_hint: Some(format!(
+            "nexus-node agent inbox --base {} --since {} --json",
+            base.display(),
+            event.sequence
+        )),
+    }
+}
+
+fn agent_watch_error_event(base: &Path, cursor: u64, error: String) -> AgentWatchEvent {
+    AgentWatchEvent {
+        schema: "nexus.agent_watch_event.v1",
+        base: base.display().to_string(),
+        generated_at: unix_now(),
+        cursor,
+        kind: "watch_error",
+        daemon_event: None,
+        error: Some(error),
+        command_hint: Some(format!(
+            "nexus-node agent up --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1 --json",
+            base.display()
+        )),
+    }
+}
+
+fn write_agent_watch_event(
+    writer: &mut impl Write,
+    event: &AgentWatchEvent,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        writeln!(writer, "{}", serde_json::to_string(event)?)?;
+        return Ok(());
+    }
+
+    if let Some(daemon_event) = &event.daemon_event {
+        writeln!(
+            writer,
+            "#{} {} {} {}",
+            daemon_event.sequence, daemon_event.timestamp, daemon_event.kind, daemon_event.summary
+        )?;
+    } else if let Some(error) = &event.error {
+        writeln!(writer, "watch_error cursor={} {error}", event.cursor)?;
     }
     Ok(())
 }
@@ -2633,6 +2809,84 @@ mod tests {
             .command_hint
             .as_deref()
             .is_some_and(|command| command.contains("--since 42")));
+    }
+
+    #[test]
+    fn watch_options_parse_cursor_limit_and_interval() {
+        let options = parse_agent_watch_options(&[
+            "nexus-node".into(),
+            "agent".into(),
+            "watch".into(),
+            "--base".into(),
+            "/tmp/watch-base".into(),
+            "--since".into(),
+            "41".into(),
+            "--limit".into(),
+            "7".into(),
+            "--interval-ms".into(),
+            "250".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.base, PathBuf::from("/tmp/watch-base"));
+        assert_eq!(options.since, Some(41));
+        assert_eq!(options.limit, 7);
+        assert_eq!(options.interval, Duration::from_millis(250));
+        assert!(options.json);
+
+        assert!(parse_agent_watch_options(&[
+            "nexus-node".into(),
+            "agent".into(),
+            "watch".into(),
+            "--interval-ms".into(),
+            "0".into(),
+        ])
+        .unwrap_err()
+        .to_string()
+        .contains("greater than 0"));
+        assert!(parse_agent_watch_options(&[
+            "nexus-node".into(),
+            "agent".into(),
+            "watch".into(),
+            "--limit".into(),
+            "0".into(),
+        ])
+        .unwrap_err()
+        .to_string()
+        .contains("greater than 0"));
+    }
+
+    #[test]
+    fn watch_events_render_as_ndjson_and_text() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let daemon_event = DaemonEvent {
+            sequence: 9,
+            timestamp: 1234,
+            kind: "social_event".into(),
+            summary: "social_event source=peer events=3 agents=2".into(),
+        };
+        let watch_event = agent_watch_daemon_event(temp.path(), &daemon_event);
+        let mut json = Vec::new();
+
+        write_agent_watch_event(&mut json, &watch_event, true).unwrap();
+
+        assert_eq!(json.last(), Some(&b'\n'));
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["schema"], "nexus.agent_watch_event.v1");
+        assert_eq!(value["kind"], "daemon_event");
+        assert_eq!(value["cursor"], 9);
+        assert_eq!(value["daemon_event"]["kind"], "social_event");
+        assert!(value["command_hint"]
+            .as_str()
+            .is_some_and(|command| command.contains("--since 9")));
+
+        let error_event = agent_watch_error_event(temp.path(), 9, "daemon is not running".into());
+        let mut text = Vec::new();
+        write_agent_watch_event(&mut text, &error_event, false).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("watch_error cursor=9"));
+        assert!(text.contains("daemon is not running"));
     }
 
     #[test]
