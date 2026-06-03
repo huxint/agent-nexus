@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
 use nexus_agent::{
     AgentIntent, IntentActionKind, IntentActionPlan, IntentKind, IntentRecommendation,
-    SocialEventKind, SocialMemory, Task, TaskState,
+    SocialEventKind, SocialMemory, Task, TaskState, WorkspaceRunContext,
 };
 use nexus_core::Did;
+use nexus_runtime::ResourceUsage;
+use nexus_storage::Cid;
 
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
@@ -18,7 +21,10 @@ use crate::discovery::{
 use crate::ids::parse_workspace_id;
 use crate::local_state::{identity_path, load_or_create_identity, local_workspace_paths};
 use crate::social_sync::{load_social_memory, save_social_memory};
-use crate::unix_now;
+use crate::{
+    parse_workspace_exec_options, run_workspace_exec, unix_now, WorkspaceExecOptions,
+    WorkspaceExecReport,
+};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct AgentStatusReport {
@@ -173,6 +179,60 @@ pub(crate) struct AgentSendReport {
     recommended_commands: Vec<CommandHint>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct AgentExecReport {
+    schema: &'static str,
+    base: String,
+    daemon: DaemonStatusReport,
+    execution: AgentExecExecution,
+    delivery: AgentExecDelivery,
+    recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct AgentExecExecution {
+    workspace: String,
+    workspace_path: String,
+    actor: String,
+    command: String,
+    args: Vec<String>,
+    exit_code: i32,
+    stdout: AgentExecStream,
+    stderr: AgentExecStream,
+    output_root: String,
+    resources: AgentExecResources,
+    context: Option<WorkspaceRunContext>,
+    started_at: u64,
+    finished_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentExecStream {
+    bytes: usize,
+    cid: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentExecResources {
+    wall_time_ms: u64,
+    cpu_user_ms: u64,
+    cpu_kernel_ms: u64,
+    peak_memory: Option<u64>,
+    fs_read_bytes: u64,
+    fs_write_bytes: u64,
+    process_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentExecDelivery {
+    mode: &'static str,
+    local_memory: bool,
+    live_broadcast: bool,
+    issue: &'static str,
+    suggested_command: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct AgentSendEvent {
     id: String,
@@ -235,15 +295,16 @@ struct AgentInboxAction {
     command_hint: Option<String>,
 }
 
-pub(crate) fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn cmd_agent(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.get(2).map(String::as_str) {
         Some("status") | Some("context") => cmd_agent_status(args),
         Some("up") | Some("start") => cmd_agent_up(args),
         Some("inbox") => cmd_agent_inbox(args),
         Some("discover") => cmd_agent_discover(args),
         Some("send") => cmd_agent_send(args),
+        Some("exec") | Some("run") => cmd_agent_exec(args).await,
         Some(other) => Err(format!("unknown agent subcommand: {other}").into()),
-        None => Err("agent subcommand required: status, up, inbox, discover, or send".into()),
+        None => Err("agent subcommand required: status, up, inbox, discover, send, or exec".into()),
     }
 }
 
@@ -519,6 +580,17 @@ fn cmd_agent_send(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn cmd_agent_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (options, json) = parse_workspace_exec_options(args, 3, true)?;
+    let report = agent_exec_report(options).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_agent_exec_text(&report);
+    }
+    Ok(())
+}
+
 pub(crate) fn agent_up_report(
     options: &DaemonStartOptions,
 ) -> Result<AgentUpReport, Box<dyn std::error::Error>> {
@@ -529,6 +601,44 @@ pub(crate) fn agent_up_report(
         recommended_commands: up_recommended_commands(&options.base),
         status: report.status,
     })
+}
+
+pub(crate) async fn agent_exec_report(
+    options: WorkspaceExecOptions,
+) -> Result<AgentExecReport, Box<dyn std::error::Error>> {
+    let base = options.base.clone();
+    let report = run_workspace_exec(options).await?;
+    Ok(agent_exec_report_from_workspace_report(&base, report))
+}
+
+fn agent_exec_report_from_workspace_report(
+    base: &Path,
+    report: WorkspaceExecReport,
+) -> AgentExecReport {
+    let daemon = daemon_status_report(base);
+    let delivery = exec_delivery(base, &daemon);
+    AgentExecReport {
+        schema: "nexus.agent_exec.v1",
+        base: base.display().to_string(),
+        daemon,
+        execution: AgentExecExecution {
+            workspace: report.workspace.to_string(),
+            workspace_path: report.workspace_path.display().to_string(),
+            actor: report.actor.to_string(),
+            command: report.command,
+            args: report.args,
+            exit_code: report.exit_code,
+            stdout: agent_exec_stream(&report.stdout, &report.stdout_cid),
+            stderr: agent_exec_stream(&report.stderr, &report.stderr_cid),
+            output_root: hex::encode(report.output_root.as_bytes()),
+            resources: agent_exec_resources(&report.resources),
+            context: report.context,
+            started_at: report.started_at,
+            finished_at: report.finished_at,
+        },
+        delivery,
+        recommended_commands: exec_recommended_commands(base),
+    }
 }
 
 fn agent_send_report(
@@ -786,6 +896,53 @@ fn send_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentSendDelivery 
             suggested_command: Some(format!("nexus-node agent up --base {} --json", base.display())),
         }
     }
+}
+
+fn exec_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentExecDelivery {
+    if daemon.running {
+        AgentExecDelivery {
+            mode: "local_exec_daemon_running",
+            local_memory: true,
+            live_broadcast: false,
+            issue: "daemon exec IPC is pending; the command ran locally and recorded social memory outside the running daemon",
+            suggested_command: Some(format!("nexus-node daemon status --base {} --json", base.display())),
+        }
+    } else {
+        AgentExecDelivery {
+            mode: "local_exec",
+            local_memory: true,
+            live_broadcast: false,
+            issue: "daemon is not running; the command ran locally and will be available for replay after the daemon or serve starts",
+            suggested_command: Some(format!(
+                "nexus-node daemon start --base {} --listen /ip4/0.0.0.0/udp/0/quic-v1",
+                base.display()
+            )),
+        }
+    }
+}
+
+fn agent_exec_stream(bytes: &[u8], cid: &Cid) -> AgentExecStream {
+    AgentExecStream {
+        bytes: bytes.len(),
+        cid: hex::encode(cid.as_bytes()),
+        text: String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn agent_exec_resources(resources: &ResourceUsage) -> AgentExecResources {
+    AgentExecResources {
+        wall_time_ms: duration_millis(resources.wall_time),
+        cpu_user_ms: duration_millis(resources.cpu_user),
+        cpu_kernel_ms: duration_millis(resources.cpu_kernel),
+        peak_memory: resources.peak_memory,
+        fs_read_bytes: resources.fs_read_bytes,
+        fs_write_bytes: resources.fs_write_bytes,
+        process_count: resources.process_count,
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn control_plane_status(daemon: &DaemonStatusReport) -> ControlPlaneStatus {
@@ -1134,6 +1291,36 @@ fn send_recommended_commands(base: &Path) -> Vec<CommandHint> {
         CommandHint {
             name: "up",
             command: format!("nexus-node agent up --base {base} --json"),
+        },
+    ]
+}
+
+fn exec_recommended_commands(base: &Path) -> Vec<CommandHint> {
+    let base = base.display();
+    vec![
+        CommandHint {
+            name: "status",
+            command: format!("nexus-node agent status --base {base} --json"),
+        },
+        CommandHint {
+            name: "inbox",
+            command: format!("nexus-node agent inbox --base {base} --json"),
+        },
+        CommandHint {
+            name: "society",
+            command: format!("nexus-node society --base {base} --json --intent-limit 10"),
+        },
+        CommandHint {
+            name: "send_status",
+            command: format!(
+                "nexus-node agent send --base {base} --kind status --title <TEXT> --json"
+            ),
+        },
+        CommandHint {
+            name: "daemon_start",
+            command: format!(
+                "nexus-node daemon start --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"
+            ),
         },
     ]
 }
@@ -1530,10 +1717,42 @@ fn recommended_commands(base: &Path) -> Vec<CommandHint> {
             ),
         },
         CommandHint {
+            name: "exec",
+            command: format!(
+                "nexus-node agent exec --base {base} --workspace <PATH> --json -- <CMD> [ARG...]"
+            ),
+        },
+        CommandHint {
             name: "serve_foreground",
             command: format!("nexus-node serve --base {base} --listen /ip4/0.0.0.0/udp/0/quic-v1"),
         },
     ]
+}
+
+fn print_agent_exec_text(report: &AgentExecReport) {
+    print!("{}", report.execution.stdout.text);
+    eprint!("{}", report.execution.stderr.text);
+    println!(
+        "\nAgent exec: workspace={} root={} exit={}",
+        report.execution.workspace, report.execution.output_root, report.execution.exit_code
+    );
+    println!("workspace_path: {}", report.execution.workspace_path);
+    println!(
+        "daemon: running={} ipc_available={}",
+        report.daemon.running, report.daemon.ipc_available
+    );
+    println!(
+        "delivery: mode={} local_memory={} live_broadcast={}",
+        report.delivery.mode, report.delivery.local_memory, report.delivery.live_broadcast
+    );
+    println!("issue: {}", report.delivery.issue);
+    if let Some(command) = &report.delivery.suggested_command {
+        println!("suggested: {command}");
+    }
+    println!("recommended:");
+    for hint in &report.recommended_commands {
+        println!("  {}: {}", hint.name, hint.command);
+    }
 }
 
 fn print_agent_send_text(report: &AgentSendReport) {
@@ -1736,6 +1955,7 @@ mod tests {
     };
     use nexus_core::WorkspaceId;
     use nexus_crypto::NodeIdentity;
+    use nexus_workspace::{Workspace, WorkspaceConfig};
 
     #[test]
     fn status_does_not_create_identity() {
@@ -2116,5 +2336,62 @@ mod tests {
         assert_eq!(report.intent.task_id.as_deref(), Some("task-send-title"));
         assert_eq!(report.intent.capability.as_deref(), Some("code-review"));
         assert_eq!(report.intent.expires_at, Some(4_102_444_800));
+    }
+
+    #[tokio::test]
+    async fn exec_runs_workspace_and_reports_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let mut workspace = Workspace::create(
+            &identity,
+            temp.path(),
+            WorkspaceConfig {
+                name: "agent-exec-ws".into(),
+                description: "agent exec smoke".into(),
+            },
+        )
+        .await
+        .unwrap();
+        workspace.write_file("input.txt", b"hello").unwrap();
+        workspace.snapshot().await.unwrap();
+        let workspace_path = workspace.root_dir().to_path_buf();
+
+        let args = vec![
+            "nexus-node".into(),
+            "agent".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().to_string_lossy().to_string(),
+            "--workspace".into(),
+            workspace_path.to_string_lossy().to_string(),
+            "--note".into(),
+            "agent exec test".into(),
+            "--json".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "cat input.txt > output.txt && printf agent-output".into(),
+        ];
+        let (options, json) = parse_workspace_exec_options(&args, 3, true).unwrap();
+        assert!(json);
+
+        let report = agent_exec_report(options).await.unwrap();
+
+        assert_eq!(report.schema, "nexus.agent_exec.v1");
+        assert_eq!(report.execution.actor, identity.did().to_string());
+        assert_eq!(report.execution.command, "sh");
+        assert_eq!(report.execution.exit_code, 0);
+        assert_eq!(report.execution.stdout.text, "agent-output");
+        assert_eq!(report.delivery.mode, "local_exec");
+        assert!(!report.delivery.live_broadcast);
+        assert_eq!(
+            std::fs::read(workspace_path.join("output.txt")).unwrap(),
+            b"hello"
+        );
+
+        let memory = load_social_memory(&temp.path().join(".nexus-social-memory.json")).unwrap();
+        assert_eq!(memory.event_count(), 2);
+        memory.events()[0].verify_signature().unwrap();
+        memory.events()[1].verify_signature().unwrap();
     }
 }

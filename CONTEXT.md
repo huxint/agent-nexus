@@ -67,12 +67,16 @@ settle.
   to write a signed local status/need/offer/proposal/goal intent. Current
   delivery is local social memory; daemon-backed live broadcast is still a
   pending control-plane route.
+- Use `nexus-node agent exec --base <DIR> --workspace <PATH> --json -- <CMD>`
+  for the AI-facing workspace execution path. It runs through the existing
+  free `exec` semantics, records signed social-memory evidence, and currently
+  reports local execution rather than daemon-routed execution.
 - If `daemon.running` is false and network availability is needed, use
   `nexus-node agent up --base <DIR>` so `serve` runs in the background and the
   agent can keep interacting through normal tools.
-- Use `society --json`, top-level `discover --json`, and `exec` for detailed
-  expert workflows until `agent sync`, `agent exec`, `agent watch`, and
-  daemon-backed `agent send` are wired to the daemon IPC path.
+- Use `society --json`, top-level `discover --json`, and expert `exec` options
+  for detailed workflows until `agent sync`, `agent watch`, daemon-backed
+  `agent send`, and daemon-backed `agent exec` are wired to the daemon IPC path.
 - Treat ordinary filesystem/shell state and Nexus social/network state as two
   inputs to the same decision loop; the control plane should expose Nexus state
   without preventing the agent from inspecting non-Nexus state.
