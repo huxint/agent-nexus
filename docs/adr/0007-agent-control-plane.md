@@ -91,9 +91,11 @@ socket path under `<base>/.nexus/`. `daemon status` detects stale pid records
 and, when available, asks the control socket for live status. `daemon events`
 reads the daemon's bounded in-memory event journal over that socket so callers
 can poll recent peer, social, workspace announcement, and served snapshot
-changes by cursor. `daemon stop` prefers the control socket `shutdown` request
-before falling back to process termination. Repeated `start` returns the
-already-running daemon instead of spawning another network node.
+changes by cursor. Accepted social events also derive intent, task, and action
+recommendation change entries for agent-facing inbox/watch consumers. `daemon
+stop` prefers the control socket `shutdown` request before falling back to
+process termination. Repeated `start` returns the already-running daemon
+instead of spawning another network node.
 
 The daemon API should be base-scoped. A future Unix domain socket or named pipe
 under `<base>/.nexus/` can expose additional request/response commands such as

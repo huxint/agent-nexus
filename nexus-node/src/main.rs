@@ -482,8 +482,9 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let memory_path = base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
-    let synced_social_events =
+    let synced_social_events_report =
         request_social_events_from_peer(&network, peer, &mut memory, &memory_path).await;
+    let synced_social_events = synced_social_events_report.inserted;
     if synced_social_events > 0 {
         tracing::info!(
             "synced {synced_social_events} social events before cloning workspace {}",
@@ -5190,6 +5191,125 @@ struct NodeEventContext<'a> {
     event_journal: &'a daemon::DaemonEventJournalHandle,
 }
 
+fn record_daemon_social_event_change(
+    journal: &daemon::DaemonEventJournalHandle,
+    source: &Option<libp2p::PeerId>,
+    data: &[u8],
+) {
+    let Ok(event) = SocialEvent::from_json(data) else {
+        return;
+    };
+    record_daemon_social_event_change_from_event(journal, source, &event);
+}
+
+fn record_daemon_social_event_change_from_event(
+    journal: &daemon::DaemonEventJournalHandle,
+    source: &Option<libp2p::PeerId>,
+    event: &SocialEvent,
+) {
+    let Some((kind, summary)) = daemon_social_event_change_summary(source, event) else {
+        return;
+    };
+    journal.push(kind, summary);
+}
+
+fn daemon_social_event_change_summary(
+    source: &Option<libp2p::PeerId>,
+    event: &SocialEvent,
+) -> Option<(&'static str, String)> {
+    match &event.kind {
+        SocialEventKind::IntentPublished { intent } => Some((
+            "intent_changed",
+            format!(
+                "intent_changed action=published intent={} kind={} author={} source={source:?}",
+                intent.id,
+                daemon_intent_kind_name(intent.kind),
+                event.author
+            ),
+        )),
+        SocialEventKind::IntentResponded { response } => Some((
+            "action_recommendation_changed",
+            format!(
+                "action_recommendation_changed action=intent_responded intent={} response={} kind={} responder={} source={source:?}",
+                response.intent_id,
+                response.id,
+                daemon_intent_response_kind_name(response.kind),
+                response.responder
+            ),
+        )),
+        SocialEventKind::TaskPublished { task } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=published task={} capability={} publisher={} source={source:?}",
+                task.id, task.required_capability, task.publisher
+            ),
+        )),
+        SocialEventKind::TaskOffered { offer } => Some((
+            "action_recommendation_changed",
+            format!(
+                "action_recommendation_changed action=task_offered task={} bidder={} price={} source={source:?}",
+                offer.task_id, offer.bidder, offer.price
+            ),
+        )),
+        SocialEventKind::TaskAccepted { acceptance } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=accepted task={} publisher={} bidder={} price={} source={source:?}",
+                acceptance.task_id, acceptance.publisher, acceptance.bidder, acceptance.price
+            ),
+        )),
+        SocialEventKind::TaskCancelled { cancellation } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=cancelled task={} publisher={} source={source:?}",
+                cancellation.task_id, cancellation.publisher
+            ),
+        )),
+        SocialEventKind::TaskCompleted { result } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=completed task={} executor={} success={} exit_code={} source={source:?}",
+                result.task_id, result.executor, result.success, result.exit_code
+            ),
+        )),
+        SocialEventKind::TaskExecutionAttested { attestation } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=attested task={} executor={} attestor={} source={source:?}",
+                attestation.task_id, attestation.executor, attestation.attestor
+            ),
+        )),
+        SocialEventKind::TaskDisputed { dispute } => Some((
+            "task_changed",
+            format!(
+                "task_changed action=disputed task={} disputer={} target={} source={source:?}",
+                dispute.task_id, dispute.disputer, dispute.target
+            ),
+        )),
+        _ => None,
+    }
+}
+
+fn daemon_intent_kind_name(kind: IntentKind) -> &'static str {
+    match kind {
+        IntentKind::Goal => "goal",
+        IntentKind::Need => "need",
+        IntentKind::Offer => "offer",
+        IntentKind::Proposal => "proposal",
+        IntentKind::Status => "status",
+    }
+}
+
+fn daemon_intent_response_kind_name(kind: IntentResponseKind) -> &'static str {
+    match kind {
+        IntentResponseKind::Interested => "interested",
+        IntentResponseKind::Accept => "accept",
+        IntentResponseKind::Decline => "decline",
+        IntentResponseKind::Counter => "counter",
+        IntentResponseKind::Fulfilled => "fulfilled",
+    }
+}
+
 async fn handle_node_event(
     event: NetworkEvent,
     context: &NodeEventContext<'_>,
@@ -5228,6 +5348,7 @@ async fn handle_node_event(
                             social_memory.agent_count()
                         ),
                     );
+                    record_daemon_social_event_change(context.event_journal, source, data);
                 }
                 Ok(SocialIngestOutcome::Duplicate) => {
                     tracing::debug!("ignored duplicate social event from {:?}", source);
@@ -5254,13 +5375,27 @@ async fn handle_node_event(
                 unix_now(),
             )
             .await;
-            let _ = request_social_events_from_peer(
+            let sync_report = request_social_events_from_peer(
                 context.network,
                 *peer,
                 social_memory,
                 context.memory_path,
             )
             .await;
+            if sync_report.inserted > 0 {
+                context.event_journal.push(
+                    "social_event",
+                    format!(
+                        "social_event source=sync_peer({peer}) events={} agents={}",
+                        social_memory.event_count(),
+                        social_memory.agent_count()
+                    ),
+                );
+            }
+            let source = Some(*peer);
+            for event in &sync_report.inserted_events {
+                record_daemon_social_event_change_from_event(context.event_journal, &source, event);
+            }
         }
         NetworkEvent::SyncRequest {
             request_id,
@@ -5679,6 +5814,79 @@ mod tests {
         assert_eq!(daemon_events.events.len(), 1);
         assert_eq!(daemon_events.events[0].kind, "peer_connected");
         assert!(daemon_events.events[0].summary.contains(&peer.to_string()));
+    }
+
+    #[test]
+    fn daemon_social_event_change_recorder_classifies_work_items() {
+        let author = NodeIdentity::generate();
+        let bidder = NodeIdentity::generate();
+        let journal = daemon::DaemonEventJournalHandle::new();
+        let intent = AgentIntent {
+            id: "intent-daemon-classify".into(),
+            author: author.did().clone(),
+            kind: IntentKind::Need,
+            title: "Need a watcher".into(),
+            body: "classify daemon events".into(),
+            workspace: None,
+            task_id: Some("task-daemon-classify".into()),
+            capability: Some("watch".into()),
+            tags: Vec::new(),
+            created_at: 10,
+            expires_at: None,
+        };
+        let task = TaskSpec::new(
+            author.did().clone(),
+            "classify daemon events",
+            "watch",
+            "true",
+            Vec::new(),
+            10,
+            100,
+            11,
+        );
+        let task_id = task.id.clone();
+        let offer = TaskOffer {
+            task_id: task_id.clone(),
+            bidder: bidder.did().clone(),
+            price: 7,
+            estimated_time_secs: 30,
+            rationale: "ready".into(),
+        };
+        let events = SocialMemory::new()
+            .sign_event_sequence(
+                &author,
+                [
+                    (10, SocialEventKind::IntentPublished { intent }),
+                    (11, SocialEventKind::TaskPublished { task }),
+                    (12, SocialEventKind::TaskOffered { offer }),
+                ],
+            )
+            .unwrap();
+
+        for event in events {
+            record_daemon_social_event_change(&journal, &None, &event.to_json().unwrap());
+        }
+
+        let daemon_events = journal.snapshot(Path::new("."), None, Some(10));
+        assert_eq!(
+            daemon_events
+                .events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "intent_changed",
+                "task_changed",
+                "action_recommendation_changed"
+            ]
+        );
+        assert!(daemon_events.events[0]
+            .summary
+            .contains("intent=intent-daemon-classify"));
+        assert!(daemon_events.events[1].summary.contains(&task_id));
+        assert!(daemon_events.events[2]
+            .summary
+            .contains("action=task_offered"));
     }
 
     #[tokio::test]
