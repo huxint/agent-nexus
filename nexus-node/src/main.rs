@@ -1,6 +1,16 @@
 //! Nexus Node — a complete AI workspace node.
 //!
 //! Usage:
+//!   Agent control plane:
+//!   nexus-node agent status --base <dir> [--json]
+//!   nexus-node agent up --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--json]
+//!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
+//!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
+//!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--json]
+//!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
+//!   nexus-node agent exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] [--note <text>] [--json] -- <command> [args...]
+//!
+//!   Advanced commands:
 //!   nexus-node create --name <name> [--base <dir>]
 //!   nexus-node serve  --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node society --base <dir> [--json] [--private --shared-secret <text>] [--agent <did>] [--workspace <hex>] [--task <id>] [--intent-limit <n>]
@@ -11,13 +21,6 @@
 //!   nexus-node bootstrap status --base <dir> [--json] [--invite <addr>] [--no-public-bootstrap]
 //!   nexus-node network status --base <dir> [--json] [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--timeout-ms <n>]
 //!   nexus-node daemon start|status|stop --base <dir> [--json]
-//!   nexus-node agent status --base <dir> [--json]
-//!   nexus-node agent up --base <dir> [--listen <addr>] [--bootstrap <addr>|--invite <addr>] [--no-public-bootstrap] [--json]
-//!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <ts>] [--limit <n>] [--json]
-//!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
-//!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
-//!   nexus-node agent exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] [--note <text>] [--json] -- <command> [args...]
-//!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--json]
 //!   nexus-node identity rotate --base <dir> [--reason <text>] [--rotated-at <ts>]
 //!   nexus-node event manifest|intent|intent-response|identity-revoke|identity-rotate|workspace-join|workspace-snapshot|workspace-run|capability|collective|collective-join|collective-workspace|collective-proposal|collective-vote|collective-decision|relation|interaction|task-publish|task-offer|task-accept|task-cancel|task-complete|task-dispute --base <dir> ...
 //!   nexus-node act --base <dir> --intent <id> --kind <respond-intent|offer-task|join-workspace|propose-collective> ...
@@ -148,6 +151,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage(prog: &str) {
     eprintln!("nexus-node — AI workspace node");
+    eprintln!("\nAgent control plane:");
+    eprintln!("  {prog} agent status --base <DIR> [--json]");
+    eprintln!(
+        "  {prog} agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]"
+    );
+    eprintln!(
+        "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]"
+    );
+    eprintln!(
+        "  {prog} agent discover --base <DIR> [--json] [--sort <relevance|clone-ready|name|owner|latest>] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]"
+    );
+    eprintln!("  {prog} agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]");
+    eprintln!(
+        "  {prog} agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>] [--json]"
+    );
+    eprintln!("  {prog} agent exec --base <DIR> --workspace <PATH> [--isolation auto|native|bubblewrap] [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] [--json] -- <CMD> [ARG...]");
+
+    eprintln!("\nAdvanced commands:");
     eprintln!("  {prog} create --name <NAME> [--base <DIR>]");
     eprintln!("  {prog} join --base <DIR> --workspace <PATH>");
     eprintln!("  {prog} clone --base <DIR> [--global|--lan] [--peer <PEER_ID>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] --workspace <HEX> --name <NAME> [--listen <ADDR>] [--timeout-ms <N>] [--description <TEXT>]");
@@ -161,21 +182,6 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} daemon start --base <DIR> [--json] [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap]");
     eprintln!("  {prog} daemon status --base <DIR> [--json]");
     eprintln!("  {prog} daemon stop --base <DIR> [--json] [--timeout-ms <N>]");
-    eprintln!("  {prog} agent status --base <DIR> [--json]");
-    eprintln!(
-        "  {prog} agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]"
-    );
-    eprintln!(
-        "  {prog} agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>] [--json]"
-    );
-    eprintln!(
-        "  {prog} agent discover --base <DIR> [--json] [--sort <relevance|clone-ready|name|owner|latest>] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]"
-    );
-    eprintln!(
-        "  {prog} agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>] [--json]"
-    );
-    eprintln!("  {prog} agent exec --base <DIR> --workspace <PATH> [--isolation auto|native|bubblewrap] [--cwd <DIR>] [--env KEY=VALUE] [--stdin <TEXT>|--stdin-file <PATH>] [--timeout-ms <N>] [--note <TEXT>] [--json] -- <CMD> [ARG...]");
-    eprintln!("  {prog} agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]");
     eprintln!("  {prog} identity rotate --base <DIR> [--reason <TEXT>] [--rotated-at <TS>]");
     eprintln!(
         "  {prog} society --base <DIR> [--json] [--private --shared-secret <TEXT>] [--agent <DID>] [--workspace <HEX>] [--task <ID>] [--activity-limit <N>] [--activity-since <TS>] [--intent-limit <N>]"
