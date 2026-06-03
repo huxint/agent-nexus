@@ -31,7 +31,7 @@ pub struct WorkspaceAnnouncement {
     pub signature: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredWorkspaceView {
     pub workspace: String,
     pub name: String,
@@ -49,13 +49,14 @@ pub struct DiscoveredWorkspaceView {
     pub announcements: Vec<WorkspaceAnnouncement>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceConcurrencyModel {
     SnapshotForks,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DiscoverySort {
     #[default]
     Relevance,
@@ -65,7 +66,7 @@ pub enum DiscoverySort {
     Latest,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryFilter {
     pub workspace: Option<String>,
     pub peer: Option<String>,

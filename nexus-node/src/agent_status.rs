@@ -16,9 +16,11 @@ use nexus_storage::Cid;
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{
-    daemon_events_report, daemon_status_report, start_daemon, DaemonEvent, DaemonEventJournal,
-    DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
+    daemon_agent_discover, daemon_events_report, daemon_status_report, start_daemon, DaemonEvent,
+    DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
 };
+#[cfg(test)]
+use crate::daemon::{spawn_serve_control_socket, DaemonEventJournalHandle};
 use crate::discovery::{
     discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
     DiscoverySort,
@@ -1128,35 +1130,84 @@ pub(crate) fn agent_status_report(base: &Path) -> AgentStatusReport {
 
 pub(crate) fn agent_discover_report(base: &Path, filter: DiscoveryFilter) -> AgentDiscoverReport {
     let daemon = daemon_status_report(base);
-    let mode = if daemon.running {
-        if daemon.ipc_available {
-            "daemon_running_cache"
-        } else {
-            "daemon_running_no_ipc_cache"
+    if daemon.running && daemon.ipc_available {
+        match daemon_agent_discover(base, filter.clone()) {
+            Ok(response) => {
+                return agent_discover_report_from_parts(
+                    base,
+                    "daemon_ipc_cache",
+                    response.status,
+                    response.cached_announcements,
+                    response.workspaces,
+                    response.error.map(|error| {
+                        agent_issue(
+                            "daemon_discover_error",
+                            error,
+                            Some(format!(
+                                "nexus-node daemon status --base {} --json",
+                                base.display()
+                            )),
+                        )
+                    }),
+                );
+            }
+            Err(error) => {
+                return local_agent_discover_report(
+                    base,
+                    filter,
+                    daemon,
+                    "daemon_ipc_error_local_cache",
+                    Some(agent_issue(
+                        "daemon_discover_ipc_error",
+                        error.to_string(),
+                        Some(format!(
+                            "nexus-node daemon status --base {} --json",
+                            base.display()
+                        )),
+                    )),
+                );
+            }
         }
+    }
+
+    let mode = if daemon.running {
+        "daemon_running_no_ipc_cache"
     } else {
         "local_cache"
     };
+    local_agent_discover_report(base, filter, daemon, mode, None)
+}
 
+fn local_agent_discover_report(
+    base: &Path,
+    filter: DiscoveryFilter,
+    daemon: DaemonStatusReport,
+    mode: &'static str,
+    fallback_error: Option<AgentIssue>,
+) -> AgentDiscoverReport {
     let (cached_announcements, workspaces, error) = match load_workspace_discovery(base) {
         Ok(announcements) => {
             let cached_announcements = announcements.len();
             let workspaces = discovered_workspace_views(&announcements, &filter);
-            (cached_announcements, workspaces, None)
+            (cached_announcements, workspaces, fallback_error)
         }
         Err(error) => (
             0,
             Vec::new(),
-            Some(agent_issue(
-                "discovery_cache_read_error",
-                error.to_string(),
-                Some(format!(
-                    "nexus-node discover --base {} --lan --json --timeout-ms 3000",
-                    base.display()
-                )),
-            )),
+            Some(discovery_cache_read_issue(base, error.to_string())),
         ),
     };
+    agent_discover_report_from_parts(base, mode, daemon, cached_announcements, workspaces, error)
+}
+
+fn agent_discover_report_from_parts(
+    base: &Path,
+    mode: &'static str,
+    daemon: DaemonStatusReport,
+    cached_announcements: usize,
+    workspaces: Vec<DiscoveredWorkspaceView>,
+    error: Option<AgentIssue>,
+) -> AgentDiscoverReport {
     let summary = AgentDiscoverSummary {
         cached_announcements,
         workspaces: workspaces.len(),
@@ -1180,6 +1231,17 @@ pub(crate) fn agent_discover_report(base: &Path, filter: DiscoveryFilter) -> Age
         error,
         recommended_commands: discover_recommended_commands(base),
     }
+}
+
+fn discovery_cache_read_issue(base: &Path, error: String) -> AgentIssue {
+    agent_issue(
+        "discovery_cache_read_error",
+        error,
+        Some(format!(
+            "nexus-node discover --base {} --lan --json --timeout-ms 3000",
+            base.display()
+        )),
+    )
 }
 
 pub(crate) fn agent_inbox_report(
@@ -3203,6 +3265,82 @@ mod tests {
         assert_eq!(report.workspaces[0].workspace, workspace.to_string());
         assert!(report.workspaces[0].clone_ready);
         assert!(!identity_path(temp.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discover_prefers_daemon_ipc_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([85; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/3456/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "daemon routed workspace".into(),
+            description: "served by agent discover IPC".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 12,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+        )
+        .unwrap();
+
+        let base = temp.path().to_path_buf();
+        let report = tokio::task::spawn_blocking(move || {
+            agent_discover_report(
+                &base,
+                DiscoveryFilter {
+                    clone_ready_only: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "daemon_ipc_cache");
+        assert_eq!(report.summary.cached_announcements, 1);
+        assert_eq!(report.summary.workspaces, 1);
+        assert_eq!(report.workspaces[0].workspace, workspace.to_string());
+        assert!(report.workspaces[0].clone_ready);
+        assert!(report.error.is_none());
+
+        handle.abort();
     }
 
     #[test]
