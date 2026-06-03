@@ -441,12 +441,12 @@
 **依赖**：`UX2`。
 **涉及**：`nexus-node/src/agent_status.rs`、后续 `agent_control` 模块。
 
-#### - [ ] UX4 — inbox/watch 事件流 · 🟠 · M
+#### - [x] UX4 — inbox/watch 事件流 · 🟠 · M
 **为什么**：实时交互不是只查快照。AI 需要知道“刚收到什么社会事件、哪个 workspace root 变化、哪个任务/intent 需要响应”。
 **怎么做**：
 - [x] 增加本地缓存版 `nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <CURSOR>] [--limit <N>] [--json]`：汇总 daemon 提醒、intent 推荐、open/assigned tasks、clone-ready discovery；只读，不启动网络、不创建身份、不解密私钥。
 - [x] daemon 维护 bounded event journal，并通过 `nexus-node daemon events --base <DIR> [--since <CURSOR>] [--limit <N>] [--json]` 暴露：social event accepted、workspace announcement、peer/listen/sync 网络事件、workspace snapshot changed。
-- [ ] 将 task/intent/action recommendation changed 纳入 daemon event journal。
+- [x] 将 task/intent/action recommendation changed 纳入 daemon event journal：accepted social events 会派生 `intent_changed`、`task_changed`、`action_recommendation_changed`。
 - [x] `nexus-node agent inbox --base <DIR> --since <cursor> --json` 在 daemon IPC 可用时返回 `daemon_events` 增量 journal，并把事件映射为 `daemon_event` inbox item。
 - [x] `nexus-node agent watch --base <DIR> --json` 轮询 daemon event journal 并输出 `nexus.agent_watch_event.v1` NDJSON 事件流，适合外层 agent runtime 订阅。
 **完成判据**：一个外部 agent 可以用 cursor 增量处理 Nexus 内通信，同时继续使用普通 shell/filesystem 工具处理 Nexus 外状态。

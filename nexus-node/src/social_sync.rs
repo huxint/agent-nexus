@@ -164,35 +164,52 @@ pub fn social_events_response_frame_len(
     .map(|bytes| bytes.len())
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SocialEventSyncReport {
+    pub inserted: usize,
+    pub inserted_events: Vec<SocialEvent>,
+}
+
 pub async fn request_social_events_from_peer(
     network: &Network,
     peer: libp2p::PeerId,
     social_memory: &mut SocialMemory,
     memory_path: &Path,
-) -> usize {
+) -> SocialEventSyncReport {
     let client = SyncClient::new(network.sync_request_channel());
     let known_event_ids = social_memory
         .events()
         .iter()
         .map(|event| event.id.clone())
         .collect();
-    let mut inserted = 0;
+    let mut report = SocialEventSyncReport::default();
 
     match client.get_social_events(peer, known_event_ids, 512).await {
         Ok(events_json) => {
             let event_slices = events_json.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let decoded_events = events_json
+                .iter()
+                .map(|data| SocialEvent::from_json(data))
+                .collect::<Vec<_>>();
             let results = social_memory.ingest_json_batch(event_slices);
-            inserted = results
+            report.inserted = results
                 .iter()
                 .filter(|result| matches!(result, Ok(true)))
                 .count();
-            if inserted > 0 {
+            for (result, decoded) in results.iter().zip(decoded_events) {
+                if matches!(result, Ok(true)) {
+                    if let Ok(event) = decoded {
+                        report.inserted_events.push(event);
+                    }
+                }
+            }
+            if report.inserted > 0 {
                 if let Err(err) = save_social_memory(memory_path, social_memory) {
                     tracing::warn!("failed to save synced social events from {}: {err}", peer);
                 } else {
                     tracing::info!(
                         "synced {} social events from {}; events={}, agents={}",
-                        inserted,
+                        report.inserted,
                         peer,
                         social_memory.event_count(),
                         social_memory.agent_count()
@@ -209,5 +226,5 @@ pub async fn request_social_events_from_peer(
             tracing::debug!("social event sync request to {} failed: {err}", peer);
         }
     }
-    inserted
+    report
 }
