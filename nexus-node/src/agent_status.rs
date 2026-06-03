@@ -146,6 +146,7 @@ pub(crate) struct AgentInboxReport {
     generated_at: u64,
     daemon: DaemonStatusReport,
     daemon_events: DaemonEventsReport,
+    discovery_source: &'static str,
     summary: AgentInboxSummary,
     items: Vec<AgentInboxItem>,
     recommended_commands: Vec<CommandHint>,
@@ -1282,6 +1283,7 @@ pub(crate) fn agent_inbox_report(
     let resolved_agent = requested_agent.or_else(|| identity_status(base).did.map(Did::new));
     let mut items = Vec::new();
     let daemon_delta_mode = since.is_some() && daemon_events_are_live(&daemon_events);
+    let mut discovery_source = "skipped_delta_mode";
 
     push_daemon_inbox_items(base, &daemon, generated_at, &mut items);
     push_daemon_event_items(base, &daemon_events.journal, &mut items);
@@ -1322,7 +1324,7 @@ pub(crate) fn agent_inbox_report(
             }),
         }
 
-        push_discovered_workspace_items(base, &mut items);
+        discovery_source = push_discovered_workspace_items(base, &daemon, &mut items);
     }
 
     if !daemon_delta_mode {
@@ -1341,6 +1343,7 @@ pub(crate) fn agent_inbox_report(
         generated_at,
         daemon,
         daemon_events,
+        discovery_source,
         summary,
         items,
         recommended_commands: inbox_recommended_commands(base),
@@ -2068,11 +2071,67 @@ fn task_matches_agent_capability(memory: &SocialMemory, task: &Task, agent: Opti
         })
 }
 
-fn push_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>) {
+fn push_discovered_workspace_items(
+    base: &Path,
+    daemon: &DaemonStatusReport,
+    items: &mut Vec<AgentInboxItem>,
+) -> &'static str {
+    if daemon.running && daemon.ipc_available {
+        match daemon_agent_discover(base, DiscoveryFilter::default()) {
+            Ok(response) => {
+                push_discovered_workspace_view_items(base, response.workspaces, items);
+                return "daemon_ipc_cache";
+            }
+            Err(error) => {
+                items.push(AgentInboxItem {
+                    kind: "daemon_alert",
+                    priority: 63,
+                    title: "Daemon discovery IPC failed".into(),
+                    body: Some(error.to_string()),
+                    author: None,
+                    workspace: None,
+                    task_id: None,
+                    capability: None,
+                    timestamp: Some(unix_now()),
+                    score: None,
+                    reasons: vec!["daemon-discovery-ipc-error".into()],
+                    actions: Vec::new(),
+                    command_hint: Some(format!(
+                        "nexus-node daemon status --base {} --json",
+                        base.display()
+                    )),
+                });
+                push_local_discovered_workspace_items(base, items);
+                return "daemon_ipc_error_local_cache";
+            }
+        }
+    }
+
+    push_local_discovered_workspace_items(base, items);
+    if daemon.running {
+        "daemon_running_no_ipc_cache"
+    } else {
+        "local_cache"
+    }
+}
+
+fn push_local_discovered_workspace_items(base: &Path, items: &mut Vec<AgentInboxItem>) {
     let Ok(announcements) = load_workspace_discovery(base) else {
         return;
     };
-    for workspace in discovered_workspace_views(&announcements, &DiscoveryFilter::default()) {
+    push_discovered_workspace_view_items(
+        base,
+        discovered_workspace_views(&announcements, &DiscoveryFilter::default()),
+        items,
+    );
+}
+
+fn push_discovered_workspace_view_items(
+    base: &Path,
+    workspaces: Vec<DiscoveredWorkspaceView>,
+    items: &mut Vec<AgentInboxItem>,
+) {
+    for workspace in workspaces {
         if !workspace.clone_ready {
             continue;
         }
@@ -2966,6 +3025,7 @@ mod tests {
         assert!(!identity_path(temp.path()).exists());
         assert_eq!(report.summary.daemon_alerts, 1);
         assert_eq!(report.summary.daemon_events, 0);
+        assert_eq!(report.discovery_source, "local_cache");
         assert_eq!(report.daemon_events.journal.cursor, 0);
         assert!(report.daemon_events.journal.events.is_empty());
         assert_eq!(
@@ -2979,6 +3039,75 @@ mod tests {
                     .as_deref()
                     .is_some_and(|command| command.contains("nexus-node daemon start"))
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inbox_prefers_daemon_ipc_discovery_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([87; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/5678/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "daemon inbox workspace".into(),
+            description: "served by agent inbox discovery IPC".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 14,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+        )
+        .unwrap();
+
+        let base = temp.path().to_path_buf();
+        let report = tokio::task::spawn_blocking(move || agent_inbox_report(&base, None, 10, None))
+            .await
+            .unwrap();
+
+        assert_eq!(report.discovery_source, "daemon_ipc_cache");
+        assert_eq!(report.summary.discovered_workspaces, 1);
+        let workspace_id = workspace.to_string();
+        assert!(report.items.iter().any(|item| {
+            item.kind == "discovered_workspace"
+                && item.workspace.as_deref() == Some(workspace_id.as_str())
+        }));
+
+        handle.abort();
     }
 
     #[test]
