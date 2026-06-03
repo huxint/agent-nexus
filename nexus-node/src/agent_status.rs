@@ -16,8 +16,9 @@ use nexus_storage::Cid;
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{
-    daemon_agent_discover, daemon_events_report, daemon_status_report, start_daemon, DaemonEvent,
-    DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
+    daemon_agent_discover, daemon_agent_sync, daemon_events_report, daemon_status_report,
+    start_daemon, DaemonEvent, DaemonEventJournal, DaemonEventsReport, DaemonStartOptions,
+    DaemonStatusReport,
 };
 #[cfg(test)]
 use crate::daemon::{spawn_serve_control_socket, DaemonEventJournalHandle};
@@ -971,28 +972,53 @@ pub(crate) fn agent_sync_report(
     workspace_filter: Option<String>,
     name: Option<String>,
 ) -> AgentSyncReport {
-    let daemon = daemon_status_report(base);
-    let mode = sync_mode(&daemon);
+    let mut daemon = daemon_status_report(base);
+    let mut mode = sync_mode(&daemon);
     let locals = local_workspace_statuses(base);
-    let (discovered, error) = match load_workspace_discovery(base) {
-        Ok(announcements) => {
-            let filter = DiscoveryFilter {
-                workspace: workspace_filter.clone(),
-                ..Default::default()
-            };
-            (discovered_workspace_views(&announcements, &filter), None)
+    let discovery_filter = DiscoveryFilter {
+        workspace: workspace_filter.clone(),
+        ..Default::default()
+    };
+    let (discovered, error) = if daemon.running && daemon.ipc_available {
+        match daemon_agent_sync(base, discovery_filter.clone()) {
+            Ok(response) => {
+                daemon = response.status;
+                mode = "daemon_ipc_local_plan";
+                (
+                    response.workspaces,
+                    response.error.map(|error| {
+                        agent_issue(
+                            "daemon_sync_error",
+                            error,
+                            Some(format!(
+                                "nexus-node daemon status --base {} --json",
+                                base.display()
+                            )),
+                        )
+                    }),
+                )
+            }
+            Err(error) => {
+                mode = "daemon_ipc_error_local_plan";
+                let (discovered, cache_error) =
+                    local_sync_discovered_workspaces(base, &discovery_filter);
+                (
+                    discovered,
+                    cache_error.or_else(|| {
+                        Some(agent_issue(
+                            "daemon_sync_ipc_error",
+                            error.to_string(),
+                            Some(format!(
+                                "nexus-node daemon status --base {} --json",
+                                base.display()
+                            )),
+                        ))
+                    }),
+                )
+            }
         }
-        Err(error) => (
-            Vec::new(),
-            Some(agent_issue(
-                "discovery_cache_read_error",
-                format!("read discovery cache: {error}"),
-                Some(format!(
-                    "nexus-node discover --base {} --lan --json --timeout-ms 3000",
-                    base.display()
-                )),
-            )),
-        ),
+    } else {
+        local_sync_discovered_workspaces(base, &discovery_filter)
     };
 
     let mut targets = Vec::new();
@@ -1027,7 +1053,7 @@ pub(crate) fn agent_sync_report(
     }
 
     let summary = summarize_sync_targets(&targets);
-    let issue = sync_issue(base, &daemon);
+    let issue = sync_issue(base, &daemon, mode);
     AgentSyncReport {
         schema: "nexus.agent_sync.v1",
         base: base.display().to_string(),
@@ -1428,8 +1454,30 @@ fn sync_mode(daemon: &DaemonStatusReport) -> &'static str {
     }
 }
 
-fn sync_issue(base: &Path, daemon: &DaemonStatusReport) -> AgentIssue {
-    if daemon.running {
+fn local_sync_discovered_workspaces(
+    base: &Path,
+    filter: &DiscoveryFilter,
+) -> (Vec<DiscoveredWorkspaceView>, Option<AgentIssue>) {
+    match load_workspace_discovery(base) {
+        Ok(announcements) => (discovered_workspace_views(&announcements, filter), None),
+        Err(error) => (
+            Vec::new(),
+            Some(discovery_cache_read_issue(
+                base,
+                format!("read discovery cache: {error}"),
+            )),
+        ),
+    }
+}
+
+fn sync_issue(base: &Path, daemon: &DaemonStatusReport, mode: &'static str) -> AgentIssue {
+    if mode == "daemon_ipc_local_plan" {
+        agent_issue(
+            "daemon_sync_apply_pending",
+            "daemon discovery IPC is active; this report still returns a local clone/sync plan and does not apply network changes",
+            Some(format!("nexus-node daemon status --base {} --json", base.display())),
+        )
+    } else if daemon.running {
         agent_issue(
             "daemon_sync_ipc_pending",
             "daemon sync IPC is pending; this report is based on local workspace and discovery caches",
@@ -3338,6 +3386,82 @@ mod tests {
         assert_eq!(report.summary.workspaces, 1);
         assert_eq!(report.workspaces[0].workspace, workspace.to_string());
         assert!(report.workspaces[0].clone_ready);
+        assert!(report.error.is_none());
+
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_prefers_daemon_ipc_discovery_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([86; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/4567/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "daemon sync workspace".into(),
+            description: "served by agent sync IPC".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 13,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+        )
+        .unwrap();
+
+        let base = temp.path().to_path_buf();
+        let workspace_filter = workspace.to_string();
+        let report = tokio::task::spawn_blocking(move || {
+            agent_sync_report(
+                &base,
+                Some(workspace_filter),
+                Some("daemon-sync-copy".into()),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "daemon_ipc_local_plan");
+        assert_eq!(report.issue.kind, "daemon_sync_apply_pending");
+        assert_eq!(report.summary.targets, 1);
+        assert_eq!(report.summary.clone_ready, 1);
+        assert_eq!(report.targets[0].workspace, workspace.to_string());
+        assert_eq!(report.targets[0].action, "clone_with_expert_command");
         assert!(report.error.is_none());
 
         handle.abort();
