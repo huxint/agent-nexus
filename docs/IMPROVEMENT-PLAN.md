@@ -448,7 +448,7 @@
 - [x] daemon 维护 bounded event journal，并通过 `nexus-node daemon events --base <DIR> [--since <CURSOR>] [--limit <N>] [--json]` 暴露：social event accepted、workspace announcement、peer/listen/sync 网络事件、workspace snapshot changed。
 - [ ] 将 task/intent/action recommendation changed 纳入 daemon event journal。
 - [x] `nexus-node agent inbox --base <DIR> --since <cursor> --json` 在 daemon IPC 可用时返回 `daemon_events` 增量 journal，并把事件映射为 `daemon_event` inbox item。
-- [ ] `nexus-node agent watch --base <DIR> --json` 输出 NDJSON 事件流，适合外层 agent runtime 订阅。
+- [x] `nexus-node agent watch --base <DIR> --json` 轮询 daemon event journal 并输出 `nexus.agent_watch_event.v1` NDJSON 事件流，适合外层 agent runtime 订阅。
 **完成判据**：一个外部 agent 可以用 cursor 增量处理 Nexus 内通信，同时继续使用普通 shell/filesystem 工具处理 Nexus 外状态。
 **依赖**：`UX2`。
 **涉及**：`nexus-node`、`nexus-agent`。

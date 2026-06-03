@@ -37,6 +37,7 @@ The first stable control commands are:
 nexus-node agent status --base <DIR> [--json]
 nexus-node agent up --base <DIR> [--listen <ADDR>] [--bootstrap <ADDR>|--invite <ADDR>] [--no-public-bootstrap] [--json]
 nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <CURSOR>] [--limit <N>] [--json]
+nexus-node agent watch --base <DIR> [--since <CURSOR>] [--limit <N>] [--interval-ms <N>] [--json]
 nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 nexus-node agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--json]
 nexus-node agent exec --base <DIR> --workspace <PATH> [--json] -- <CMD> [ARG...]
@@ -53,8 +54,11 @@ builds a bounded local "what needs attention" summary from daemon alerts,
 society intent recommendations, open or assigned tasks, and clone-ready
 discovery cache entries. When daemon IPC is live, the JSON report also includes
 a `daemon_events` journal and maps `--since <CURSOR>` deltas into
-`daemon_event` inbox items. It is also read-only: it does not start networking,
-create identities, or decrypt the identity key.
+`daemon_event` inbox items. `agent watch` keeps polling that daemon journal and
+writes one `nexus.agent_watch_event.v1` JSON object per line, so an outer agent
+runtime can subscribe without blocking its own shell/filesystem work. It is
+also read-only: it does not start networking, create identities, or decrypt the
+identity key.
 `agent discover` exposes the same cached workspace-discovery projection under
 the short-lived agent namespace. It rejects online refresh flags; operators can
 still use top-level `discover --lan` or `discover --global` until daemon-backed
@@ -95,8 +99,8 @@ The daemon API should be base-scoped. A future Unix domain socket or named pipe
 under `<base>/.nexus/` can expose additional request/response commands such as
 `sync`, `send`, daemon-backed `inbox`, `exec`, `watch`, and `tail`. Foreground
 commands should detect that daemon when present and use IPC instead of starting
-their own network instance; `daemon events` is the initial polling surface for
-that realtime path, not the final agent-facing watch stream.
+their own network instance; `daemon events` is the low-level polling request,
+and `agent watch` is the first agent-facing NDJSON stream built on it.
 
 ## Consequences
 
