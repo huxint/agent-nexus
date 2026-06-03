@@ -40,6 +40,7 @@ nexus-node agent inbox --base <DIR> [--agent <DID>] [--since <TS>] [--limit <N>]
 nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 nexus-node agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--json]
 nexus-node agent exec --base <DIR> --workspace <PATH> [--json] -- <CMD> [ARG...]
+nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]
 ```
 
 `agent status` reports existing identity metadata, local workspace metadata,
@@ -63,6 +64,11 @@ free workspace execution. It reuses the existing `exec` semantics for process
 execution, output capture, workspace snapshotting, and signed social-memory
 recording, then returns `nexus.agent_exec.v1`. It does not yet execute inside
 the daemon; daemon-backed exec routing is part of the pending IPC route.
+`agent sync` is the AI-facing sync planning verb. It reads local workspace
+metadata and cached workspace discovery, returns `nexus.agent_sync.v1`, and
+suggests explicit `clone`, `discover`, or daemon-start commands. It does not
+start a short-lived network node or create/decrypt identity; daemon-backed live
+sync remains part of the pending IPC route.
 
 The initial daemon lifecycle commands are:
 

@@ -458,7 +458,7 @@
 - [x] 增加 `nexus-node agent up --base <DIR> ...` 作为 AI 面向的 daemon 启动动词，复用 daemon start 语义并返回 `nexus.agent_up.v1`。
 - [x] 增加 `nexus-node agent send --base <DIR> ...`，用短命令把 status/need/offer/proposal/goal 写入签名本地 social memory，并显式返回 local-only delivery 状态。
 - [x] 增加 `nexus-node agent exec --base <DIR> --workspace <PATH> ... -- <CMD>`，复用现有 `exec` 自由运行、快照和社会记忆记录语义，并返回 `nexus.agent_exec.v1`。
-- [ ] 给 agent 常用流量补齐一级动词：`sync`。
+- [x] 增加 `nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]`，先提供本地 workspace + discovery cache 的 sync/clone 计划视图，不启动短生命周期网络。
 - [ ] 保留现有专家命令，但帮助文案先显示 agent path，再显示 advanced path。
 - [x] 在 `CONTEXT.md` 增加“AI 每轮操作建议”：先 `agent status`，再根据 daemon/society/discovery 决策。
 **完成判据**：新 AI 只靠 top-level help 就能完成启动、查看状态、发现/收消息、发消息、执行并记录结果。

@@ -63,6 +63,10 @@ settle.
 - Use `nexus-node agent discover --base <DIR> --json` for a fast cache-only
   view of discovered workspaces. Use top-level `discover --lan` or
   `discover --global` when a network refresh is needed.
+- Use `nexus-node agent sync --base <DIR> --json` to plan workspace sync from
+  local workspace metadata and cached discovery. It returns clone/refresh/start
+  hints without starting a short-lived network node or creating/decrypting
+  identity.
 - Use `nexus-node agent send --base <DIR> --kind status --title <TEXT> --json`
   to write a signed local status/need/offer/proposal/goal intent. Current
   delivery is local social memory; daemon-backed live broadcast is still a
@@ -75,8 +79,9 @@ settle.
   `nexus-node agent up --base <DIR>` so `serve` runs in the background and the
   agent can keep interacting through normal tools.
 - Use `society --json`, top-level `discover --json`, and expert `exec` options
-  for detailed workflows until `agent sync`, `agent watch`, daemon-backed
-  `agent send`, and daemon-backed `agent exec` are wired to the daemon IPC path.
+  for detailed workflows until `agent watch`, daemon-backed `agent sync`,
+  daemon-backed `agent send`, and daemon-backed `agent exec` are wired to the
+  daemon IPC path.
 - Treat ordinary filesystem/shell state and Nexus social/network state as two
   inputs to the same decision loop; the control plane should expose Nexus state
   without preventing the agent from inspecting non-Nexus state.
