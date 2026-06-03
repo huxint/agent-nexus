@@ -60,10 +60,13 @@ runtime can subscribe without blocking its own shell/filesystem work. It is
 also read-only: it does not start networking, create identities, or decrypt the
 identity key.
 `agent discover` exposes the same cached workspace-discovery projection under
-the short-lived agent namespace. It rejects online refresh flags; operators can
-still use top-level `discover --lan` or `discover --global` until daemon-backed
-routing owns refreshes. `agent send` writes a signed intent/status social event
-to local social memory and returns `nexus.agent_send.v1` delivery metadata. It
+the short-lived agent namespace. When daemon IPC is available it asks the
+base-scoped control socket for `agent_discover`; if that request fails it falls
+back to the local cache with a structured issue. It rejects online refresh
+flags; operators can still use top-level `discover --lan` or `discover --global`
+until daemon-backed routing owns refreshes. `agent send` writes a signed
+intent/status social event to local social memory and returns
+`nexus.agent_send.v1` delivery metadata. It
 does not yet inject the event into a running daemon; daemon-backed live send is
 part of the pending IPC route. `agent exec` is the short-command entry point for
 free workspace execution. It reuses the existing `exec` semantics for process

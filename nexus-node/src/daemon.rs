@@ -18,6 +18,9 @@ use tokio::sync::watch;
 
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{parse_u64_arg, required_arg};
+use crate::discovery::{
+    discovered_workspace_views, load_workspace_discovery, DiscoveredWorkspaceView, DiscoveryFilter,
+};
 use crate::state::write_file_atomic;
 use crate::unix_now;
 
@@ -87,6 +90,8 @@ struct DaemonControlRequest {
     since: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovery_filter: Option<DiscoveryFilter>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,7 +101,19 @@ struct DaemonControlResponse {
     status: DaemonStatusReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     events: Option<DaemonEventJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovered_workspaces: Option<Vec<DiscoveredWorkspaceView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_announcements: Option<usize>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DaemonAgentDiscoverResponse {
+    pub(crate) status: DaemonStatusReport,
+    pub(crate) workspaces: Vec<DiscoveredWorkspaceView>,
+    pub(crate) cached_announcements: usize,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +348,7 @@ pub(crate) fn daemon_events_report(
             command: "events".into(),
             since,
             limit: Some(effective_limit),
+            discovery_filter: None,
         },
     ) {
         Ok(response) if response.ok => DaemonEventsReport {
@@ -960,6 +978,8 @@ async fn handle_control_stream(
                 shutdown: false,
                 status: daemon_control_status(&base),
                 events: None,
+                discovered_workspaces: None,
+                cached_announcements: None,
                 error: None,
             },
             "shutdown" => DaemonControlResponse {
@@ -967,6 +987,8 @@ async fn handle_control_stream(
                 shutdown: true,
                 status: daemon_control_status(&base),
                 events: None,
+                discovered_workspaces: None,
+                cached_announcements: None,
                 error: None,
             },
             "events" => DaemonControlResponse {
@@ -974,13 +996,18 @@ async fn handle_control_stream(
                 shutdown: false,
                 status: daemon_control_status(&base),
                 events: Some(event_journal.snapshot(&base, request.since, request.limit)),
+                discovered_workspaces: None,
+                cached_announcements: None,
                 error: None,
             },
+            "agent_discover" => daemon_control_agent_discover_response(&base, request),
             other => DaemonControlResponse {
                 ok: false,
                 shutdown: false,
                 status: daemon_control_status(&base),
                 events: None,
+                discovered_workspaces: None,
+                cached_announcements: None,
                 error: Some(format!("unknown daemon control command: {other}")),
             },
         },
@@ -989,6 +1016,8 @@ async fn handle_control_stream(
             shutdown: false,
             status: daemon_control_status(&base),
             events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
             error: Some(error.to_string()),
         },
     };
@@ -1000,6 +1029,37 @@ async fn handle_control_stream(
     }
     if shutdown {
         let _ = shutdown_tx.send(true);
+    }
+}
+
+fn daemon_control_agent_discover_response(
+    base: &Path,
+    request: DaemonControlRequest,
+) -> DaemonControlResponse {
+    let status = daemon_control_status(base);
+    let filter = request.discovery_filter.unwrap_or_default();
+    match load_workspace_discovery(base) {
+        Ok(announcements) => {
+            let cached_announcements = announcements.len();
+            DaemonControlResponse {
+                ok: true,
+                shutdown: false,
+                status,
+                events: None,
+                discovered_workspaces: Some(discovered_workspace_views(&announcements, &filter)),
+                cached_announcements: Some(cached_announcements),
+                error: None,
+            }
+        }
+        Err(error) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            error: Some(format!("read discovery cache: {error}")),
+        },
     }
 }
 
@@ -1036,8 +1096,44 @@ fn query_control_socket(
             command: command.to_string(),
             since: None,
             limit: None,
+            discovery_filter: None,
         },
     )
+}
+
+pub(crate) fn daemon_agent_discover(
+    base: &Path,
+    filter: DiscoveryFilter,
+) -> Result<DaemonAgentDiscoverResponse, Box<dyn std::error::Error>> {
+    let status = daemon_status_report(base);
+    let Some(socket) = status.control_socket.as_deref() else {
+        return Err("daemon control socket is not available".into());
+    };
+    if !status.running {
+        return Err("daemon is not running".into());
+    }
+
+    let response = query_control_socket_request(
+        Path::new(socket),
+        &DaemonControlRequest {
+            command: "agent_discover".into(),
+            since: None,
+            limit: None,
+            discovery_filter: Some(filter),
+        },
+    )?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "daemon agent discover request failed".into())
+            .into());
+    }
+    Ok(DaemonAgentDiscoverResponse {
+        status: response.status,
+        workspaces: response.discovered_workspaces.unwrap_or_default(),
+        cached_announcements: response.cached_announcements.unwrap_or(0),
+        error: response.error,
+    })
 }
 
 #[cfg(unix)]
@@ -1082,6 +1178,12 @@ fn query_control_socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{
+        record_workspace_announcement, sign_workspace_announcement, WorkspaceAnnouncement,
+        WORKSPACE_ANNOUNCEMENT_VERSION,
+    };
+    use nexus_core::WorkspaceId;
+    use nexus_crypto::NodeIdentity;
 
     #[test]
     fn daemon_status_reports_absent_state() {
@@ -1228,6 +1330,52 @@ mod tests {
         assert!(status.status.ipc_available);
         assert!(status.events.is_none());
 
+        let owner = NodeIdentity::generate();
+        let workspace = WorkspaceId::from_bytes([84; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: nexus_network::to_peer_id(&owner).to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/3100/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "daemon cache workspace".into(),
+            description: "served through agent discover IPC".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 77,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+        let discover_socket = socket.clone();
+        let discover = tokio::task::spawn_blocking(move || {
+            query_control_socket_request(
+                &discover_socket,
+                &DaemonControlRequest {
+                    command: "agent_discover".into(),
+                    since: None,
+                    limit: None,
+                    discovery_filter: Some(DiscoveryFilter {
+                        clone_ready_only: true,
+                        ..Default::default()
+                    }),
+                },
+            )
+            .map_err(|err| err.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(discover.ok);
+        assert!(!discover.shutdown);
+        assert_eq!(discover.cached_announcements, Some(1));
+        let workspaces = discover
+            .discovered_workspaces
+            .expect("agent discover response should include workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace, workspace.to_string());
+        assert!(workspaces[0].clone_ready);
+
         let events_socket = socket.clone();
         let events = tokio::task::spawn_blocking(move || {
             query_control_socket_request(
@@ -1236,6 +1384,7 @@ mod tests {
                     command: "events".into(),
                     since: Some(1),
                     limit: Some(10),
+                    discovery_filter: None,
                 },
             )
             .map_err(|err| err.to_string())
