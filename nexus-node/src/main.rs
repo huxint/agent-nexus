@@ -350,6 +350,16 @@ async fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 // clone
 // ---------------------------------------------------------------------------
 
+struct CloneWorkspaceReport {
+    workspace: WorkspaceId,
+    path: PathBuf,
+    root: Cid,
+    peer: libp2p::PeerId,
+    owner: Did,
+    synced_social_events: Vec<SocialEvent>,
+    recorded_events: Vec<SocialEvent>,
+}
+
 async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
@@ -477,17 +487,62 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => Network::new(&identity, network_config(listen.parse()?, bootstrap)).await?,
     };
 
-    if !peer_ready {
-        wait_for_peer_connected(&network, peer, Duration::from_secs(15)).await?;
-    }
     let memory_path = base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
+    let (_workspace, report) = clone_workspace_from_network(
+        &base,
+        &network,
+        &identity,
+        &mut memory,
+        &memory_path,
+        workspace_id,
+        name,
+        description,
+        peer,
+        discovered_source.as_ref(),
+        &discovered_fork_roots,
+        peer_ready,
+    )
+    .await?;
+
+    println!(
+        "Cloned workspace {} to {} at root {}",
+        report.workspace,
+        report.path.display(),
+        hex::encode(report.root.as_bytes())
+    );
+    Ok(())
+}
+
+async fn clone_workspace_from_network(
+    base: &Path,
+    network: &Network,
+    identity: &NodeIdentity,
+    social_memory: &mut SocialMemory,
+    memory_path: &Path,
+    workspace_id: WorkspaceId,
+    name: String,
+    description: Option<String>,
+    peer: libp2p::PeerId,
+    discovered_source: Option<&DiscoveredCloneSource>,
+    discovered_fork_roots: &[String],
+    peer_ready: bool,
+) -> Result<(Workspace, CloneWorkspaceReport), Box<dyn std::error::Error>> {
+    if !peer_ready {
+        if let Some(discovered) = discovered_source {
+            for addr in &discovered.addrs {
+                network.dial(addr.clone());
+            }
+        }
+        wait_for_peer_connected(network, peer, Duration::from_secs(15)).await?;
+    }
+
     let synced_social_events_report =
-        request_social_events_from_peer(&network, peer, &mut memory, &memory_path).await;
-    let synced_social_events = synced_social_events_report.inserted;
-    if synced_social_events > 0 {
+        request_social_events_from_peer(network, peer, social_memory, memory_path).await;
+    if synced_social_events_report.inserted > 0 {
         tracing::info!(
-            "synced {synced_social_events} social events before cloning workspace {}",
+            "synced {} social events before cloning workspace {}",
+            synced_social_events_report.inserted,
             workspace_id
         );
     }
@@ -506,7 +561,7 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         SyncResponse::WorkspaceNotFound { .. } => return Err("remote workspace not found".into()),
         other => return Err(format!("unexpected state response: {other:?}").into()),
     };
-    if let Some(discovered) = &discovered_source {
+    if let Some(discovered) = discovered_source {
         if remote_owner != discovered.owner {
             return Err(format!(
                 "remote owner {} does not match signed discovery owner {}",
@@ -562,10 +617,10 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let mut workspace = workspace;
     workspace.join_agent(identity.did(), unix_now())?;
-    register_workspace_path(&base, workspace.root_dir())?;
+    register_workspace_path(base, workspace.root_dir())?;
 
     let now = unix_now().max(
-        memory
+        social_memory
             .events()
             .iter()
             .map(|event| event.timestamp)
@@ -573,8 +628,8 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let events = memory.sign_event_sequence(
-        &identity,
+    let events = social_memory.sign_event_sequence(
+        identity,
         [
             (
                 now,
@@ -590,30 +645,33 @@ async fn cmd_clone(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         actor: identity.did().clone(),
                         root: cloned_root,
                         label: Some("cloned".into()),
-                        note: Some(clone_snapshot_note(peer, &discovered_fork_roots)),
+                        note: Some(clone_snapshot_note(peer, discovered_fork_roots)),
                         timestamp: now,
                     },
                 },
             ),
         ],
     )?;
-    let mut inserted = false;
+    let mut recorded_events = Vec::new();
     for event in events {
-        if memory.ingest_event(event)? {
-            inserted = true;
+        if social_memory.ingest_event(event.clone())? {
+            recorded_events.push(event);
         }
     }
-    if inserted {
-        save_social_memory(&memory_path, &memory)?;
+    if !recorded_events.is_empty() {
+        save_social_memory(memory_path, social_memory)?;
     }
 
-    println!(
-        "Cloned workspace {} to {} at root {}",
-        workspace.id(),
-        workspace.root_dir().display(),
-        hex::encode(cloned_root.as_bytes())
-    );
-    Ok(())
+    let report = CloneWorkspaceReport {
+        workspace: workspace.id(),
+        path: workspace.root_dir().to_path_buf(),
+        root: cloned_root,
+        peer,
+        owner: remote_owner,
+        synced_social_events: synced_social_events_report.inserted_events,
+        recorded_events,
+    };
+    Ok((workspace, report))
 }
 
 fn discovered_workspace_fork_roots(base: &Path, workspace_id: &WorkspaceId) -> Vec<String> {
@@ -1091,7 +1149,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 handle_node_event(event, &event_context, &mut server, &mut social_memory).await;
             }
             Some(command) = control_rx.recv() => {
-                handle_daemon_control_command(command, &event_context, &mut social_memory).await;
+                handle_daemon_control_command(command, &event_context, &mut server, &mut social_memory).await;
             }
             _ = observe_tick.tick() => {
                 publish_workspace_announcements(
@@ -5461,6 +5519,7 @@ struct NodeEventContext<'a> {
 async fn handle_daemon_control_command(
     command: daemon::DaemonControlCommand,
     context: &NodeEventContext<'_>,
+    server: &mut WorkspaceServer,
     social_memory: &mut SocialMemory,
 ) {
     match command {
@@ -5472,6 +5531,12 @@ async fn handle_daemon_control_command(
         }
         daemon::DaemonControlCommand::AgentExec { request, reply } => {
             let result = handle_daemon_agent_exec(request, context, social_memory)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+        daemon::DaemonControlCommand::AgentSyncApply { request, reply } => {
+            let result = handle_daemon_agent_sync_apply(request, context, server, social_memory)
                 .await
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -5584,6 +5649,135 @@ async fn handle_daemon_agent_exec(
     }
 
     Ok(daemon_agent_exec_response(run.report, live_broadcast))
+}
+
+async fn handle_daemon_agent_sync_apply(
+    request: daemon::DaemonAgentSyncApplyRequest,
+    context: &NodeEventContext<'_>,
+    server: &mut WorkspaceServer,
+    social_memory: &mut SocialMemory,
+) -> Result<daemon::DaemonAgentSyncApplyResponse, Box<dyn std::error::Error>> {
+    let Some(workspace) = request.workspace.clone() else {
+        return Ok(daemon::DaemonAgentSyncApplyResponse {
+            workspace: None,
+            name: request.name,
+            applied: false,
+            mode: "daemon_ipc_apply_missing_workspace".into(),
+            message: "agent sync apply requires a workspace filter; no network changes were applied"
+                .into(),
+            suggested_command: Some(format!(
+                "nexus-node agent sync --base {} --workspace <workspace> --name <name> --apply --json",
+                context.base.display()
+            )),
+            clone: None,
+        });
+    };
+    let Some(name) = request.name.clone() else {
+        return Ok(daemon::DaemonAgentSyncApplyResponse {
+            workspace: Some(workspace.clone()),
+            name: None,
+            applied: false,
+            mode: "daemon_ipc_apply_missing_name".into(),
+            message:
+                "agent sync apply requires a local clone name; no network changes were applied"
+                    .into(),
+            suggested_command: Some(format!(
+                "nexus-node agent sync --base {} --workspace {} --name <name> --apply --json",
+                context.base.display(),
+                workspace
+            )),
+            clone: None,
+        });
+    };
+
+    let workspace_id = parse_workspace_id(&workspace)?;
+    let Some(discovered_source) = discover_clone_source(context.base, &workspace_id, None)? else {
+        return Ok(daemon::DaemonAgentSyncApplyResponse {
+            workspace: Some(workspace),
+            name: Some(name),
+            applied: false,
+            mode: "daemon_ipc_apply_no_clone_source".into(),
+            message: "daemon has no signed, addressed discovery source for this workspace; no network changes were applied".into(),
+            suggested_command: Some(format!(
+                "nexus-node discover --base {} --lan --json --workspace {}",
+                context.base.display(),
+                workspace_id
+            )),
+            clone: None,
+        });
+    };
+
+    let discovered_fork_roots = discovered_workspace_fork_roots(context.base, &workspace_id);
+    let peer = discovered_source.peer;
+    let peer_ready = context.network.is_connected(peer);
+    let (workspace_handle, report) = clone_workspace_from_network(
+        context.base,
+        context.network,
+        context.identity,
+        social_memory,
+        context.memory_path,
+        workspace_id,
+        name,
+        None,
+        peer,
+        Some(&discovered_source),
+        &discovered_fork_roots,
+        peer_ready,
+    )
+    .await?;
+    server.register(workspace_handle);
+
+    if !report.synced_social_events.is_empty() || !report.recorded_events.is_empty() {
+        context.event_journal.push(
+            "social_event",
+            format!(
+                "social_event source=local_agent_sync_apply events={} agents={}",
+                social_memory.event_count(),
+                social_memory.agent_count()
+            ),
+        );
+    }
+    let peer_source = Some(report.peer);
+    for event in &report.synced_social_events {
+        record_daemon_social_event_change_from_event(context.event_journal, &peer_source, event);
+    }
+    let mut live_broadcast = !report.recorded_events.is_empty();
+    for event in &report.recorded_events {
+        record_daemon_social_event_change_from_event(context.event_journal, &None, event);
+        live_broadcast &= publish_social_event_with_retry(context.network, event).await;
+    }
+
+    Ok(daemon::DaemonAgentSyncApplyResponse {
+        workspace: Some(report.workspace.to_string()),
+        name: Some(
+            report
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| report.workspace.to_string()),
+        ),
+        applied: true,
+        mode: "daemon_ipc_clone".into(),
+        message: format!(
+            "daemon cloned workspace {} to {} at root {}",
+            report.workspace,
+            report.path.display(),
+            hex::encode(report.root.as_bytes())
+        ),
+        suggested_command: Some(format!(
+            "nexus-node agent status --base {} --json",
+            context.base.display()
+        )),
+        clone: Some(daemon::DaemonAgentSyncCloneResult {
+            path: report.path.display().to_string(),
+            root: hex::encode(report.root.as_bytes()),
+            peer: report.peer.to_string(),
+            owner: report.owner.to_string(),
+            synced_social_events: report.synced_social_events.len(),
+            recorded_social_events: report.recorded_events.len(),
+            live_broadcast,
+        }),
+    })
 }
 
 fn daemon_agent_exec_options(
@@ -7998,6 +8192,145 @@ mod tests {
             .any(|snapshot| snapshot.actor == *owner.did()
                 && snapshot.root == root
                 && snapshot.label.as_deref() == Some("served")));
+    }
+
+    #[tokio::test]
+    async fn daemon_sync_apply_clones_discovered_workspace_through_daemon_network() {
+        let owner_base = TempDir::new().unwrap();
+        let owner = load_or_create_identity(owner_base.path()).unwrap();
+        let mut source = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "daemon-apply-source".into(),
+                description: "remote AI computer cloned through daemon apply".into(),
+            },
+        )
+        .await
+        .unwrap();
+        source
+            .write_file("daemon.txt", b"daemon-routed clone")
+            .unwrap();
+        let root = source.snapshot().await.unwrap();
+        let workspace_id = source.id();
+
+        let mut owner_network = Network::new(
+            &owner,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let owner_addr = wait_for_test_listen(&mut owner_network).await;
+        let owner_peer = owner_network.local_peer_id();
+        let mut owner_server = WorkspaceServer::new(Arc::new(owner_network.clone()));
+        owner_server.register(source);
+        let announcement = workspace_announcement(
+            &owner,
+            owner_peer,
+            vec![owner_addr],
+            owner_server.workspaces().next().unwrap(),
+            75,
+        )
+        .unwrap();
+        let mut remote_memory = SocialMemory::new();
+        for event in signed_presence_events(
+            &owner,
+            build_node_manifest(&owner, owner_base.path(), 300),
+            &[PresenceWorkspace {
+                id: workspace_id,
+                owner_root: Some(root),
+            }],
+            &remote_memory,
+            300,
+        )
+        .unwrap()
+        {
+            assert!(remote_memory.ingest_event(event).unwrap());
+        }
+        let serve_task = spawn_test_workspace_social_server(
+            Arc::new(load_or_create_identity(owner_base.path()).unwrap()),
+            &owner_network,
+            owner_server,
+            remote_memory.clone(),
+        );
+
+        let clone_base = TempDir::new().unwrap();
+        assert!(record_workspace_announcement(clone_base.path(), announcement).unwrap());
+        let clone_identity = load_or_create_identity(clone_base.path()).unwrap();
+        let clone_network = Network::new(
+            &clone_identity,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut clone_server = WorkspaceServer::new(Arc::new(clone_network.clone()));
+        let memory_path = clone_base.path().join(".nexus-social-memory.json");
+        let mut social_memory = load_social_memory(&memory_path).unwrap();
+        let event_journal = daemon::DaemonEventJournalHandle::new();
+        let context = NodeEventContext {
+            network: &clone_network,
+            memory_path: &memory_path,
+            base: clone_base.path(),
+            identity: &clone_identity,
+            event_journal: &event_journal,
+        };
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        handle_daemon_control_command(
+            daemon::DaemonControlCommand::AgentSyncApply {
+                request: daemon::DaemonAgentSyncApplyRequest {
+                    workspace: Some(workspace_id.to_string()),
+                    name: Some("daemon-apply-clone".into()),
+                },
+                reply,
+            },
+            &context,
+            &mut clone_server,
+            &mut social_memory,
+        )
+        .await;
+        let response = reply_rx.await.unwrap().unwrap();
+
+        serve_task.abort();
+
+        assert!(response.applied);
+        assert_eq!(response.mode, "daemon_ipc_clone");
+        let clone_result = response.clone.expect("clone result should be reported");
+        assert_eq!(clone_result.root, hex::encode(root.as_bytes()));
+        assert_eq!(clone_result.peer, owner_peer.to_string());
+        assert_eq!(clone_result.owner, owner.did().to_string());
+        assert_eq!(clone_result.recorded_social_events, 2);
+        assert!(clone_result.synced_social_events >= remote_memory.event_count());
+        assert_eq!(clone_server.workspace_count(), 1);
+
+        let cloned_path = clone_base.path().join("daemon-apply-clone");
+        let cloned = Workspace::load(&clone_identity, &cloned_path)
+            .await
+            .unwrap();
+        assert_eq!(cloned.id(), workspace_id);
+        assert_eq!(cloned.root_cid(), Some(root));
+        assert_eq!(
+            cloned.read_file("daemon.txt").unwrap(),
+            b"daemon-routed clone"
+        );
+        assert_eq!(
+            local_workspace_paths(clone_base.path()).unwrap(),
+            vec![normalize_workspace_path(&cloned_path).unwrap()]
+        );
+        let persisted_memory = load_social_memory(&memory_path).unwrap();
+        assert!(persisted_memory.society().has_agent(owner.did()));
+        assert!(persisted_memory
+            .society()
+            .workspace_snapshots(&workspace_id)
+            .into_iter()
+            .any(|snapshot| snapshot.actor == *clone_identity.did()
+                && snapshot.root == root
+                && snapshot.label.as_deref() == Some("cloned")));
     }
 
     #[tokio::test]
