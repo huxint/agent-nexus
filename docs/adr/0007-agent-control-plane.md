@@ -41,7 +41,7 @@ nexus-node agent watch --base <DIR> [--since <CURSOR>] [--limit <N>] [--interval
 nexus-node agent discover --base <DIR> [--json] [--verified] [--clone-ready] ...
 nexus-node agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--json]
 nexus-node agent exec --base <DIR> --workspace <PATH> [--json] -- <CMD> [ARG...]
-nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]
+nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--apply] [--json]
 ```
 
 `agent status` reports existing identity metadata, local workspace metadata,
@@ -80,8 +80,10 @@ metadata and cached workspace discovery, returns `nexus.agent_sync.v1`, and
 suggests explicit `clone`, `discover`, or daemon-start commands. When daemon
 IPC is available it asks the base-scoped control socket for `agent_sync`
 discovery data, then builds the local plan from that daemon-side cache
-projection. It does not start a short-lived network node or create/decrypt
-identity; daemon-backed live sync remains part of the pending IPC route.
+projection. Without `--apply` it does not start a short-lived network node or
+create/decrypt identity. With `--apply`, daemon IPC routes clone-ready
+workspaces through the daemon network, and routes already-local workspaces
+through live refresh when a signed, addressed discovery source is cached.
 
 Agent-owned JSON issues use a stable `AgentIssue` object with `kind`, `message`,
 and `suggested_command`, including cache read failures, local fallback delivery,
