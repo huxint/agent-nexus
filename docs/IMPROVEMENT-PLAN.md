@@ -438,8 +438,8 @@
 - [x] `agent discover` 在 daemon IPC 可用时通过 `agent_discover` control request 读取 daemon 侧 discovery cache；IPC 失败时退回本地 cache 并返回结构化问题。
 - [x] `agent sync` 在 daemon IPC 可用时通过 `agent_sync` control request 读取 daemon 侧 discovery cache，再在本地生成 clone/sync plan；IPC 失败时退回本地 cache 并返回结构化问题。
 - [x] `agent sync --apply --workspace <HEX> --name <TEXT>` 在 daemon IPC 可用、且 discovery cache 有已签名地址来源时，通过 `agent_sync_apply` control request 复用 daemon network 执行 clone，落盘 workspace、注册本地路径、写入 social memory，并在 JSON `apply.clone` 中返回 path/root/peer/owner。
-- [x] 已存在本地 workspace 的 `agent sync --apply --workspace <HEX>` 已经 daemon-routed 到明确控制面边界：`applied=false`、`mode=daemon_ipc_refresh_pending`、`suggested_command` 指向 inspect/sync 计划；不误走 clone、不要求 `--name`。
-- [ ] 已存在本地 workspace 的真正 live refresh/apply 仍需后续 daemon-routed 实现；当前只返回 pending 边界、inspect/refresh 计划或专家命令提示。
+- [x] 已存在本地 workspace 的 `agent sync --apply --workspace <HEX>` 在 daemon IPC 可用、且 discovery cache 有已签名地址来源时，复用 daemon network 拉取远端根、替换本地可见文件树、保留应用前快照，并记录本地 `refreshed` workspace snapshot 事件；不误走 clone、不要求 `--name`。
+- [x] 已存在本地 workspace 但缺少签名地址来源时返回明确控制面边界：`applied=false`、`mode=daemon_ipc_refresh_no_source`、`suggested_command` 指向 `discover --lan --json --workspace <HEX>`。
 - [x] `agent inbox` 在 daemon IPC 可用时通过 daemon event journal 获取增量事件，并通过 `agent_discover` control request 读取 daemon 侧 discovery cache 生成 clone-ready 提示；IPC 失败时退回本地 cache 并显式标注来源。
 - [x] daemon 不存在时，`agent discover` 读 discovery cache 并给出显式联网刷新提示；不启动网络、不创建身份、不解密私钥。
 - [x] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。
@@ -468,7 +468,7 @@
 - [x] 增加 `nexus-node agent up --base <DIR> ...` 作为 AI 面向的 daemon 启动动词，复用 daemon start 语义并返回 `nexus.agent_up.v1`。
 - [x] 增加 `nexus-node agent send --base <DIR> ...`，用短命令把 status/need/offer/proposal/goal 写入签名本地 social memory，并显式返回 local-only delivery 状态。
 - [x] 增加 `nexus-node agent exec --base <DIR> --workspace <PATH> ... -- <CMD>`，复用现有 `exec` 自由运行、快照和社会记忆记录语义，并返回 `nexus.agent_exec.v1`。
-- [x] 增加 `nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]`，先提供本地 workspace + discovery cache 的 sync/clone 计划视图，不启动短生命周期网络。
+- [x] 增加 `nexus-node agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--apply] [--json]`，先提供本地 workspace + discovery cache 的 sync/clone 计划视图，不启动短生命周期网络；`--apply` 在 daemon IPC 可用时复用 daemon network 执行 clone 或 refresh。
 - [x] 保留现有专家命令，但帮助文案先显示 agent path，再显示 advanced path。
 - [x] 在 `CONTEXT.md` 增加“AI 每轮操作建议”：先 `agent status`，再根据 daemon/society/discovery 决策。
 **完成判据**：新 AI 只靠 top-level help 就能完成启动、查看状态、发现/收消息、发消息、执行并记录结果。

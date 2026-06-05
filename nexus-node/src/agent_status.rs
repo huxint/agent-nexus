@@ -828,7 +828,8 @@ fn cmd_agent_sync(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--global" | "--online" | "--lan" | "--bootstrap" | "--invite" | "--listen"
             | "--timeout-ms" | "--peer" => {
                 return Err(format!(
-                    "agent sync is cache-backed for now; use `nexus-node clone {}` or `nexus-node discover {}` for explicit network work",
+                    "agent sync does not accept {}; use `nexus-node agent sync --apply` with a running daemon, or `nexus-node clone {}` / `nexus-node discover {}` for explicit short-lived network work",
+                    args[i],
                     args[i], args[i]
                 )
                 .into());

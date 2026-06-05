@@ -462,6 +462,49 @@ impl Workspace {
         Ok(root_cid)
     }
 
+    /// Replace the visible workspace tree with a snapshot fetched into another
+    /// block store, preserving the current local state as a retained snapshot.
+    pub async fn apply_snapshot_from_store(
+        &mut self,
+        root_cid: Cid,
+        source_store: &dyn BlockStore,
+    ) -> WorkspaceResult<Cid> {
+        let previous_root = self.snapshot().await?;
+        if previous_root == root_cid {
+            return Ok(previous_root);
+        }
+
+        let staging_dir = self.apply_staging_dir();
+        if staging_dir.exists() {
+            filesystem::remove_dir_all(&staging_dir)?;
+        }
+        filesystem::ensure_dir(&staging_dir)?;
+
+        let apply_result = async {
+            Self::restore_tree(
+                source_store,
+                self.store.as_ref(),
+                &root_cid,
+                &staging_dir,
+                &staging_dir,
+            )
+            .await?;
+            replace_visible_workspace_entries(&self.root_dir, &staging_dir)?;
+            Ok::<(), WorkspaceError>(())
+        }
+        .await;
+
+        let _ = filesystem::remove_dir_all(&staging_dir);
+        apply_result?;
+
+        self.root_cid = Some(root_cid);
+        self.snapshot_history.push(root_cid);
+        self.trim_snapshot_history();
+        self.file_cache.clear();
+        self.persist_metadata()?;
+        Ok(previous_root)
+    }
+
     /// Garbage collect unreachable block-store entries.
     pub async fn gc_block_store(&self) -> WorkspaceResult<GcReport> {
         let roots = self.snapshot_roots_for_gc();
@@ -608,13 +651,7 @@ impl Workspace {
         let metadata = std::fs::metadata(path)?;
         let signature = FileSignature::from_metadata(&metadata);
         let relative = path.strip_prefix(base).unwrap_or(path).to_path_buf();
-
-        if let Some(cached) = previous_cache.get(&relative) {
-            if cached.signature == signature && store.has(&cached.cid).await? {
-                next_cache.insert(relative, cached.clone());
-                return Ok(cached.cid);
-            }
-        }
+        let _ = previous_cache;
 
         let cid = if metadata.len() <= FILE_CHUNK_SIZE_BYTES as u64 {
             let data = std::fs::read(path)?;
@@ -757,6 +794,15 @@ impl Workspace {
 
         std::fs::write(&full_path, data)?;
         Ok(())
+    }
+
+    fn apply_staging_dir(&self) -> PathBuf {
+        let mut nonce = [0_u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        self.root_dir
+            .join(".nexus")
+            .join("apply-staging")
+            .join(hex::encode(nonce))
     }
 
     fn persist_metadata(&self) -> WorkspaceResult<()> {
@@ -957,6 +1003,35 @@ fn checked_child_path(base: &Path, root_dir: &Path, name: &str) -> WorkspaceResu
         )));
     }
     Ok(base.join(child))
+}
+
+fn replace_visible_workspace_entries(root_dir: &Path, staging_dir: &Path) -> WorkspaceResult<()> {
+    clear_visible_workspace_entries(root_dir)?;
+    for entry in std::fs::read_dir(staging_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let target = checked_child_path(root_dir, root_dir, &name)?;
+        std::fs::rename(entry.path(), target)?;
+    }
+    Ok(())
+}
+
+fn clear_visible_workspace_entries(root_dir: &Path) -> WorkspaceResult<()> {
+    for entry in std::fs::read_dir(root_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".nexus" {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1273,23 @@ mod tests {
         assert_eq!(ws.root_cid().unwrap(), cid2);
     }
 
+    #[tokio::test]
+    async fn snapshot_detects_same_length_rewrites() {
+        let (mut ws, _base) = setup_workspace().await;
+
+        ws.write_file("state.txt", b"one").unwrap();
+        let cid1 = ws.snapshot().await.expect("snapshot 1");
+
+        ws.write_file("state.txt", b"two").unwrap();
+        let cid2 = ws.snapshot().await.expect("snapshot 2");
+
+        assert_ne!(cid1, cid2);
+        let root_node = ws.store.get(&cid2).await.unwrap();
+        let entry = root_node.lookup("state.txt").expect("state file entry");
+        let file_node = ws.store.get(&entry.cid).await.unwrap();
+        assert_eq!(file_node.as_blob().unwrap(), b"two");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn snapshot_and_listing_skip_symlinks() {
@@ -1274,6 +1366,118 @@ mod tests {
         let loaded = Workspace::load(&owner, &clone_path).await.unwrap();
         assert_eq!(loaded.id(), source.id());
         assert_eq!(loaded.owner(), remote_owner.did());
+    }
+
+    #[tokio::test]
+    async fn apply_snapshot_from_store_replaces_visible_workspace_tree() {
+        let owner = NodeIdentity::generate();
+        let base = TempDir::new().unwrap();
+        let mut source = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "source".into(),
+                description: "source workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+        source.write_file("same.txt", b"old").unwrap();
+        source.write_file("remove-me.txt", b"old").unwrap();
+        let old_root = source.snapshot().await.unwrap();
+
+        let clone_path = base.path().join("apply-target");
+        let mut target = Workspace::materialize_from_store(
+            owner.did(),
+            &clone_path,
+            WorkspaceConfig {
+                name: "apply-target".into(),
+                description: "target workspace".into(),
+            },
+            source.id(),
+            old_root,
+            source.store.as_ref(),
+        )
+        .await
+        .unwrap();
+        target.write_file("local-only.txt", b"local").unwrap();
+
+        std::fs::remove_file(source.root_dir().join("remove-me.txt")).unwrap();
+        source.write_file("same.txt", b"new").unwrap();
+        source.write_file("nested/new.txt", b"fresh").unwrap();
+        let new_root = source.snapshot().await.unwrap();
+
+        let previous_root = target
+            .apply_snapshot_from_store(new_root, source.store.as_ref())
+            .await
+            .unwrap();
+
+        assert_ne!(previous_root, old_root);
+        assert_eq!(target.root_cid(), Some(new_root));
+        assert_eq!(target.read_file("same.txt").unwrap(), b"new");
+        assert_eq!(target.read_file("nested/new.txt").unwrap(), b"fresh");
+        assert!(!clone_path.join("remove-me.txt").exists());
+        assert!(!clone_path.join("local-only.txt").exists());
+        assert!(clone_path.join(".nexus/config.json").exists());
+    }
+
+    #[tokio::test]
+    async fn apply_snapshot_from_store_rejects_root_nexus_tree_before_replacing_files() {
+        let owner = NodeIdentity::generate();
+        let base = TempDir::new().unwrap();
+        let source = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "source".into(),
+                description: "source workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut target = Workspace::create(
+            &owner,
+            base.path(),
+            WorkspaceConfig {
+                name: "target".into(),
+                description: "target workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+        target.write_file("safe.txt", b"safe").unwrap();
+
+        let blob_cid = source
+            .store
+            .put(MerkleNode::blob(b"poison".to_vec()))
+            .await
+            .unwrap();
+        let nexus_cid = source
+            .store
+            .put(MerkleNode::tree(vec![TreeEntry {
+                name: "config.json".into(),
+                cid: blob_cid,
+                kind: NodeKind::Blob,
+            }]))
+            .await
+            .unwrap();
+        let root_cid = source
+            .store
+            .put(MerkleNode::tree(vec![TreeEntry {
+                name: ".nexus".into(),
+                cid: nexus_cid,
+                kind: NodeKind::Tree,
+            }]))
+            .await
+            .unwrap();
+
+        let err = target
+            .apply_snapshot_from_store(root_cid, source.store.as_ref())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid workspace tree entry"));
+        assert_eq!(target.read_file("safe.txt").unwrap(), b"safe");
     }
 
     #[tokio::test]

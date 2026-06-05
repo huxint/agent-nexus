@@ -7,7 +7,7 @@
 //!   nexus-node agent inbox --base <dir> [--agent <did>] [--since <cursor>] [--limit <n>] [--json]
 //!   nexus-node agent watch --base <dir> [--since <cursor>] [--limit <n>] [--interval-ms <n>] [--json]
 //!   nexus-node agent discover --base <dir> [--json] [--verified] [--clone-ready] [--workspace <hex>] [--peer <peer-id>] [--owner <did>] [--name <text>]
-//!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--json]
+//!   nexus-node agent sync --base <dir> [--workspace <hex>] [--name <text>] [--apply] [--json]
 //!   nexus-node agent send --base <dir> [--kind <goal|need|offer|proposal|status>] --title <text> [--body <text>] [--workspace <hex>] [--task <id>] [--capability <name>] [--tag <text>...] [--expires-at <ts>] [--json]
 //!   nexus-node agent exec --base <dir> --workspace <path> [--isolation auto|native|bubblewrap] [--cwd <dir>] [--env KEY=VALUE] [--stdin <text>|--stdin-file <path>] [--timeout-ms <n>] [--note <text>] [--json] -- <command> [args...]
 //!
@@ -166,7 +166,9 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} agent discover --base <DIR> [--json] [--sort <relevance|clone-ready|name|owner|latest>] [--verified] [--clone-ready] [--workspace <HEX>] [--peer <PEER_ID>] [--owner <DID>] [--name <TEXT>]"
     );
-    eprintln!("  {prog} agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--json]");
+    eprintln!(
+        "  {prog} agent sync --base <DIR> [--workspace <HEX>] [--name <TEXT>] [--apply] [--json]"
+    );
     eprintln!(
         "  {prog} agent send --base <DIR> [--kind <goal|need|offer|proposal|status>] --title <TEXT> [--body <TEXT>] [--workspace <HEX>] [--task <ID>] [--capability <NAME>] [--tag <TEXT>...] [--expires-at <TS>] [--json]"
     );
@@ -353,6 +355,17 @@ async fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 struct CloneWorkspaceReport {
     workspace: WorkspaceId,
     path: PathBuf,
+    root: Cid,
+    peer: libp2p::PeerId,
+    owner: Did,
+    synced_social_events: Vec<SocialEvent>,
+    recorded_events: Vec<SocialEvent>,
+}
+
+struct RefreshWorkspaceReport {
+    workspace: WorkspaceId,
+    path: PathBuf,
+    previous_root: Cid,
     root: Cid,
     peer: libp2p::PeerId,
     owner: Did,
@@ -672,6 +685,145 @@ async fn clone_workspace_from_network(
         recorded_events,
     };
     Ok((workspace, report))
+}
+
+async fn refresh_workspace_from_network(
+    base: &Path,
+    network: &Network,
+    identity: &NodeIdentity,
+    social_memory: &mut SocialMemory,
+    memory_path: &Path,
+    workspace: &mut Workspace,
+    peer: libp2p::PeerId,
+    discovered_source: Option<&DiscoveredCloneSource>,
+    peer_ready: bool,
+) -> Result<RefreshWorkspaceReport, Box<dyn std::error::Error>> {
+    if !peer_ready {
+        if let Some(discovered) = discovered_source {
+            for addr in &discovered.addrs {
+                network.dial(addr.clone());
+            }
+        }
+        wait_for_peer_connected(network, peer, Duration::from_secs(15)).await?;
+    }
+
+    let workspace_id = workspace.id();
+    let local_owner = workspace.owner().clone();
+    let local_path = workspace.root_dir().to_path_buf();
+    let synced_social_events_report =
+        request_social_events_from_peer(network, peer, social_memory, memory_path).await;
+    if synced_social_events_report.inserted > 0 {
+        tracing::info!(
+            "synced {} social events before refreshing workspace {}",
+            synced_social_events_report.inserted,
+            workspace_id
+        );
+    }
+
+    let client = SyncClient::new(network.sync_request_channel());
+    let state = client.get_state(peer, workspace_id).await?;
+    let (remote_owner, root_cid) = match state {
+        SyncResponse::StateResponse {
+            workspace_id: got_workspace,
+            root_cid_hex,
+            owner_did,
+            ..
+        } if got_workspace == workspace_id => (Did::new(owner_did), parse_cid(&root_cid_hex)?),
+        SyncResponse::WorkspaceNotFound { .. } => return Err("remote workspace not found".into()),
+        other => return Err(format!("unexpected state response: {other:?}").into()),
+    };
+    if remote_owner != local_owner {
+        return Err(format!(
+            "remote owner {} does not match local workspace owner {}",
+            remote_owner, local_owner
+        )
+        .into());
+    }
+    if let Some(discovered) = discovered_source {
+        if remote_owner != discovered.owner {
+            return Err(format!(
+                "remote owner {} does not match signed discovery owner {}",
+                remote_owner, discovered.owner
+            )
+            .into());
+        }
+        if let Some(expected_root) = discovered.root {
+            if root_cid != expected_root {
+                return Err(format!(
+                    "remote root {} does not match signed discovery root {}",
+                    hex::encode(root_cid.as_bytes()),
+                    hex::encode(expected_root.as_bytes())
+                )
+                .into());
+            }
+        }
+    }
+
+    let sync_store_path = base
+        .join(".nexus")
+        .join("synced-blocks")
+        .join(workspace_id.to_string());
+    let sync_store: Arc<dyn BlockStore> = Arc::new(DiskBlockStore::new(sync_store_path));
+    let refreshed_root = client
+        .clone_workspace(peer, workspace_id, &sync_store)
+        .await?;
+    if refreshed_root != root_cid {
+        return Err(format!(
+            "remote root changed while refreshing: expected {}, got {}",
+            hex::encode(root_cid.as_bytes()),
+            hex::encode(refreshed_root.as_bytes())
+        )
+        .into());
+    }
+
+    let previous_root = workspace
+        .apply_snapshot_from_store(refreshed_root, sync_store.as_ref())
+        .await?;
+    let now = unix_now().max(
+        social_memory
+            .events()
+            .iter()
+            .map(|event| event.timestamp)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let events = social_memory.sign_event_sequence(
+        identity,
+        [(
+            now,
+            SocialEventKind::WorkspaceSnapshotted {
+                snapshot: WorkspaceSnapshot {
+                    workspace: workspace.id(),
+                    actor: identity.did().clone(),
+                    root: refreshed_root,
+                    label: Some("refreshed".into()),
+                    note: Some(format!("refreshed from peer {peer}")),
+                    timestamp: now,
+                },
+            },
+        )],
+    )?;
+    let mut recorded_events = Vec::new();
+    for event in events {
+        if social_memory.ingest_event(event.clone())? {
+            recorded_events.push(event);
+        }
+    }
+    if !recorded_events.is_empty() {
+        save_social_memory(memory_path, social_memory)?;
+    }
+
+    Ok(RefreshWorkspaceReport {
+        workspace: workspace.id(),
+        path: local_path,
+        previous_root,
+        root: refreshed_root,
+        peer,
+        owner: remote_owner,
+        synced_social_events: synced_social_events_report.inserted_events,
+        recorded_events,
+    })
 }
 
 fn discovered_workspace_fork_roots(base: &Path, workspace_id: &WorkspaceId) -> Vec<String> {
@@ -5674,19 +5826,90 @@ async fn handle_daemon_agent_sync_apply(
     };
     let workspace_id = parse_workspace_id(&workspace)?;
     if let Some(local_workspace) = server.get(&workspace_id) {
+        let local_name = local_workspace.name().to_string();
+        let Some(discovered_source) = discover_clone_source(context.base, &workspace_id, None)?
+        else {
+            return Ok(daemon::DaemonAgentSyncApplyResponse {
+                workspace: Some(workspace_id.to_string()),
+                name: Some(local_name),
+                applied: false,
+                mode: "daemon_ipc_refresh_no_source".into(),
+                message: format!(
+                    "workspace {} is already local, but daemon has no signed, addressed discovery source to refresh it; no network changes were applied",
+                    workspace_id
+                ),
+                suggested_command: Some(format!(
+                    "nexus-node discover --base {} --lan --json --workspace {}",
+                    context.base.display(),
+                    workspace_id
+                )),
+                clone: None,
+            });
+        };
+        let peer = discovered_source.peer;
+        let peer_ready = context.network.is_connected(peer);
+        let report = {
+            let workspace = server
+                .get_mut(&workspace_id)
+                .ok_or("local workspace disappeared before refresh")?;
+            refresh_workspace_from_network(
+                context.base,
+                context.network,
+                context.identity,
+                social_memory,
+                context.memory_path,
+                workspace,
+                peer,
+                Some(&discovered_source),
+                peer_ready,
+            )
+            .await?
+        };
+
+        if !report.synced_social_events.is_empty() || !report.recorded_events.is_empty() {
+            context.event_journal.push(
+                "social_event",
+                format!(
+                    "social_event source=local_agent_sync_refresh events={} agents={}",
+                    social_memory.event_count(),
+                    social_memory.agent_count()
+                ),
+            );
+        }
+        let peer_source = Some(report.peer);
+        for event in &report.synced_social_events {
+            record_daemon_social_event_change_from_event(
+                context.event_journal,
+                &peer_source,
+                event,
+            );
+        }
+        for event in &report.recorded_events {
+            record_daemon_social_event_change_from_event(context.event_journal, &None, event);
+            let _ = publish_social_event_with_retry(context.network, event).await;
+        }
+
         return Ok(daemon::DaemonAgentSyncApplyResponse {
-            workspace: Some(workspace_id.to_string()),
-            name: Some(local_workspace.name().to_string()),
-            applied: false,
-            mode: "daemon_ipc_refresh_pending".into(),
+            workspace: Some(report.workspace.to_string()),
+            name: report
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .or(Some(local_name)),
+            applied: true,
+            mode: "daemon_ipc_refresh".into(),
             message: format!(
-                "workspace {} is already local; daemon-routed live refresh/apply is not implemented yet, so no network changes were applied",
-                workspace_id
+                "daemon refreshed workspace {} at {} from peer {} owner {}: {} -> {}",
+                report.workspace,
+                report.path.display(),
+                report.peer,
+                report.owner,
+                hex::encode(report.previous_root.as_bytes()),
+                hex::encode(report.root.as_bytes())
             ),
             suggested_command: Some(format!(
-                "nexus-node agent sync --base {} --workspace {} --json",
-                context.base.display(),
-                workspace_id
+                "nexus-node agent status --base {} --json",
+                context.base.display()
             )),
             clone: None,
         });
@@ -7376,6 +7599,25 @@ mod tests {
         addr.with(Protocol::P2p(peer))
     }
 
+    async fn copy_workspace_tree_to_store(
+        source: &Workspace,
+        target: &dyn BlockStore,
+        cid: &Cid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let node = source.get_block(cid).await?;
+        if let Some(entries) = node.as_tree() {
+            for entry in entries {
+                Box::pin(copy_workspace_tree_to_store(source, target, &entry.cid)).await?;
+            }
+        } else if let Some((chunks, _)) = node.as_chunked_blob() {
+            for chunk in chunks {
+                Box::pin(copy_workspace_tree_to_store(source, target, chunk)).await?;
+            }
+        }
+        target.put(node).await?;
+        Ok(())
+    }
+
     async fn publish_test_announce(network: &Network, data: Vec<u8>) {
         let mut last_error = None;
         for _ in 0..40 {
@@ -8352,7 +8594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_sync_apply_existing_workspace_returns_refresh_pending_boundary() {
+    async fn daemon_sync_apply_existing_workspace_without_discovery_returns_refresh_source_hint() {
         let base = TempDir::new().unwrap();
         let identity = load_or_create_identity(base.path()).unwrap();
         let mut workspace = Workspace::create(
@@ -8408,21 +8650,171 @@ mod tests {
         let response = reply_rx.await.unwrap().unwrap();
 
         assert!(!response.applied);
-        assert_eq!(response.mode, "daemon_ipc_refresh_pending");
+        assert_eq!(response.mode, "daemon_ipc_refresh_no_source");
         assert_eq!(response.workspace, Some(workspace_id.to_string()));
         assert_eq!(response.name.as_deref(), Some("local-daemon-workspace"));
         assert!(response.clone.is_none());
         let suggested = response
             .suggested_command
             .as_deref()
-            .expect("pending refresh boundary should include a suggested command");
-        assert!(suggested.contains("nexus-node agent sync"));
+            .expect("missing refresh source should include a suggested command");
+        assert!(suggested.contains("nexus-node discover"));
+        assert!(suggested.contains("--lan"));
         assert!(suggested.contains("--json"));
         assert!(suggested.contains(&workspace_id.to_string()));
         assert!(response
             .message
-            .contains("daemon-routed live refresh/apply is not implemented yet"));
+            .contains("no signed, addressed discovery source"));
         assert_eq!(server.workspace_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_sync_apply_refreshes_existing_workspace_through_daemon_network() {
+        let owner_base = TempDir::new().unwrap();
+        let owner = load_or_create_identity(owner_base.path()).unwrap();
+        let mut source = Workspace::create(
+            &owner,
+            owner_base.path(),
+            WorkspaceConfig {
+                name: "daemon-refresh-source".into(),
+                description: "remote AI computer refreshed through daemon apply".into(),
+            },
+        )
+        .await
+        .unwrap();
+        source.write_file("state.txt", b"old").unwrap();
+        source.write_file("remove-me.txt", b"remote old").unwrap();
+        let old_root = source.snapshot().await.unwrap();
+        let workspace_id = source.id();
+
+        let clone_base = TempDir::new().unwrap();
+        let clone_identity = load_or_create_identity(clone_base.path()).unwrap();
+        let clone_path = clone_base.path().join("daemon-refresh-local");
+        let initial_store = DiskBlockStore::new(clone_base.path().join("initial-refresh-blocks"));
+        copy_workspace_tree_to_store(&source, &initial_store, &old_root)
+            .await
+            .unwrap();
+        let local_workspace = Workspace::materialize_from_store(
+            owner.did(),
+            &clone_path,
+            WorkspaceConfig {
+                name: "daemon-refresh-local".into(),
+                description: "local stale workspace".into(),
+            },
+            workspace_id,
+            old_root,
+            &initial_store,
+        )
+        .await
+        .unwrap();
+        local_workspace
+            .write_file("local-only.txt", b"local edit before refresh")
+            .unwrap();
+
+        std::fs::remove_file(source.root_dir().join("remove-me.txt")).unwrap();
+        source
+            .write_file("state.txt", b"new via daemon refresh")
+            .unwrap();
+        source
+            .write_file("nested/fresh.txt", b"fresh remote file")
+            .unwrap();
+        let new_root = source.snapshot().await.unwrap();
+        assert_ne!(old_root, new_root);
+
+        let mut owner_network = Network::new(
+            &owner,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let owner_addr = wait_for_test_listen(&mut owner_network).await;
+        let owner_peer = owner_network.local_peer_id();
+        let mut owner_server = WorkspaceServer::new(Arc::new(owner_network.clone()));
+        let announcement =
+            workspace_announcement(&owner, owner_peer, vec![owner_addr], &source, 90).unwrap();
+        owner_server.register(source);
+        let remote_memory = SocialMemory::new();
+        let serve_task = spawn_test_workspace_social_server(
+            Arc::new(load_or_create_identity(owner_base.path()).unwrap()),
+            &owner_network,
+            owner_server,
+            remote_memory,
+        );
+
+        assert!(record_workspace_announcement(clone_base.path(), announcement).unwrap());
+        let clone_network = Network::new(
+            &clone_identity,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut clone_server = WorkspaceServer::new(Arc::new(clone_network.clone()));
+        clone_server.register(local_workspace);
+        let memory_path = clone_base.path().join(".nexus-social-memory.json");
+        let mut social_memory = load_social_memory(&memory_path).unwrap();
+        let event_journal = daemon::DaemonEventJournalHandle::new();
+        let context = NodeEventContext {
+            network: &clone_network,
+            memory_path: &memory_path,
+            base: clone_base.path(),
+            identity: &clone_identity,
+            event_journal: &event_journal,
+        };
+
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        handle_daemon_control_command(
+            daemon::DaemonControlCommand::AgentSyncApply {
+                request: daemon::DaemonAgentSyncApplyRequest {
+                    workspace: Some(workspace_id.to_string()),
+                    name: None,
+                },
+                reply,
+            },
+            &context,
+            &mut clone_server,
+            &mut social_memory,
+        )
+        .await;
+        let response = reply_rx.await.unwrap().unwrap();
+
+        serve_task.abort();
+
+        assert!(response.applied);
+        assert_eq!(response.mode, "daemon_ipc_refresh");
+        assert_eq!(response.workspace, Some(workspace_id.to_string()));
+        assert_eq!(response.name.as_deref(), Some("daemon-refresh-local"));
+        assert!(response.clone.is_none());
+        assert!(response.message.contains(&hex::encode(new_root.as_bytes())));
+        assert_eq!(clone_server.workspace_count(), 1);
+
+        let refreshed = Workspace::load(&clone_identity, &clone_path).await.unwrap();
+        assert_eq!(refreshed.id(), workspace_id);
+        assert_eq!(refreshed.root_cid(), Some(new_root));
+        assert_eq!(
+            refreshed.read_file("state.txt").unwrap(),
+            b"new via daemon refresh"
+        );
+        assert_eq!(
+            refreshed.read_file("nested/fresh.txt").unwrap(),
+            b"fresh remote file"
+        );
+        assert!(!clone_path.join("remove-me.txt").exists());
+        assert!(!clone_path.join("local-only.txt").exists());
+
+        let persisted_memory = load_social_memory(&memory_path).unwrap();
+        assert!(persisted_memory
+            .society()
+            .workspace_snapshots(&workspace_id)
+            .into_iter()
+            .any(|snapshot| snapshot.actor == *clone_identity.did()
+                && snapshot.root == new_root
+                && snapshot.label.as_deref() == Some("refreshed")));
     }
 
     #[tokio::test]
