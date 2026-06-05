@@ -17,9 +17,11 @@ use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{
     daemon_agent_discover, daemon_agent_exec, daemon_agent_send, daemon_agent_sync,
-    daemon_events_report, daemon_status_report, start_daemon, DaemonAgentExecRequest,
-    DaemonAgentExecResponse, DaemonAgentSendRequest, DaemonAgentSendResponse, DaemonEvent,
-    DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
+    daemon_agent_sync_apply, daemon_events_report, daemon_status_report, start_daemon,
+    DaemonAgentExecRequest, DaemonAgentExecResponse, DaemonAgentSendRequest,
+    DaemonAgentSendResponse, DaemonAgentSyncApplyRequest, DaemonAgentSyncApplyResponse,
+    DaemonAgentSyncCloneResult, DaemonEvent, DaemonEventJournal, DaemonEventsReport,
+    DaemonStartOptions, DaemonStatusReport,
 };
 #[cfg(test)]
 use crate::daemon::{spawn_serve_control_socket, DaemonEventJournalHandle};
@@ -254,7 +256,21 @@ pub(crate) struct AgentSyncReport {
     targets: Vec<AgentSyncTarget>,
     error: Option<AgentIssue>,
     issue: AgentIssue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply: Option<AgentSyncApplyStatus>,
     recommended_commands: Vec<CommandHint>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AgentSyncApplyStatus {
+    requested: bool,
+    daemon_routed: bool,
+    applied: bool,
+    mode: String,
+    message: String,
+    issue: AgentIssue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clone: Option<DaemonAgentSyncCloneResult>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -787,6 +803,7 @@ fn cmd_agent_sync(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut json = false;
     let mut workspace = None;
     let mut name = None;
+    let mut apply = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -805,8 +822,11 @@ fn cmd_agent_sync(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--json" => {
                 json = true;
             }
+            "--apply" => {
+                apply = true;
+            }
             "--global" | "--online" | "--lan" | "--bootstrap" | "--invite" | "--listen"
-            | "--timeout-ms" | "--peer" | "--apply" => {
+            | "--timeout-ms" | "--peer" => {
                 return Err(format!(
                     "agent sync is cache-backed for now; use `nexus-node clone {}` or `nexus-node discover {}` for explicit network work",
                     args[i], args[i]
@@ -818,7 +838,12 @@ fn cmd_agent_sync(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let report = agent_sync_report(&base, workspace.map(|id| id.to_string()), name);
+    let workspace = workspace.map(|id| id.to_string());
+    let report = if apply {
+        agent_sync_apply_report(&base, workspace, name)
+    } else {
+        agent_sync_report(&base, workspace, name)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1179,7 +1204,105 @@ pub(crate) fn agent_sync_report(
         targets,
         error,
         issue,
+        apply: None,
         recommended_commands: sync_recommended_commands(base),
+    }
+}
+
+fn agent_sync_apply_report(
+    base: &Path,
+    workspace_filter: Option<String>,
+    name: Option<String>,
+) -> AgentSyncReport {
+    let mut report = agent_sync_report(base, workspace_filter.clone(), name.clone());
+    let apply_status = if report.daemon.running && report.daemon.ipc_available {
+        let request = DaemonAgentSyncApplyRequest {
+            workspace: workspace_filter,
+            name,
+        };
+        match daemon_agent_sync_apply(base, request) {
+            Ok(response) => {
+                report.daemon = response.status;
+                report.mode = if response.apply.applied {
+                    "daemon_ipc_apply"
+                } else {
+                    "daemon_ipc_apply_pending"
+                };
+                agent_sync_apply_status_from_daemon(response.apply)
+            }
+            Err(error) => {
+                report.mode = "daemon_ipc_apply_error_local_plan";
+                let issue = agent_issue(
+                    "daemon_sync_apply_ipc_error",
+                    format!(
+                        "daemon sync apply IPC failed; no network changes were applied: {error}"
+                    ),
+                    Some(format!(
+                        "nexus-node daemon status --base {} --json",
+                        base.display()
+                    )),
+                );
+                AgentSyncApplyStatus {
+                    requested: true,
+                    daemon_routed: false,
+                    applied: false,
+                    mode: report.mode.into(),
+                    message: issue.message.clone(),
+                    issue,
+                    clone: None,
+                }
+            }
+        }
+    } else {
+        let (kind, message, suggested_command) = if report.daemon.running {
+            (
+                "daemon_sync_apply_ipc_unavailable",
+                "agent sync --apply requires daemon IPC; no network changes were applied",
+                Some(format!(
+                    "nexus-node daemon status --base {} --json",
+                    base.display()
+                )),
+            )
+        } else {
+            (
+                "daemon_not_running",
+                "daemon is not running; agent sync --apply returned a local plan and did not apply network changes",
+                Some(format!("nexus-node agent up --base {} --json", base.display())),
+            )
+        };
+        let issue = agent_issue(kind, message, suggested_command);
+        AgentSyncApplyStatus {
+            requested: true,
+            daemon_routed: false,
+            applied: false,
+            mode: report.mode.into(),
+            message: issue.message.clone(),
+            issue,
+            clone: None,
+        }
+    };
+    report.issue = apply_status.issue.clone();
+    report.apply = Some(apply_status);
+    report
+}
+
+fn agent_sync_apply_status_from_daemon(
+    response: DaemonAgentSyncApplyResponse,
+) -> AgentSyncApplyStatus {
+    let kind = if response.applied {
+        "daemon_sync_applied"
+    } else {
+        "daemon_sync_apply_pending"
+    };
+    let issue = agent_issue(kind, response.message.clone(), response.suggested_command);
+    AgentSyncApplyStatus {
+        requested: true,
+        daemon_routed: true,
+        applied: response.applied,
+        mode: response.mode,
+        message: response.message,
+        issue,
+        clone: response.clone,
     }
 }
 
@@ -2968,6 +3091,19 @@ fn print_agent_sync_text(report: &AgentSyncReport) {
     if let Some(error) = &report.error {
         println!("error[{}]: {}", error.kind, error.message);
     }
+    if let Some(apply) = &report.apply {
+        println!(
+            "apply: requested={} daemon_routed={} applied={} mode={}",
+            apply.requested, apply.daemon_routed, apply.applied, apply.mode
+        );
+        println!("apply_issue[{}]: {}", apply.issue.kind, apply.issue.message);
+        if let Some(clone) = &apply.clone {
+            println!(
+                "clone: path={} root={} peer={} owner={}",
+                clone.path, clone.root, clone.peer, clone.owner
+            );
+        }
+    }
     if let Some(command) = &report.issue.suggested_command {
         println!("suggested: {command}");
     }
@@ -3878,6 +4014,113 @@ mod tests {
         assert_eq!(report.targets[0].action, "clone_with_expert_command");
         assert!(report.error.is_none());
 
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_apply_routes_daemon_ipc_boundary_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = NodeIdentity::generate();
+        let peer = nexus_network::to_peer_id(&owner);
+        let workspace = WorkspaceId::from_bytes([87; 32]);
+        let announcement = WorkspaceAnnouncement {
+            version: WORKSPACE_ANNOUNCEMENT_VERSION,
+            peer: peer.to_string(),
+            addrs: vec!["/ip4/127.0.0.1/udp/5678/quic-v1".into()],
+            author: owner.did().clone(),
+            workspace: workspace.to_string(),
+            name: "daemon sync apply workspace".into(),
+            description: "served by agent sync apply IPC".into(),
+            owner: owner.did().clone(),
+            root: None,
+            timestamp: 14,
+            signature: None,
+        };
+        let signed = sign_workspace_announcement(announcement, &owner).unwrap();
+        assert!(record_workspace_announcement(temp.path(), signed).unwrap());
+
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let workspace_filter = workspace.to_string();
+        let command_task = tokio::spawn(async move {
+            let Some(crate::daemon::DaemonControlCommand::AgentSyncApply { request, reply }) =
+                control_rx.recv().await
+            else {
+                panic!("agent_sync_apply command should be forwarded to the serve loop");
+            };
+            assert_eq!(
+                request.workspace.as_deref(),
+                Some(workspace_filter.as_str())
+            );
+            assert_eq!(request.name.as_deref(), Some("daemon-sync-apply-copy"));
+            reply
+                .send(Ok(DaemonAgentSyncApplyResponse {
+                    workspace: request.workspace,
+                    name: request.name,
+                    applied: false,
+                    mode: "daemon_ipc_apply_pending".into(),
+                    message: "daemon accepted sync apply boundary; apply is pending".into(),
+                    suggested_command: Some("nexus-node clone --base /tmp --workspace test --name daemon-sync-apply-copy".into()),
+                    clone: None,
+                }))
+                .unwrap();
+        });
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+            Some(control_tx),
+        )
+        .unwrap();
+
+        let base = temp.path().to_path_buf();
+        let workspace_filter = workspace.to_string();
+        let report = tokio::task::spawn_blocking(move || {
+            agent_sync_apply_report(
+                &base,
+                Some(workspace_filter),
+                Some("daemon-sync-apply-copy".into()),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "daemon_ipc_apply_pending");
+        assert_eq!(report.issue.kind, "daemon_sync_apply_pending");
+        assert_eq!(report.summary.targets, 1);
+        assert_eq!(report.summary.clone_ready, 1);
+        assert_eq!(report.targets[0].action, "clone_with_expert_command");
+        let apply = report.apply.expect("apply status should be reported");
+        assert!(apply.requested);
+        assert!(apply.daemon_routed);
+        assert!(!apply.applied);
+        assert_eq!(apply.mode, "daemon_ipc_apply_pending");
+        assert_eq!(apply.issue.kind, "daemon_sync_apply_pending");
+        assert!(report.error.is_none());
+
+        command_task.await.unwrap();
         handle.abort();
     }
 

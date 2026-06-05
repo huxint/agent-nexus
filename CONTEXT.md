@@ -66,22 +66,25 @@ settle.
 - Use `nexus-node agent sync --base <DIR> --json` to plan workspace sync from
   local workspace metadata and cached discovery. It returns clone/refresh/start
   hints without starting a short-lived network node or creating/decrypting
-  identity.
+  identity. When a daemon is running and a clone-ready workspace is selected,
+  `nexus-node agent sync --base <DIR> --workspace <HEX> --name <TEXT> --apply --json`
+  routes the clone through daemon IPC and reuses the daemon network.
 - Use `nexus-node agent send --base <DIR> --kind status --title <TEXT> --json`
-  to write a signed local status/need/offer/proposal/goal intent. Current
-  delivery is local social memory; daemon-backed live broadcast is still a
-  pending control-plane route.
+  to write a signed status/need/offer/proposal/goal intent. It uses daemon IPC
+  for live broadcast when available and falls back to local social memory with
+  structured delivery metadata.
 - Use `nexus-node agent exec --base <DIR> --workspace <PATH> --json -- <CMD>`
   for the AI-facing workspace execution path. It runs through the existing
-  free `exec` semantics, records signed social-memory evidence, and currently
-  reports local execution rather than daemon-routed execution.
+  free `exec` semantics, records signed social-memory evidence, uses daemon IPC
+  when available, and falls back to local execution with structured delivery
+  metadata.
 - If `daemon.running` is false and network availability is needed, use
   `nexus-node agent up --base <DIR>` so `serve` runs in the background and the
   agent can keep interacting through normal tools.
 - Use `society --json`, top-level `discover --json`, and expert `exec` options
-  for detailed workflows until `agent watch`, daemon-backed `agent sync`,
-  daemon-backed `agent send`, and daemon-backed `agent exec` are wired to the
-  daemon IPC path.
+  for detailed workflows that are not yet covered by the agent command surface.
+  Existing local-workspace refresh/apply remains explicit; clone apply is
+  daemon-routed when discovery cache has a signed, addressed source.
 - Treat ordinary filesystem/shell state and Nexus social/network state as two
   inputs to the same decision loop; the control plane should expose Nexus state
   without preventing the agent from inspecting non-Nexus state.

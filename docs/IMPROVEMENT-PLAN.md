@@ -436,6 +436,8 @@
 - [x] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
 - [x] `agent discover` 在 daemon IPC 可用时通过 `agent_discover` control request 读取 daemon 侧 discovery cache；IPC 失败时退回本地 cache 并返回结构化问题。
 - [x] `agent sync` 在 daemon IPC 可用时通过 `agent_sync` control request 读取 daemon 侧 discovery cache，再在本地生成 clone/sync plan；IPC 失败时退回本地 cache 并返回结构化问题。
+- [x] `agent sync --apply --workspace <HEX> --name <TEXT>` 在 daemon IPC 可用、且 discovery cache 有已签名地址来源时，通过 `agent_sync_apply` control request 复用 daemon network 执行 clone，落盘 workspace、注册本地路径、写入 social memory，并在 JSON `apply.clone` 中返回 path/root/peer/owner。
+- [ ] 已存在本地 workspace 的 live refresh/apply 仍需后续 daemon-routed 实现；当前仍返回 inspect/refresh 计划或专家命令提示。
 - [x] `agent inbox` 在 daemon IPC 可用时通过 daemon event journal 获取增量事件，并通过 `agent_discover` control request 读取 daemon 侧 discovery cache 生成 clone-ready 提示；IPC 失败时退回本地 cache 并显式标注来源。
 - [x] daemon 不存在时，`agent discover` 读 discovery cache 并给出显式联网刷新提示；不启动网络、不创建身份、不解密私钥。
 - [x] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。

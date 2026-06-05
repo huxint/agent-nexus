@@ -98,6 +98,8 @@ struct DaemonControlRequest {
     agent_send: Option<DaemonAgentSendRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_exec: Option<DaemonAgentExecRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_sync_apply: Option<DaemonAgentSyncApplyRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +117,8 @@ struct DaemonControlResponse {
     agent_send: Option<DaemonAgentSendResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_exec: Option<DaemonAgentExecResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_sync_apply: Option<DaemonAgentSyncApplyResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     network_status: Option<DaemonNetworkStatusResponse>,
     error: Option<String>,
@@ -171,6 +175,12 @@ pub(crate) struct DaemonAgentExecRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSyncApplyRequest {
+    pub(crate) workspace: Option<String>,
+    pub(crate) name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DaemonAgentExecResponse {
     pub(crate) workspace_path: String,
     pub(crate) workspace: String,
@@ -185,6 +195,29 @@ pub(crate) struct DaemonAgentExecResponse {
     pub(crate) context: Option<WorkspaceRunContext>,
     pub(crate) started_at: u64,
     pub(crate) finished_at: u64,
+    pub(crate) live_broadcast: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSyncApplyResponse {
+    pub(crate) workspace: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) applied: bool,
+    pub(crate) mode: String,
+    pub(crate) message: String,
+    pub(crate) suggested_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) clone: Option<DaemonAgentSyncCloneResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSyncCloneResult {
+    pub(crate) path: String,
+    pub(crate) root: String,
+    pub(crate) peer: String,
+    pub(crate) owner: String,
+    pub(crate) synced_social_events: usize,
+    pub(crate) recorded_social_events: usize,
     pub(crate) live_broadcast: bool,
 }
 
@@ -221,6 +254,10 @@ pub(crate) enum DaemonControlCommand {
         request: DaemonAgentExecRequest,
         reply: oneshot::Sender<Result<DaemonAgentExecResponse, String>>,
     },
+    AgentSyncApply {
+        request: DaemonAgentSyncApplyRequest,
+        reply: oneshot::Sender<Result<DaemonAgentSyncApplyResponse, String>>,
+    },
     NetworkStatus {
         reply: oneshot::Sender<Result<DaemonNetworkStatusResponse, String>>,
     },
@@ -244,6 +281,12 @@ pub(crate) struct DaemonAgentSendControlResponse {
 pub(crate) struct DaemonAgentExecControlResponse {
     pub(crate) status: DaemonStatusReport,
     pub(crate) exec: DaemonAgentExecResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DaemonAgentSyncApplyControlResponse {
+    pub(crate) status: DaemonStatusReport,
+    pub(crate) apply: DaemonAgentSyncApplyResponse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,6 +531,7 @@ pub(crate) fn daemon_events_report(
             discovery_filter: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
         },
     ) {
         Ok(response) if response.ok => DaemonEventsReport {
@@ -1125,6 +1169,7 @@ async fn handle_control_stream(
                 cached_announcements: None,
                 agent_send: None,
                 agent_exec: None,
+                agent_sync_apply: None,
                 network_status: None,
                 error: None,
             },
@@ -1137,6 +1182,7 @@ async fn handle_control_stream(
                 cached_announcements: None,
                 agent_send: None,
                 agent_exec: None,
+                agent_sync_apply: None,
                 network_status: None,
                 error: None,
             },
@@ -1149,6 +1195,7 @@ async fn handle_control_stream(
                 cached_announcements: None,
                 agent_send: None,
                 agent_exec: None,
+                agent_sync_apply: None,
                 network_status: None,
                 error: None,
             },
@@ -1157,6 +1204,9 @@ async fn handle_control_stream(
             }
             "agent_send" => daemon_control_agent_send_response(&base, request, control_tx).await,
             "agent_exec" => daemon_control_agent_exec_response(&base, request, control_tx).await,
+            "agent_sync_apply" => {
+                daemon_control_agent_sync_apply_response(&base, request, control_tx).await
+            }
             "network_status" => {
                 daemon_control_network_status_response(&base, request, event_journal, control_tx)
                     .await
@@ -1170,6 +1220,7 @@ async fn handle_control_stream(
                 cached_announcements: None,
                 agent_send: None,
                 agent_exec: None,
+                agent_sync_apply: None,
                 network_status: None,
                 error: Some(format!("unknown daemon control command: {other}")),
             },
@@ -1183,6 +1234,7 @@ async fn handle_control_stream(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some(error.to_string()),
         },
@@ -1216,6 +1268,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is unavailable".into()),
         };
@@ -1236,6 +1289,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is closed".into()),
         };
@@ -1251,6 +1305,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: Some(network_status),
             error: None,
         },
@@ -1263,6 +1318,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some(error),
         },
@@ -1275,6 +1331,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop dropped network_status response".into()),
         },
@@ -1287,6 +1344,7 @@ async fn daemon_control_network_status_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon network_status request timed out".into()),
         },
@@ -1311,6 +1369,7 @@ fn daemon_control_agent_discovery_response(
                 cached_announcements: Some(cached_announcements),
                 agent_send: None,
                 agent_exec: None,
+                agent_sync_apply: None,
                 network_status: None,
                 error: None,
             }
@@ -1324,6 +1383,7 @@ fn daemon_control_agent_discovery_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some(format!("read discovery cache: {error}")),
         },
@@ -1346,6 +1406,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("agent_send request payload is required".into()),
         };
@@ -1360,6 +1421,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is unavailable".into()),
         };
@@ -1383,6 +1445,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is closed".into()),
         };
@@ -1398,6 +1461,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: Some(agent_send),
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: None,
         },
@@ -1410,6 +1474,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some(error),
         },
@@ -1422,6 +1487,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop dropped agent_send response".into()),
         },
@@ -1434,6 +1500,7 @@ async fn daemon_control_agent_send_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon agent_send request timed out".into()),
         },
@@ -1456,6 +1523,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("agent_exec request payload is required".into()),
         };
@@ -1470,6 +1538,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is unavailable".into()),
         };
@@ -1493,6 +1562,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop command channel is closed".into()),
         };
@@ -1508,6 +1578,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: Some(agent_exec),
+            agent_sync_apply: None,
             network_status: None,
             error: None,
         },
@@ -1520,6 +1591,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some(error),
         },
@@ -1532,6 +1604,7 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon serve-loop dropped agent_exec response".into()),
         },
@@ -1544,8 +1617,126 @@ async fn daemon_control_agent_exec_response(
             cached_announcements: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
             network_status: None,
             error: Some("daemon agent_exec request timed out".into()),
+        },
+    }
+}
+
+async fn daemon_control_agent_sync_apply_response(
+    base: &Path,
+    request: DaemonControlRequest,
+    control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
+) -> DaemonControlResponse {
+    let status = daemon_control_status(base);
+    let Some(agent_sync_apply) = request.agent_sync_apply else {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some("agent_sync_apply request payload is required".into()),
+        };
+    };
+    let Some(control_tx) = control_tx else {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some("daemon serve-loop command channel is unavailable".into()),
+        };
+    };
+
+    let (reply, reply_rx) = oneshot::channel();
+    if control_tx
+        .send(DaemonControlCommand::AgentSyncApply {
+            request: agent_sync_apply,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some("daemon serve-loop command channel is closed".into()),
+        };
+    }
+
+    match tokio::time::timeout(DAEMON_CONTROL_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(agent_sync_apply))) => DaemonControlResponse {
+            ok: true,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: Some(agent_sync_apply),
+            network_status: None,
+            error: None,
+        },
+        Ok(Ok(Err(error))) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some(error),
+        },
+        Ok(Err(_)) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some("daemon serve-loop dropped agent_sync_apply response".into()),
+        },
+        Err(_) => DaemonControlResponse {
+            ok: false,
+            shutdown: false,
+            status,
+            events: None,
+            discovered_workspaces: None,
+            cached_announcements: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: None,
+            network_status: None,
+            error: Some("daemon agent_sync_apply request timed out".into()),
         },
     }
 }
@@ -1586,6 +1777,7 @@ fn query_control_socket(
             discovery_filter: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
         },
     )
 }
@@ -1626,6 +1818,7 @@ fn daemon_agent_discovery(
             discovery_filter: Some(filter),
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
         },
     )?;
     if !response.ok {
@@ -1663,6 +1856,7 @@ pub(crate) fn daemon_agent_send(
             discovery_filter: None,
             agent_send: Some(request),
             agent_exec: None,
+            agent_sync_apply: None,
         },
     )?;
     if !response.ok {
@@ -1701,6 +1895,7 @@ pub(crate) fn daemon_agent_exec(
             discovery_filter: None,
             agent_send: None,
             agent_exec: Some(request),
+            agent_sync_apply: None,
         },
     )?;
     if !response.ok {
@@ -1715,6 +1910,45 @@ pub(crate) fn daemon_agent_exec(
     Ok(DaemonAgentExecControlResponse {
         status: response.status,
         exec,
+    })
+}
+
+pub(crate) fn daemon_agent_sync_apply(
+    base: &Path,
+    request: DaemonAgentSyncApplyRequest,
+) -> Result<DaemonAgentSyncApplyControlResponse, Box<dyn std::error::Error>> {
+    let status = daemon_status_report(base);
+    let Some(socket) = status.control_socket.as_deref() else {
+        return Err("daemon control socket is not available".into());
+    };
+    if !status.running {
+        return Err("daemon is not running".into());
+    }
+
+    let response = query_control_socket_request(
+        Path::new(socket),
+        &DaemonControlRequest {
+            command: "agent_sync_apply".into(),
+            since: None,
+            limit: None,
+            discovery_filter: None,
+            agent_send: None,
+            agent_exec: None,
+            agent_sync_apply: Some(request),
+        },
+    )?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "daemon agent_sync_apply request failed".into())
+            .into());
+    }
+    let apply = response
+        .agent_sync_apply
+        .ok_or("daemon agent_sync_apply response did not include apply result")?;
+    Ok(DaemonAgentSyncApplyControlResponse {
+        status: response.status,
+        apply,
     })
 }
 
@@ -1740,6 +1974,7 @@ pub(crate) fn daemon_network_status(
             discovery_filter: None,
             agent_send: None,
             agent_exec: None,
+            agent_sync_apply: None,
         },
     )?;
     if !response.ok {
@@ -1987,6 +2222,7 @@ mod tests {
                     }),
                     agent_send: None,
                     agent_exec: None,
+                    agent_sync_apply: None,
                 },
             )
             .map_err(|err| err.to_string())
@@ -2019,6 +2255,7 @@ mod tests {
                     }),
                     agent_send: None,
                     agent_exec: None,
+                    agent_sync_apply: None,
                 },
             )
             .map_err(|err| err.to_string())
@@ -2046,6 +2283,7 @@ mod tests {
                     discovery_filter: None,
                     agent_send: None,
                     agent_exec: None,
+                    agent_sync_apply: None,
                 },
             )
             .map_err(|err| err.to_string())
