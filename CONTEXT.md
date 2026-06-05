@@ -83,7 +83,9 @@ settle.
   agent can keep interacting through normal tools.
 - Use `society --json`, top-level `discover --json`, and expert `exec` options
   for detailed workflows that are not yet covered by the agent command surface.
-  Existing local-workspace refresh/apply remains explicit; clone apply is
+  Existing local-workspace live refresh/apply is not implemented yet; when
+  selected through daemon-routed `agent sync --apply`, it returns
+  `applied=false` with a suggested inspection command. Clone apply is
   daemon-routed when discovery cache has a signed, addressed source.
 - Treat ordinary filesystem/shell state and Nexus social/network state as two
   inputs to the same decision loop; the control plane should expose Nexus state
