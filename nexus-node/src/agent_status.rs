@@ -16,9 +16,10 @@ use nexus_storage::Cid;
 use crate::bootstrap::extend_bootstrap_peers;
 use crate::cli_args::{normalize_symbol, parse_u64_arg, parse_usize_arg, required_arg};
 use crate::daemon::{
-    daemon_agent_discover, daemon_agent_send, daemon_agent_sync, daemon_events_report,
-    daemon_status_report, start_daemon, DaemonAgentSendRequest, DaemonAgentSendResponse,
-    DaemonEvent, DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
+    daemon_agent_discover, daemon_agent_exec, daemon_agent_send, daemon_agent_sync,
+    daemon_events_report, daemon_status_report, start_daemon, DaemonAgentExecRequest,
+    DaemonAgentExecResponse, DaemonAgentSendRequest, DaemonAgentSendResponse, DaemonEvent,
+    DaemonEventJournal, DaemonEventsReport, DaemonStartOptions, DaemonStatusReport,
 };
 #[cfg(test)]
 use crate::daemon::{spawn_serve_control_socket, DaemonEventJournalHandle};
@@ -934,16 +935,39 @@ pub(crate) async fn agent_exec_report(
     options: WorkspaceExecOptions,
 ) -> Result<AgentExecReport, Box<dyn std::error::Error>> {
     let base = options.base.clone();
+    let daemon = daemon_status_report(&base);
+    let mut fallback_error = None;
+    if daemon.running && daemon.ipc_available {
+        let request = daemon_agent_exec_request_from_options(&options);
+        match daemon_agent_exec(&base, request) {
+            Ok(response) => {
+                return Ok(agent_exec_report_from_daemon(
+                    &base,
+                    response.status,
+                    response.exec,
+                ));
+            }
+            Err(error) => {
+                fallback_error = Some(error.to_string());
+            }
+        }
+    }
+
     let report = run_workspace_exec(options).await?;
-    Ok(agent_exec_report_from_workspace_report(&base, report))
+    Ok(agent_exec_report_from_workspace_report(
+        &base,
+        report,
+        fallback_error,
+    ))
 }
 
 fn agent_exec_report_from_workspace_report(
     base: &Path,
     report: WorkspaceExecReport,
+    fallback_error: Option<String>,
 ) -> AgentExecReport {
     let daemon = daemon_status_report(base);
-    let delivery = exec_delivery(base, &daemon);
+    let delivery = exec_delivery(base, &daemon, fallback_error);
     AgentExecReport {
         schema: "nexus.agent_exec.v1",
         base: base.display().to_string(),
@@ -965,6 +989,93 @@ fn agent_exec_report_from_workspace_report(
         },
         delivery,
         recommended_commands: exec_recommended_commands(base),
+    }
+}
+
+fn daemon_agent_exec_request_from_options(
+    options: &WorkspaceExecOptions,
+) -> DaemonAgentExecRequest {
+    DaemonAgentExecRequest {
+        workspace_path: options.workspace_path.display().to_string(),
+        note: options.note.clone(),
+        working_dir: options
+            .exec_options
+            .working_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        env: options.exec_options.env.clone(),
+        stdin_hex: options.exec_options.stdin.as_ref().map(hex::encode),
+        timeout_ms: options.exec_options.timeout.map(duration_millis),
+        capture_stdout: options.exec_options.capture_stdout,
+        capture_stderr: options.exec_options.capture_stderr,
+        max_stdout_bytes: options.exec_options.max_stdout_bytes,
+        max_stderr_bytes: options.exec_options.max_stderr_bytes,
+        isolation: options.exec_options.isolation.as_str().into(),
+        isolation_explicit: options.isolation_explicit,
+        command: options.command.clone(),
+        command_args: options.command_args.clone(),
+    }
+}
+
+fn agent_exec_report_from_daemon(
+    base: &Path,
+    daemon: DaemonStatusReport,
+    response: DaemonAgentExecResponse,
+) -> AgentExecReport {
+    let DaemonAgentExecResponse {
+        workspace_path,
+        workspace,
+        actor,
+        command,
+        args,
+        exit_code,
+        stdout,
+        stderr,
+        output_root,
+        resources,
+        context,
+        started_at,
+        finished_at,
+        live_broadcast,
+    } = response;
+
+    AgentExecReport {
+        schema: "nexus.agent_exec.v1",
+        base: base.display().to_string(),
+        daemon,
+        execution: AgentExecExecution {
+            workspace,
+            workspace_path,
+            actor,
+            command,
+            args,
+            exit_code,
+            stdout: agent_exec_stream_from_daemon(stdout),
+            stderr: agent_exec_stream_from_daemon(stderr),
+            output_root,
+            resources: AgentExecResources {
+                wall_time_ms: resources.wall_time_ms,
+                cpu_user_ms: resources.cpu_user_ms,
+                cpu_kernel_ms: resources.cpu_kernel_ms,
+                peak_memory: resources.peak_memory,
+                fs_read_bytes: resources.fs_read_bytes,
+                fs_write_bytes: resources.fs_write_bytes,
+                process_count: resources.process_count,
+            },
+            context,
+            started_at,
+            finished_at,
+        },
+        delivery: daemon_exec_delivery(live_broadcast),
+        recommended_commands: exec_recommended_commands(base),
+    }
+}
+
+fn agent_exec_stream_from_daemon(stream: crate::daemon::DaemonAgentExecStream) -> AgentExecStream {
+    AgentExecStream {
+        bytes: stream.bytes,
+        cid: stream.cid,
+        text: stream.text,
     }
 }
 
@@ -1552,15 +1663,35 @@ fn send_delivery(
     }
 }
 
-fn exec_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentExecDelivery {
-    if daemon.running {
+fn exec_delivery(
+    base: &Path,
+    daemon: &DaemonStatusReport,
+    fallback_error: Option<String>,
+) -> AgentExecDelivery {
+    if let Some(error) = fallback_error {
+        AgentExecDelivery {
+            mode: "local_exec_daemon_ipc_fallback",
+            local_memory: true,
+            live_broadcast: false,
+            issue: agent_issue(
+                "daemon_exec_ipc_failed",
+                format!(
+                    "daemon exec IPC failed; the command ran locally and recorded social memory outside the running daemon: {error}"
+                ),
+                Some(format!(
+                    "nexus-node daemon status --base {} --json",
+                    base.display()
+                )),
+            ),
+        }
+    } else if daemon.running {
         AgentExecDelivery {
             mode: "local_exec_daemon_running",
             local_memory: true,
             live_broadcast: false,
             issue: agent_issue(
-                "daemon_exec_ipc_pending",
-                "daemon exec IPC is pending; the command ran locally and recorded social memory outside the running daemon",
+                "daemon_exec_ipc_unavailable",
+                "daemon exec IPC is unavailable; the command ran locally and recorded social memory outside the running daemon",
                 Some(format!("nexus-node daemon status --base {} --json", base.display())),
             ),
         }
@@ -1578,6 +1709,20 @@ fn exec_delivery(base: &Path, daemon: &DaemonStatusReport) -> AgentExecDelivery 
                 )),
             ),
         }
+    }
+}
+
+fn daemon_exec_delivery(live_broadcast: bool) -> AgentExecDelivery {
+    let message = if live_broadcast {
+        "daemon executed the command, recorded social memory, and broadcast the resulting events"
+    } else {
+        "daemon executed the command and recorded social memory; resulting events were not accepted by the live network yet"
+    };
+    AgentExecDelivery {
+        mode: "daemon_ipc",
+        local_memory: true,
+        live_broadcast,
+        issue: agent_issue("daemon_ipc_delivery", message, None),
     }
 }
 
@@ -1860,14 +2005,13 @@ fn control_plane_status(base: &Path, daemon: &DaemonStatusReport) -> ControlPlan
             daemon_supported: true,
             issue: agent_issue(
                 "daemon_ipc_routing_pending",
-                "daemon is running; exec and remaining live sync IPC routes are still pending",
+                "daemon is running; remaining live sync IPC routes are still pending",
                 Some(format!(
                     "nexus-node daemon status --base {} --json",
                     base.display()
                 )),
             ),
-            next_design:
-                "route agent exec and live sync through the base-scoped daemon control socket",
+            next_design: "route live sync through the base-scoped daemon control socket",
         }
     } else {
         ControlPlaneStatus {
@@ -2032,6 +2176,7 @@ fn daemon_event_priority(kind: &str) -> u32 {
     match kind {
         "social_event" => 84,
         "workspace_snapshot_changed" => 82,
+        "workspace_run_changed" => 82,
         "workspace_announcement" => 78,
         "sync_request" => 68,
         "peer_connected" | "peer_disconnected" => 62,
@@ -4064,6 +4209,256 @@ mod tests {
         assert_eq!(report.delivery.mode, "daemon_ipc");
         assert_eq!(report.delivery.issue.kind, "daemon_ipc_delivery");
         assert!(report.delivery.live_broadcast);
+
+        command_task.await.unwrap();
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_prefers_daemon_ipc_when_available() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let workspace_path = temp.path().join("daemon-exec-workspace");
+        let args = vec![
+            "nexus-node".into(),
+            "agent".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().display().to_string(),
+            "--workspace".into(),
+            workspace_path.display().to_string(),
+            "--note".into(),
+            "daemon exec note".into(),
+            "--stdin".into(),
+            "daemon stdin".into(),
+            "--timeout-ms".into(),
+            "250".into(),
+            "--json".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "printf daemon-output".into(),
+        ];
+        let (options, json) = parse_workspace_exec_options(&args, 3, true).unwrap();
+        assert!(json);
+
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let command_task = tokio::spawn(async move {
+            let Some(crate::daemon::DaemonControlCommand::AgentExec { request, reply }) =
+                control_rx.recv().await
+            else {
+                panic!("agent_exec command should be forwarded to the serve loop");
+            };
+            assert_eq!(request.workspace_path, workspace_path.display().to_string());
+            assert_eq!(request.note.as_deref(), Some("daemon exec note"));
+            assert_eq!(
+                request.stdin_hex.as_deref(),
+                Some("6461656d6f6e20737464696e")
+            );
+            assert_eq!(request.timeout_ms, Some(250));
+            assert_eq!(request.isolation, "native");
+            assert_eq!(request.command, "sh");
+            assert_eq!(request.command_args, vec!["-c", "printf daemon-output"]);
+            reply
+                .send(Ok(DaemonAgentExecResponse {
+                    workspace_path: request.workspace_path,
+                    workspace: "workspace-daemon-exec".into(),
+                    actor: "did:key:daemon-exec".into(),
+                    command: request.command,
+                    args: request.command_args,
+                    exit_code: 0,
+                    stdout: crate::daemon::DaemonAgentExecStream {
+                        bytes: 13,
+                        cid: "stdout-cid".into(),
+                        text: "daemon-output".into(),
+                    },
+                    stderr: crate::daemon::DaemonAgentExecStream {
+                        bytes: 0,
+                        cid: "stderr-cid".into(),
+                        text: String::new(),
+                    },
+                    output_root: "output-root".into(),
+                    resources: crate::daemon::DaemonAgentExecResources {
+                        wall_time_ms: 9,
+                        cpu_user_ms: 1,
+                        cpu_kernel_ms: 2,
+                        peak_memory: Some(1024),
+                        fs_read_bytes: 3,
+                        fs_write_bytes: 4,
+                        process_count: 1,
+                    },
+                    context: None,
+                    started_at: 111,
+                    finished_at: 112,
+                    live_broadcast: true,
+                }))
+                .unwrap();
+        });
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+            Some(control_tx),
+        )
+        .unwrap();
+
+        let report = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(agent_exec_report(options))
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.schema, "nexus.agent_exec.v1");
+        assert_eq!(report.execution.workspace, "workspace-daemon-exec");
+        assert_eq!(report.execution.actor, "did:key:daemon-exec");
+        assert_eq!(report.execution.stdout.text, "daemon-output");
+        assert_eq!(report.execution.resources.wall_time_ms, 9);
+        assert_eq!(report.delivery.mode, "daemon_ipc");
+        assert_eq!(report.delivery.issue.kind, "daemon_ipc_delivery");
+        assert!(report.delivery.live_broadcast);
+        assert!(!identity_path(temp.path()).exists());
+
+        command_task.await.unwrap();
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_falls_back_to_local_when_daemon_ipc_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let identity = load_or_create_identity(temp.path()).unwrap();
+        let mut workspace = Workspace::create(
+            &identity,
+            temp.path(),
+            WorkspaceConfig {
+                name: "agent-exec-fallback-ws".into(),
+                description: "agent exec daemon fallback".into(),
+            },
+        )
+        .await
+        .unwrap();
+        workspace.write_file("input.txt", b"fallback").unwrap();
+        workspace.snapshot().await.unwrap();
+        let workspace_path = workspace.root_dir().to_path_buf();
+
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": [],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let args = vec![
+            "nexus-node".into(),
+            "agent".into(),
+            "exec".into(),
+            "--base".into(),
+            temp.path().display().to_string(),
+            "--workspace".into(),
+            workspace_path.display().to_string(),
+            "--json".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "cat input.txt > fallback.txt && printf local-fallback".into(),
+        ];
+        let (options, json) = parse_workspace_exec_options(&args, 3, true).unwrap();
+        assert!(json);
+
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let command_task = tokio::spawn(async move {
+            let Some(crate::daemon::DaemonControlCommand::AgentExec { request, reply }) =
+                control_rx.recv().await
+            else {
+                panic!("agent_exec command should be forwarded before fallback");
+            };
+            assert_eq!(request.workspace_path, workspace_path.display().to_string());
+            assert_eq!(request.command, "sh");
+            reply.send(Err("daemon exec disabled".into())).unwrap();
+        });
+        let handle = spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            DaemonEventJournalHandle::new(),
+            Some(control_tx),
+        )
+        .unwrap();
+
+        let report = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(agent_exec_report(options))
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.schema, "nexus.agent_exec.v1");
+        assert_eq!(report.execution.actor, identity.did().to_string());
+        assert_eq!(report.execution.stdout.text, "local-fallback");
+        assert_eq!(report.delivery.mode, "local_exec_daemon_ipc_fallback");
+        assert_eq!(report.delivery.issue.kind, "daemon_exec_ipc_failed");
+        assert!(report
+            .delivery
+            .issue
+            .message
+            .contains("daemon exec disabled"));
+        assert!(!report.delivery.live_broadcast);
+        assert_eq!(
+            std::fs::read(workspace.root_dir().join("fallback.txt")).unwrap(),
+            b"fallback"
+        );
 
         command_task.await.unwrap();
         handle.abort();
