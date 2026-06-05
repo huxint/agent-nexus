@@ -5672,6 +5672,25 @@ async fn handle_daemon_agent_sync_apply(
             clone: None,
         });
     };
+    let workspace_id = parse_workspace_id(&workspace)?;
+    if let Some(local_workspace) = server.get(&workspace_id) {
+        return Ok(daemon::DaemonAgentSyncApplyResponse {
+            workspace: Some(workspace_id.to_string()),
+            name: Some(local_workspace.name().to_string()),
+            applied: false,
+            mode: "daemon_ipc_refresh_pending".into(),
+            message: format!(
+                "workspace {} is already local; daemon-routed live refresh/apply is not implemented yet, so no network changes were applied",
+                workspace_id
+            ),
+            suggested_command: Some(format!(
+                "nexus-node agent sync --base {} --workspace {} --json",
+                context.base.display(),
+                workspace_id
+            )),
+            clone: None,
+        });
+    }
     let Some(name) = request.name.clone() else {
         return Ok(daemon::DaemonAgentSyncApplyResponse {
             workspace: Some(workspace.clone()),
@@ -5690,7 +5709,6 @@ async fn handle_daemon_agent_sync_apply(
         });
     };
 
-    let workspace_id = parse_workspace_id(&workspace)?;
     let Some(discovered_source) = discover_clone_source(context.base, &workspace_id, None)? else {
         return Ok(daemon::DaemonAgentSyncApplyResponse {
             workspace: Some(workspace),
@@ -8331,6 +8349,80 @@ mod tests {
             .any(|snapshot| snapshot.actor == *clone_identity.did()
                 && snapshot.root == root
                 && snapshot.label.as_deref() == Some("cloned")));
+    }
+
+    #[tokio::test]
+    async fn daemon_sync_apply_existing_workspace_returns_refresh_pending_boundary() {
+        let base = TempDir::new().unwrap();
+        let identity = load_or_create_identity(base.path()).unwrap();
+        let mut workspace = Workspace::create(
+            &identity,
+            base.path(),
+            WorkspaceConfig {
+                name: "local-daemon-workspace".into(),
+                description: "already served by this daemon".into(),
+            },
+        )
+        .await
+        .unwrap();
+        workspace.write_file("local.txt", b"local state").unwrap();
+        workspace.snapshot().await.unwrap();
+        let workspace_id = workspace.id();
+
+        let network = Network::new(
+            &identity,
+            NetworkConfig {
+                listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut server = WorkspaceServer::new(Arc::new(network.clone()));
+        server.register(workspace);
+        let memory_path = base.path().join(".nexus-social-memory.json");
+        let mut social_memory = load_social_memory(&memory_path).unwrap();
+        let event_journal = daemon::DaemonEventJournalHandle::new();
+        let context = NodeEventContext {
+            network: &network,
+            memory_path: &memory_path,
+            base: base.path(),
+            identity: &identity,
+            event_journal: &event_journal,
+        };
+
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        handle_daemon_control_command(
+            daemon::DaemonControlCommand::AgentSyncApply {
+                request: daemon::DaemonAgentSyncApplyRequest {
+                    workspace: Some(workspace_id.to_string()),
+                    name: None,
+                },
+                reply,
+            },
+            &context,
+            &mut server,
+            &mut social_memory,
+        )
+        .await;
+        let response = reply_rx.await.unwrap().unwrap();
+
+        assert!(!response.applied);
+        assert_eq!(response.mode, "daemon_ipc_refresh_pending");
+        assert_eq!(response.workspace, Some(workspace_id.to_string()));
+        assert_eq!(response.name.as_deref(), Some("local-daemon-workspace"));
+        assert!(response.clone.is_none());
+        let suggested = response
+            .suggested_command
+            .as_deref()
+            .expect("pending refresh boundary should include a suggested command");
+        assert!(suggested.contains("nexus-node agent sync"));
+        assert!(suggested.contains("--json"));
+        assert!(suggested.contains(&workspace_id.to_string()));
+        assert!(response
+            .message
+            .contains("daemon-routed live refresh/apply is not implemented yet"));
+        assert_eq!(server.workspace_count(), 1);
     }
 
     #[tokio::test]
