@@ -13,7 +13,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -103,7 +103,7 @@ pub enum NetworkEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkDiagnostics {
     pub local_peer_id: String,
     pub listen_addrs: Vec<String>,

@@ -680,6 +680,11 @@ pub(crate) struct WorkspaceExecReport {
     pub finished_at: u64,
 }
 
+struct WorkspaceExecRun {
+    report: WorkspaceExecReport,
+    recorded_events: Vec<SocialEvent>,
+}
+
 async fn cmd_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (options, json) = parse_workspace_exec_options(args, 2, false)?;
     debug_assert!(!json);
@@ -804,15 +809,25 @@ pub(crate) fn parse_workspace_exec_options(
 }
 
 pub(crate) async fn run_workspace_exec(
-    mut options: WorkspaceExecOptions,
+    options: WorkspaceExecOptions,
 ) -> Result<WorkspaceExecReport, Box<dyn std::error::Error>> {
     let identity = load_or_create_identity(&options.base)?;
     let memory_path = options.base.join(".nexus-social-memory.json");
     let mut memory = load_social_memory(&memory_path)?;
-    let mut workspace = Workspace::load(&identity, &options.workspace_path).await?;
+    let run = run_workspace_exec_with_memory(options, &identity, &memory_path, &mut memory).await?;
+    Ok(run.report)
+}
+
+async fn run_workspace_exec_with_memory(
+    mut options: WorkspaceExecOptions,
+    identity: &NodeIdentity,
+    memory_path: &Path,
+    memory: &mut SocialMemory,
+) -> Result<WorkspaceExecRun, Box<dyn std::error::Error>> {
+    let mut workspace = Workspace::load(identity, &options.workspace_path).await?;
     register_workspace_path(&options.base, workspace.root_dir())?;
     apply_default_exec_isolation(
-        &identity,
+        identity,
         &workspace,
         &mut options.exec_options,
         options.isolation_explicit,
@@ -852,14 +867,12 @@ pub(crate) async fn run_workspace_exec(
                 note: options.note.clone(),
             };
             match memory.sign_event(
-                &identity,
+                identity,
                 finished_at,
                 SocialEventKind::WorkspaceRunRecorded { run: Box::new(run) },
             ) {
                 Ok(event) => {
-                    if let Err(record_err) =
-                        record_social_events(&memory_path, &mut memory, [event])
-                    {
+                    if let Err(record_err) = record_social_events(memory_path, memory, [event]) {
                         eprintln!("failed to record workspace run failure: {record_err}");
                     }
                 }
@@ -899,7 +912,7 @@ pub(crate) async fn run_workspace_exec(
     };
 
     let events = memory.sign_event_sequence(
-        &identity,
+        identity,
         [
             (
                 finished_at,
@@ -911,9 +924,10 @@ pub(crate) async fn run_workspace_exec(
             ),
         ],
     )?;
-    record_social_events(&memory_path, &mut memory, events)?;
+    let recorded_events = events.clone();
+    record_social_events(memory_path, memory, events)?;
 
-    Ok(WorkspaceExecReport {
+    let report = WorkspaceExecReport {
         workspace_path: options.workspace_path,
         workspace: workspace.id(),
         actor: identity.did().clone(),
@@ -929,6 +943,10 @@ pub(crate) async fn run_workspace_exec(
         context,
         started_at,
         finished_at,
+    };
+    Ok(WorkspaceExecRun {
+        report,
+        recorded_events,
     })
 }
 
@@ -1622,7 +1640,12 @@ fn print_bootstrap_status_text(status: &BootstrapStatus) {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct NetworkStatusReport {
+    schema: &'static str,
     base: String,
+    mode: &'static str,
+    daemon: Option<daemon::DaemonStatusReport>,
+    daemon_events: Option<daemon::DaemonEventJournal>,
+    error: Option<String>,
     public_defaults_enabled: bool,
     bootstrap_peers: Vec<String>,
     observed_for_ms: u64,
@@ -1652,17 +1675,44 @@ struct DcutrStatusEvent {
     result: String,
 }
 
+#[derive(Clone, Debug)]
+struct NetworkStatusOptions {
+    base: PathBuf,
+    listen: String,
+    bootstrap: Vec<libp2p::Multiaddr>,
+    use_public_bootstrap: bool,
+    timeout: Duration,
+    json: bool,
+    force_probe: bool,
+}
+
 async fn cmd_network(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.get(2).map(String::as_str) != Some("status") {
         return Err("network subcommand required: status".into());
     }
 
+    let options = parse_network_status_options(args)?;
+    let json = options.json;
+    let report = network_status_report(options).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_network_status_text(&report);
+    }
+    Ok(())
+}
+
+fn parse_network_status_options(
+    args: &[String],
+) -> Result<NetworkStatusOptions, Box<dyn std::error::Error>> {
     let mut base = PathBuf::from(".");
     let mut listen = "/ip4/0.0.0.0/udp/0/quic-v1".to_string();
     let mut bootstrap = Vec::new();
     let mut use_public_bootstrap = true;
     let mut timeout = DEFAULT_NETWORK_STATUS_TIMEOUT;
     let mut json = false;
+    let mut force_probe = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -1676,47 +1726,157 @@ async fn cmd_network(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             "--listen" => {
                 i += 1;
                 listen = required_arg(args, i, "--listen")?.to_string();
+                force_probe = true;
             }
             "--bootstrap" => {
                 i += 1;
                 bootstrap.push(required_arg(args, i, "--bootstrap")?.parse()?);
+                force_probe = true;
             }
             "--invite" => {
                 i += 1;
                 extend_bootstrap_peers(&mut bootstrap, required_arg(args, i, "--invite")?)?;
+                force_probe = true;
             }
             "--no-public-bootstrap" => {
                 use_public_bootstrap = false;
+                force_probe = true;
             }
             "--timeout-ms" => {
                 i += 1;
                 let millis = parse_u64_arg(required_arg(args, i, "--timeout-ms")?, "--timeout-ms")?;
                 timeout = Duration::from_millis(millis);
+                force_probe = true;
             }
             other => return Err(format!("unknown network status option: {other}").into()),
         }
         i += 1;
     }
 
-    if bootstrap.is_empty() {
-        bootstrap = default_bootstrap_peers(&base, use_public_bootstrap)?;
+    Ok(NetworkStatusOptions {
+        base,
+        listen,
+        bootstrap,
+        use_public_bootstrap,
+        timeout,
+        json,
+        force_probe,
+    })
+}
+
+async fn network_status_report(
+    mut options: NetworkStatusOptions,
+) -> Result<NetworkStatusReport, Box<dyn std::error::Error>> {
+    if !options.force_probe {
+        let daemon = daemon::daemon_status_report(&options.base);
+        if daemon.running && daemon.ipc_available {
+            return match daemon::daemon_network_status(
+                &options.base,
+                None,
+                Some(NETWORK_STATUS_RECENT_EVENT_LIMIT),
+            ) {
+                Ok(response) => Ok(network_status_report_from_daemon(
+                    &options.base,
+                    response.status,
+                    Some(response.events),
+                    response.network_status.diagnostics,
+                    "daemon_ipc",
+                    None,
+                )),
+                Err(error) => Ok(network_status_report_from_daemon_record(
+                    &options.base,
+                    daemon,
+                    "daemon_ipc_error",
+                    Some(error.to_string()),
+                )),
+            };
+        }
+        if daemon.running {
+            return Ok(network_status_report_from_daemon_record(
+                &options.base,
+                daemon,
+                "daemon_running_no_ipc",
+                Some("daemon is running but network status IPC is unavailable".into()),
+            ));
+        }
     }
 
-    let identity = load_or_create_identity(&base)?;
+    if options.bootstrap.is_empty() {
+        options.bootstrap = default_bootstrap_peers(&options.base, options.use_public_bootstrap)?;
+    }
+
+    let identity = load_or_create_identity(&options.base)?;
     let network = Network::new(
         &identity,
-        network_config(listen.parse()?, bootstrap.clone()),
+        network_config(options.listen.parse()?, options.bootstrap.clone()),
     )
     .await?;
-    let report =
-        collect_network_status(&base, &network, &bootstrap, use_public_bootstrap, timeout).await;
+    Ok(collect_network_status(
+        &options.base,
+        &network,
+        &options.bootstrap,
+        options.use_public_bootstrap,
+        options.timeout,
+    )
+    .await)
+}
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_network_status_text(&report);
+fn network_status_report_from_daemon(
+    base: &Path,
+    daemon: daemon::DaemonStatusReport,
+    daemon_events: Option<daemon::DaemonEventJournal>,
+    diagnostics: NetworkDiagnostics,
+    mode: &'static str,
+    error: Option<String>,
+) -> NetworkStatusReport {
+    let mut autonat = AutonatStatusReport::default();
+    let mut dcutr_events = Vec::new();
+    let mut relay_events = Vec::new();
+    let mut recent_events = Vec::new();
+
+    if let Some(events) = daemon_events.as_ref() {
+        for event in &events.events {
+            record_daemon_event_for_network_status(
+                event,
+                &mut autonat,
+                &mut dcutr_events,
+                &mut relay_events,
+                &mut recent_events,
+            );
+        }
     }
-    Ok(())
+
+    NetworkStatusReport {
+        schema: "nexus.network_status.v1",
+        base: base.display().to_string(),
+        mode,
+        public_defaults_enabled: daemon.public_defaults_enabled.unwrap_or(false),
+        bootstrap_peers: daemon.bootstrap_peers.clone(),
+        observed_for_ms: 0,
+        diagnostics,
+        autonat,
+        dcutr_events,
+        relay_events,
+        recent_events,
+        daemon: Some(daemon),
+        daemon_events,
+        error,
+    }
+}
+
+fn network_status_report_from_daemon_record(
+    base: &Path,
+    daemon: daemon::DaemonStatusReport,
+    mode: &'static str,
+    error: Option<String>,
+) -> NetworkStatusReport {
+    let diagnostics = NetworkDiagnostics {
+        local_peer_id: "unknown".into(),
+        listen_addrs: daemon.listen.iter().cloned().collect(),
+        connected_peers: Vec::new(),
+        connected_peer_count: 0,
+    };
+    network_status_report_from_daemon(base, daemon, None, diagnostics, mode, error)
 }
 
 async fn collect_network_status(
@@ -1755,7 +1915,12 @@ async fn collect_network_status(
     }
 
     NetworkStatusReport {
+        schema: "nexus.network_status.v1",
         base: base.display().to_string(),
+        mode: "short_probe",
+        daemon: None,
+        daemon_events: None,
+        error: None,
         public_defaults_enabled,
         bootstrap_peers: stringify_status_multiaddrs(bootstrap_peers),
         observed_for_ms: duration_millis(started_at.elapsed()),
@@ -1803,6 +1968,93 @@ fn record_network_status_event(
     if let Some(summary) = network_status_event_summary(&event) {
         push_recent_network_event(recent_events, summary);
     }
+}
+
+fn record_daemon_event_for_network_status(
+    event: &daemon::DaemonEvent,
+    autonat: &mut AutonatStatusReport,
+    dcutr_events: &mut Vec<DcutrStatusEvent>,
+    relay_events: &mut Vec<String>,
+    recent_events: &mut Vec<String>,
+) {
+    match event.kind.as_str() {
+        "autonat_status_changed" => {
+            if let Some((old, new)) = parse_autonat_status_change(&event.summary) {
+                autonat.current_status = Some(new.clone());
+                autonat
+                    .status_changes
+                    .push(AutonatStatusChange { old, new });
+            }
+        }
+        "autonat_event" => {
+            autonat.events.push(
+                event
+                    .summary
+                    .strip_prefix("autonat_event ")
+                    .unwrap_or(&event.summary)
+                    .to_string(),
+            );
+        }
+        "dcutr_event" => {
+            if let Some(status_event) = parse_dcutr_status_event(&event.summary) {
+                dcutr_events.push(status_event);
+            }
+        }
+        "relay_event" => {
+            relay_events.push(
+                event
+                    .summary
+                    .strip_prefix("relay_event ")
+                    .unwrap_or(&event.summary)
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    if is_network_status_daemon_event(&event.kind) {
+        push_recent_network_event(recent_events, event.summary.clone());
+    }
+}
+
+fn parse_autonat_status_change(summary: &str) -> Option<(String, String)> {
+    let summary = summary.strip_prefix("autonat_status_changed ")?;
+    let (old, new) = summary.split_once(" -> ")?;
+    Some((old.to_string(), new.to_string()))
+}
+
+fn parse_dcutr_status_event(summary: &str) -> Option<DcutrStatusEvent> {
+    let summary = summary.strip_prefix("dcutr_event ")?;
+    let mut remote_peer_id = None;
+    let mut result = None;
+    for part in summary.split_whitespace() {
+        if let Some(value) = part.strip_prefix("peer=") {
+            remote_peer_id = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("result=") {
+            result = Some(value.to_string());
+        }
+    }
+    Some(DcutrStatusEvent {
+        remote_peer_id: remote_peer_id?,
+        result: result?,
+    })
+}
+
+fn is_network_status_daemon_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "peer_discovered"
+            | "routing_updated"
+            | "peer_connected"
+            | "peer_disconnected"
+            | "listening"
+            | "sync_request"
+            | "providers_found"
+            | "autonat_status_changed"
+            | "autonat_event"
+            | "dcutr_event"
+            | "relay_event"
+    )
 }
 
 fn network_status_event_summary(event: &NetworkEvent) -> Option<String> {
@@ -1884,6 +2136,16 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn print_network_status_text(report: &NetworkStatusReport) {
     println!("Network status: {}", report.base);
+    println!("mode: {}", report.mode);
+    if let Some(daemon) = &report.daemon {
+        println!(
+            "daemon: running={} ipc_available={}",
+            daemon.running, daemon.ipc_available
+        );
+    }
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+    }
     println!("peer: {}", report.diagnostics.local_peer_id);
     println!("observed_for_ms: {}", report.observed_for_ms);
     println!(
@@ -5208,6 +5470,18 @@ async fn handle_daemon_control_command(
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
+        daemon::DaemonControlCommand::AgentExec { request, reply } => {
+            let result = handle_daemon_agent_exec(request, context, social_memory)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+        daemon::DaemonControlCommand::NetworkStatus { reply } => {
+            let result = Ok(daemon::DaemonNetworkStatusResponse {
+                diagnostics: context.network.diagnostics(),
+            });
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -5278,6 +5552,106 @@ async fn handle_daemon_agent_send(
         expires_at: intent.expires_at,
         live_broadcast,
     })
+}
+
+async fn handle_daemon_agent_exec(
+    request: daemon::DaemonAgentExecRequest,
+    context: &NodeEventContext<'_>,
+    social_memory: &mut SocialMemory,
+) -> Result<daemon::DaemonAgentExecResponse, Box<dyn std::error::Error>> {
+    let options = daemon_agent_exec_options(context.base, request)?;
+    let run = run_workspace_exec_with_memory(
+        options,
+        context.identity,
+        context.memory_path,
+        social_memory,
+    )
+    .await?;
+    if !run.recorded_events.is_empty() {
+        context.event_journal.push(
+            "social_event",
+            format!(
+                "social_event source=local_agent_exec events={} agents={}",
+                social_memory.event_count(),
+                social_memory.agent_count()
+            ),
+        );
+    }
+    let mut live_broadcast = !run.recorded_events.is_empty();
+    for event in &run.recorded_events {
+        record_daemon_social_event_change_from_event(context.event_journal, &None, event);
+        live_broadcast &= publish_social_event_with_retry(context.network, event).await;
+    }
+
+    Ok(daemon_agent_exec_response(run.report, live_broadcast))
+}
+
+fn daemon_agent_exec_options(
+    base: &Path,
+    request: daemon::DaemonAgentExecRequest,
+) -> Result<WorkspaceExecOptions, Box<dyn std::error::Error>> {
+    let stdin = request.stdin_hex.as_deref().map(hex::decode).transpose()?;
+    Ok(WorkspaceExecOptions {
+        base: base.to_path_buf(),
+        workspace_path: PathBuf::from(request.workspace_path),
+        note: request.note,
+        exec_options: ExecOptions {
+            working_dir: request.working_dir.map(PathBuf::from),
+            env: request.env,
+            stdin,
+            timeout: request.timeout_ms.map(Duration::from_millis),
+            capture_stdout: request.capture_stdout,
+            capture_stderr: request.capture_stderr,
+            max_stdout_bytes: request.max_stdout_bytes,
+            max_stderr_bytes: request.max_stderr_bytes,
+            isolation: parse_exec_isolation(&request.isolation)?,
+        },
+        isolation_explicit: request.isolation_explicit,
+        command: request.command,
+        command_args: request.command_args,
+    })
+}
+
+fn daemon_agent_exec_response(
+    report: WorkspaceExecReport,
+    live_broadcast: bool,
+) -> daemon::DaemonAgentExecResponse {
+    daemon::DaemonAgentExecResponse {
+        workspace_path: report.workspace_path.display().to_string(),
+        workspace: report.workspace.to_string(),
+        actor: report.actor.to_string(),
+        command: report.command,
+        args: report.args,
+        exit_code: report.exit_code,
+        stdout: daemon_agent_exec_stream(&report.stdout, &report.stdout_cid),
+        stderr: daemon_agent_exec_stream(&report.stderr, &report.stderr_cid),
+        output_root: hex::encode(report.output_root.as_bytes()),
+        resources: daemon_agent_exec_resources(&report.resources),
+        context: report.context,
+        started_at: report.started_at,
+        finished_at: report.finished_at,
+        live_broadcast,
+    }
+}
+
+fn daemon_agent_exec_stream(bytes: &[u8], cid: &Cid) -> daemon::DaemonAgentExecStream {
+    daemon::DaemonAgentExecStream {
+        bytes: bytes.len(),
+        cid: hex::encode(cid.as_bytes()),
+        text: String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn daemon_agent_exec_resources(resources: &ResourceUsage) -> daemon::DaemonAgentExecResources {
+    daemon::DaemonAgentExecResources {
+        wall_time_ms: duration_millis(resources.wall_time),
+        cpu_user_ms: duration_millis(resources.cpu_user),
+        cpu_kernel_ms: duration_millis(resources.cpu_kernel),
+        peak_memory: resources.peak_memory,
+        fs_read_bytes: resources.fs_read_bytes,
+        fs_write_bytes: resources.fs_write_bytes,
+        process_count: resources.process_count,
+    }
 }
 
 fn record_daemon_social_event_change(
@@ -5373,6 +5747,21 @@ fn daemon_social_event_change_summary(
             format!(
                 "task_changed action=disputed task={} disputer={} target={} source={source:?}",
                 dispute.task_id, dispute.disputer, dispute.target
+            ),
+        )),
+        SocialEventKind::WorkspaceRunRecorded { run } => Some((
+            "workspace_run_changed",
+            format!(
+                "workspace_run_changed workspace={} command={} actor={} exit_code={} source={source:?}",
+                run.workspace, run.command, run.actor, run.exit_code
+            ),
+        )),
+        SocialEventKind::WorkspaceSnapshotted { snapshot } => Some((
+            "workspace_snapshot_changed",
+            format!(
+                "workspace_snapshot_changed workspace={} root={} source={source:?}",
+                snapshot.workspace,
+                hex::encode(snapshot.root.as_bytes())
             ),
         )),
         _ => None,
@@ -5996,6 +6385,112 @@ mod tests {
         ])
         .await
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn network_status_prefers_daemon_ipc_when_available() {
+        let temp = TempDir::new().unwrap();
+        let daemon_dir = temp.path().join(".nexus");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let socket = daemon_dir.join("daemon.sock");
+        std::fs::write(
+            daemon_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "base": temp.path().display().to_string(),
+                "pid": std::process::id(),
+                "started_at": 123,
+                "listen": "/ip4/127.0.0.1/udp/0/quic-v1",
+                "public_defaults_enabled": false,
+                "bootstrap_peers": ["/ip4/127.0.0.1/udp/1111/quic-v1"],
+                "stdout_log": "stdout.log",
+                "stderr_log": "stderr.log",
+                "control_socket": socket.display().to_string(),
+                "command": ["nexus-node", "serve"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let event_journal = daemon::DaemonEventJournalHandle::new();
+        event_journal.push("listening", "listening /ip4/127.0.0.1/udp/7777/quic-v1");
+        event_journal.push("peer_connected", "peer_connected 12D3KooWDaemonPeer");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let command_task = tokio::spawn(async move {
+            let Some(daemon::DaemonControlCommand::NetworkStatus { reply }) =
+                control_rx.recv().await
+            else {
+                panic!("network_status command should be forwarded to the serve loop");
+            };
+            reply
+                .send(Ok(daemon::DaemonNetworkStatusResponse {
+                    diagnostics: NetworkDiagnostics {
+                        local_peer_id: "12D3KooWDaemonLocal".into(),
+                        listen_addrs: vec!["/ip4/127.0.0.1/udp/7777/quic-v1".into()],
+                        connected_peers: vec!["12D3KooWDaemonPeer".into()],
+                        connected_peer_count: 1,
+                    },
+                }))
+                .unwrap();
+        });
+        let handle = daemon::spawn_serve_control_socket(
+            temp.path().to_path_buf(),
+            socket,
+            shutdown_tx,
+            event_journal,
+            Some(control_tx),
+        )
+        .unwrap();
+
+        let report = tokio::task::spawn_blocking({
+            let base = temp.path().to_path_buf();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime
+                    .block_on(network_status_report(NetworkStatusOptions {
+                        base,
+                        listen: "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+                        bootstrap: Vec::new(),
+                        use_public_bootstrap: true,
+                        timeout: DEFAULT_NETWORK_STATUS_TIMEOUT,
+                        json: true,
+                        force_probe: false,
+                    }))
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.schema, "nexus.network_status.v1");
+        assert_eq!(report.mode, "daemon_ipc");
+        assert_eq!(report.diagnostics.local_peer_id, "12D3KooWDaemonLocal");
+        assert_eq!(report.diagnostics.connected_peer_count, 1);
+        assert_eq!(
+            report.bootstrap_peers,
+            vec!["/ip4/127.0.0.1/udp/1111/quic-v1"]
+        );
+        assert_eq!(
+            report
+                .daemon_events
+                .as_ref()
+                .map(|events| events.events.len()),
+            Some(2)
+        );
+        assert!(report
+            .recent_events
+            .iter()
+            .any(|event| event.contains("peer_connected 12D3KooWDaemonPeer")));
+        assert!(!identity_path(temp.path()).exists());
+
+        command_task.await.unwrap();
+        handle.abort();
     }
 
     #[test]

@@ -433,12 +433,14 @@
 #### - [ ] UX3 — 短命令自动路由到 daemon · 🟠 · M
 **为什么**：现在 `discover`/`clone`/`network status` 会各自启动短时网络实例，命令多且状态割裂。daemon 存在时，短命令应复用已连 peer 和缓存。
 **怎么做**：
-- [ ] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
+- [x] `agent status|sync|discover|send|inbox|exec` 优先通过 IPC 请求 daemon。
 - [x] `agent discover` 在 daemon IPC 可用时通过 `agent_discover` control request 读取 daemon 侧 discovery cache；IPC 失败时退回本地 cache 并返回结构化问题。
 - [x] `agent sync` 在 daemon IPC 可用时通过 `agent_sync` control request 读取 daemon 侧 discovery cache，再在本地生成 clone/sync plan；IPC 失败时退回本地 cache 并返回结构化问题。
 - [x] `agent inbox` 在 daemon IPC 可用时通过 daemon event journal 获取增量事件，并通过 `agent_discover` control request 读取 daemon 侧 discovery cache 生成 clone-ready 提示；IPC 失败时退回本地 cache 并显式标注来源。
 - [x] daemon 不存在时，`agent discover` 读 discovery cache 并给出显式联网刷新提示；不启动网络、不创建身份、不解密私钥。
-- [ ] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。
+- [x] daemon 不存在时，其余读状态命令退化为本地缓存，显式联网命令给出可执行提示。
+- [x] daemon IPC 请求失败时，`agent send` 保存到本地社会记忆，`agent exec` 本地执行并在 delivery 中结构化标注 fallback 原因。
+- [x] `network status` 在 daemon IPC 可用时读取 live diagnostics 和 daemon event journal；显式 probe 参数仍保留短时网络实例。
 - [x] 输出 JSON schema 稳定，错误包含 `kind`、`message`、`suggested_command`。
 **完成判据**：常用 agent 流程不需要手写 `--listen`、`--bootstrap`、`--invite`，除非用户要覆盖默认网络策略。
 **依赖**：`UX2`。
