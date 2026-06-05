@@ -10,12 +10,16 @@ use std::time::{Duration, Instant};
 use nexus_agent::WorkspaceRunContext;
 use nexus_network::NetworkDiagnostics;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(any(unix, windows))]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 #[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bootstrap::extend_bootstrap_peers;
@@ -34,6 +38,8 @@ const DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_START_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_EVENT_JOURNAL_LIMIT: usize = 256;
 const DEFAULT_DAEMON_EVENTS_LIMIT: usize = 50;
+#[cfg(windows)]
+const WINDOWS_ERROR_PIPE_BUSY: i32 = 231;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DaemonStatusReport {
@@ -649,7 +655,7 @@ pub(crate) fn start_daemon(
         "--listen".to_string(),
         options.listen.clone(),
     ];
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         command_args.push("--control-socket".to_string());
         command_args.push(control_socket.display().to_string());
@@ -924,8 +930,17 @@ fn daemon_stderr_log_path(base: &Path) -> PathBuf {
     daemon_dir(base).join("daemon.stderr.log")
 }
 
+#[cfg(not(windows))]
 fn daemon_control_socket_path(base: &Path) -> PathBuf {
     daemon_dir(base).join("daemon.sock")
+}
+
+#[cfg(windows)]
+fn daemon_control_socket_path(base: &Path) -> PathBuf {
+    let normalized = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let digest = Sha256::digest(normalized.display().to_string().as_bytes());
+    let digest = hex::encode(&digest[..16]);
+    PathBuf::from(format!(r"\\.\pipe\nexus-node-daemon-{digest}"))
 }
 
 #[cfg(unix)]
@@ -933,7 +948,12 @@ fn control_socket_for_record(path: &Path) -> Option<String> {
     Some(path.display().to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn control_socket_for_record(path: &Path) -> Option<String> {
+    Some(path.display().to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn control_socket_for_record(_path: &Path) -> Option<String> {
     None
 }
@@ -1139,7 +1159,41 @@ pub(crate) fn spawn_serve_control_socket(
     Ok(handle)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn spawn_serve_control_socket(
+    base: PathBuf,
+    pipe_path: PathBuf,
+    shutdown_tx: watch::Sender<bool>,
+    event_journal: DaemonEventJournalHandle,
+    control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let handle = tokio::spawn(async move {
+        let mut first_pipe_instance = true;
+        loop {
+            let server = match ServerOptions::new()
+                .first_pipe_instance(first_pipe_instance)
+                .create(&pipe_path)
+            {
+                Ok(server) => server,
+                Err(_) => break,
+            };
+            first_pipe_instance = false;
+            if server.connect().await.is_err() {
+                break;
+            }
+            let base = base.clone();
+            let shutdown_tx = shutdown_tx.clone();
+            let event_journal = event_journal.clone();
+            let control_tx = control_tx.clone();
+            tokio::spawn(async move {
+                handle_control_stream(server, base, shutdown_tx, event_journal, control_tx).await;
+            });
+        }
+    });
+    Ok(handle)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn spawn_serve_control_socket(
     _base: PathBuf,
     _socket_path: PathBuf,
@@ -1150,14 +1204,16 @@ pub(crate) fn spawn_serve_control_socket(
     Err("daemon control socket is unsupported on this platform".into())
 }
 
-#[cfg(unix)]
-async fn handle_control_stream(
-    mut stream: UnixStream,
+#[cfg(any(unix, windows))]
+async fn handle_control_stream<S>(
+    mut stream: S,
     base: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     event_journal: DaemonEventJournalHandle,
     control_tx: Option<mpsc::Sender<DaemonControlCommand>>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let response = match read_control_request(&mut stream).await {
         Ok(request) => match request.command.as_str() {
             "status" => DaemonControlResponse {
@@ -1741,10 +1797,13 @@ async fn daemon_control_agent_sync_apply_response(
     }
 }
 
-#[cfg(unix)]
-async fn read_control_request(
-    stream: &mut UnixStream,
-) -> Result<DaemonControlRequest, Box<dyn std::error::Error + Send + Sync>> {
+#[cfg(any(unix, windows))]
+async fn read_control_request<S>(
+    stream: &mut S,
+) -> Result<DaemonControlRequest, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = vec![0u8; DAEMON_CONTROL_REQUEST_MAX_BYTES + 1];
     let bytes_read = stream.read(&mut buffer).await?;
     if bytes_read == 0 {
@@ -1763,7 +1822,7 @@ fn daemon_control_status(base: &Path) -> DaemonStatusReport {
     status
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn query_control_socket(
     socket_path: &Path,
     command: &str,
@@ -2019,7 +2078,78 @@ fn query_control_socket_request(
     Ok(serde_json::from_slice(&response)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn query_control_socket_request(
+    socket_path: &Path,
+    request: &DaemonControlRequest,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error>> {
+    let socket_path = socket_path.to_path_buf();
+    let request = request.clone();
+    let run_query = move || -> Result<DaemonControlResponse, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime
+            .block_on(query_control_socket_request_windows(socket_path, request))
+            .map_err(|error| error.to_string())
+    };
+
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run_query)
+        }
+        Ok(_) => std::thread::spawn(run_query)
+            .join()
+            .map_err(|_| "daemon control socket query thread panicked".to_string())?,
+        Err(_) => run_query(),
+    };
+    result.map_err(Into::into)
+}
+
+#[cfg(windows)]
+async fn query_control_socket_request_windows(
+    socket_path: PathBuf,
+    request: DaemonControlRequest,
+) -> Result<DaemonControlResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let data = serde_json::to_vec(&request)?;
+    if data.len() > DAEMON_CONTROL_REQUEST_MAX_BYTES {
+        return Err("daemon control request is too large".into());
+    }
+
+    let mut stream = open_named_pipe_client(&socket_path).await?;
+    tokio::time::timeout(DAEMON_CONTROL_TIMEOUT, stream.write_all(&data)).await??;
+
+    let mut response = Vec::new();
+    let mut reader = (&mut stream).take(DAEMON_CONTROL_RESPONSE_MAX_BYTES + 1);
+    tokio::time::timeout(DAEMON_CONTROL_TIMEOUT, reader.read_to_end(&mut response)).await??;
+    if response.len() as u64 > DAEMON_CONTROL_RESPONSE_MAX_BYTES {
+        return Err("daemon control response is too large".into());
+    }
+    Ok(serde_json::from_slice(&response)?)
+}
+
+#[cfg(windows)]
+async fn open_named_pipe_client(
+    socket_path: &Path,
+) -> Result<NamedPipeClient, Box<dyn std::error::Error + Send + Sync>> {
+    let started = Instant::now();
+    loop {
+        match ClientOptions::new().open(socket_path) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error() == Some(WINDOWS_ERROR_PIPE_BUSY)
+                    && started.elapsed() < DAEMON_CONTROL_TIMEOUT =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn query_control_socket(
     _socket_path: &Path,
     _command: &str,
@@ -2027,7 +2157,7 @@ fn query_control_socket(
     Err("daemon control socket is unsupported on this platform".into())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn query_control_socket_request(
     _socket_path: &Path,
     _request: &DaemonControlRequest,
@@ -2146,7 +2276,7 @@ mod tests {
         assert_eq!(clamped.events.last().unwrap().sequence, 300);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn control_socket_reports_status_and_shutdown() {
         let temp = tempfile::TempDir::new().unwrap();

@@ -424,7 +424,8 @@
 - [x] 增加 `nexus-node daemon start|stop|status --base <DIR>`。
 - [x] daemon 后台托管现有 `serve`，记录 pid、启动参数、stdout/stderr 日志和运行健康。
 - [x] 在 `<base>/.nexus/daemon.sock` 下提供 Unix domain socket；`status`/`shutdown` 请求和响应都用 bounded JSON。
-- [ ] Windows named pipe parity。
+- [x] Windows named pipe parity 已补到 daemon control path：base-scoped named pipe、启动记录、serve accept loop、bounded JSON client query/retry 复用同一套 control request/response。
+- [ ] Windows 主机验证仍需补跑；本机 cross-check 受缺少 MinGW C toolchain 影响，`ring` 依赖未能完成 Windows target check。
 - [x] pid/lock 文件要能检测 stale daemon；重复 start 返回已运行状态而不是再起一个网络节点。
 **完成判据**：agent 可以启动 daemon 后立刻回到交互；后续 `agent status` 能看到 daemon peer/listen/health。
 **依赖**：`UX1`。
